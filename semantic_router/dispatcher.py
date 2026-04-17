@@ -20,7 +20,7 @@ async def dispatch(
     actual_latency_ms = int((time.monotonic() - t0) * 1000)
 
     usage = response.get("usage", {})
-    actual_tokens = usage.get("prompt_tokens", 0) + usage.get("completion_tokens", 0)
+    actual_tokens  = usage.get("prompt_tokens", 0) + usage.get("completion_tokens", 0)
     actual_output  = usage.get("completion_tokens", 0)
     actual_energy_j = actual_output / max(adapter.efficiency_tokens_per_joule, 1e-9)
 
@@ -33,7 +33,12 @@ async def dispatch(
     try:    resp_text = response["choices"][0]["message"]["content"]
     except: resp_text = ""
 
-    sampler.enqueue(SampleItem(model_id=winning_bid.model_id, domain=domain, complexity=complexity, query=query, response=resp_text))
+    # bid_accuracy passed through so accuracy_sampler can compute reliability penalty
+    sampler.enqueue(SampleItem(
+        model_id=winning_bid.model_id, domain=domain, complexity=complexity,
+        query=query, response=resp_text,
+        bid_accuracy=winning_bid.estimated_accuracy,
+    ))
 
     return response, {
         "X-Router-Model":             winning_bid.model_id,

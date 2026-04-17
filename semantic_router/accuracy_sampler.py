@@ -1,8 +1,11 @@
 from __future__ import annotations
 import asyncio, logging, random, re, subprocess, tempfile, textwrap
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
-from semantic_router.config import SAMPLE_RATE, JUDGE_BATCH_SIZE, JUDGE_BATCH_WINDOW_S, JUDGE_QUEUE_MAX, CALIBRATION_RATE, CALIBRATION_DRIFT_THRESHOLD
+from semantic_router.config import (
+    SAMPLE_RATE, JUDGE_BATCH_SIZE, JUDGE_BATCH_WINDOW_S, JUDGE_QUEUE_MAX,
+    CALIBRATION_RATE, CALIBRATION_DRIFT_THRESHOLD,
+)
 
 if TYPE_CHECKING:
     from semantic_router.reputation_tracker import ReputationTracker
@@ -23,6 +26,7 @@ class SampleItem:
     complexity: str
     query: str
     response: str
+    bid_accuracy: float = 0.70  # model's self-reported estimated_accuracy at bid time
 
 
 def _score_code(response: str) -> float:
@@ -54,7 +58,7 @@ class AccuracySampler:
     async def _load_judge(self) -> None:
         if self._judge_model is not None: return
         from transformers import pipeline
-        self._judge_model   = pipeline("text-generation", model="kaist-ai/prometheus-2-7b",   device_map="auto", max_new_tokens=64)
+        self._judge_model    = pipeline("text-generation", model="kaist-ai/prometheus-2-7b",   device_map="auto", max_new_tokens=64)
         self._creative_model = pipeline("text-generation", model="Qwen/Qwen2.5-7B-Instruct", device_map="auto", max_new_tokens=64)
 
     def _prometheus_score(self, domain: str, query: str, response: str) -> float:
@@ -67,14 +71,17 @@ class AccuracySampler:
         return float(m.group(1)) if m else 0.5
 
     def _qwen_score(self, query: str, response: str) -> float:
-        out = self._creative_model(f"Rubric: {RUBRICS['creative']}\nQuery: {query}\nResponse: {response}\nRate 0.0-1.0. Return only {{\"score\": <float>}}." )[0]["generated_text"]
+        out = self._creative_model(
+            f"Rubric: {RUBRICS['creative']}\nQuery: {query}\nResponse: {response}\n"
+            f'Rate 0.0-1.0. Return only {{"score": <float>}}.'
+        )[0]["generated_text"]
         m = re.search(r'"score"\s*:\s*([0-9.]+)', out)
         return float(m.group(1)) if m else 0.5
 
     async def _score_item(self, item: SampleItem) -> float:
         loop = asyncio.get_event_loop()
-        if item.domain == "code":   return await loop.run_in_executor(None, _score_code, item.response)
-        if item.domain == "math":   return await loop.run_in_executor(None, _score_math, item.response, item.query)
+        if item.domain == "code":     return await loop.run_in_executor(None, _score_code, item.response)
+        if item.domain == "math":     return await loop.run_in_executor(None, _score_math, item.response, item.query)
         await self._load_judge()
         if item.domain == "creative": return await loop.run_in_executor(None, self._qwen_score, item.query, item.response)
         return await loop.run_in_executor(None, self._prometheus_score, item.domain, item.query, item.response)
@@ -83,7 +90,15 @@ class AccuracySampler:
         for item in batch:
             try:
                 score = await self._score_item(item)
-                self._tracker.update_accuracy_prior(item.model_id, item.domain, item.complexity, score)
+                # Update eligibility floor (accuracy_priors EMA)
+                self._tracker.update_accuracy_prior(
+                    item.model_id, item.domain, item.complexity, score
+                )
+                # Update bid reliability penalty (accuracy_bid_reliability EMA)
+                self._tracker.record_accuracy_bid(
+                    item.model_id, item.domain, item.complexity,
+                    item.bid_accuracy, score,
+                )
                 if random.random() < CALIBRATION_RATE:
                     asyncio.create_task(self._calibrate(item, score))
             except Exception as e:
@@ -94,7 +109,10 @@ class AccuracySampler:
             import httpx, os
             async with httpx.AsyncClient(timeout=10.0) as c:
                 r = await c.post("https://api.openai.com/v1/chat/completions",
-                    json={"model": "gpt-4o-mini", "messages": [{"role": "system", "content": "Rate 0.0-1.0. Return only a float."}, {"role": "user", "content": f"Query: {item.query}\nResponse: {item.response}"}], "max_tokens": 10},
+                    json={"model": "gpt-4o-mini", "messages": [
+                        {"role": "system", "content": "Rate 0.0-1.0. Return only a float."},
+                        {"role": "user", "content": f"Query: {item.query}\nResponse: {item.response}"}],
+                    "max_tokens": 10},
                     headers={"Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY', '')}"})
             gpt_score = float(re.search(r"[0-9.]+", r.json()["choices"][0]["message"]["content"]).group())
             self._calib_pairs.append((p_score, gpt_score))

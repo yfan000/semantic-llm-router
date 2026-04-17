@@ -14,11 +14,17 @@ JUDGE_BATCH_SIZE: int = 10
 JUDGE_BATCH_WINDOW_S: float = 2.0
 JUDGE_QUEUE_MAX: int = 1000
 
+# Latency bid reliability
 LATENCY_EMA_ALPHA: float = 0.05
-LATENCY_GRACE_RATIO: float = 1.10
+LATENCY_GRACE_RATIO: float = 1.10      # up to 10% overrun treated as accurate
 
+# Accuracy prior (judge-scored, updates eligibility floor)
 ACCURACY_EMA_ALPHA: float = 0.05
 DEFAULT_ACCURACY_PRIOR: float = 0.70
+
+# Accuracy bid reliability (penalises models that overbid estimated_accuracy)
+ACCURACY_BID_EMA_ALPHA: float = 0.05
+ACCURACY_BID_GRACE_RATIO: float = 0.90  # bid within 10% of judge score -> no penalty
 
 CALIBRATION_RATE: float = 0.01
 CALIBRATION_DRIFT_THRESHOLD: float = 0.10
