@@ -7,7 +7,9 @@ from semantic_router.adapters.base import ModelAdapter
 class ModelConfig:
     adapter: ModelAdapter
     domains: list[str]
-    min_accuracy_capability: float
+    # Per-domain accuracy floors from calibration, e.g. {"math": 0.45, "factual": 0.82}
+    # Special key "_default" used as fallback when domain is not listed
+    min_accuracy_capability: dict[str, float]
 
 
 class ModelRegistry:
@@ -21,11 +23,18 @@ class ModelRegistry:
         self._models.pop(model_id, None)
 
     def get_eligible(self, domain: str, min_accuracy: float | None) -> list[ModelAdapter]:
-        return [
-            cfg.adapter for cfg in self._models.values()
-            if (domain in cfg.domains or "general" in cfg.domains)
-            and (min_accuracy is None or cfg.min_accuracy_capability >= min_accuracy)
-        ]
+        results = []
+        for cfg in self._models.values():
+            if domain not in cfg.domains and "general" not in cfg.domains:
+                continue
+            if min_accuracy is not None:
+                # Use domain-specific floor, fall back to "_default", then 0.0
+                capability = cfg.min_accuracy_capability.get(domain) \
+                          or cfg.min_accuracy_capability.get("_default", 0.0)
+                if capability < min_accuracy:
+                    continue
+            results.append(cfg.adapter)
+        return results
 
     def list_all(self) -> list[str]:
         return list(self._models.keys())
