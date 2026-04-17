@@ -54,7 +54,8 @@ async def chat_completions(request: Request) -> JSONResponse:
     if user_id:
         user_reg.check_budget(user_id, 300, 300.0 / 2.0)
 
-    adapters = registry.get_eligible(meta.domain, pref.min_accuracy)
+    # Pass reputation so get_eligible() uses live production floors
+    adapters = registry.get_eligible(meta.domain, pref.min_accuracy, reputation)
     if not adapters:
         raise HTTPException(status_code=503, detail="No models registered for this domain.")
 
@@ -76,22 +77,20 @@ async def chat_completions(request: Request) -> JSONResponse:
     return JSONResponse(content=response_dict, headers=router_headers)
 
 
-# ── Model fleet management ─────────────────────────────────────────────────
+# -- Model fleet management --------------------------------------------------
 
 class RegisterRequest(BaseModel):
     model_id: str
-    backend: str          # "vllm" | "dynamo" | "ray"
+    backend: str
     base_url: str
     domains: list[str]
-    # Per-domain accuracy floors. If omitted or empty, calibration runs automatically.
-    # e.g. {"math": 0.45, "factual": 0.82, "_default": 0.60}
     min_accuracy_capability: dict[str, float] = {}
     efficiency_tokens_per_joule: float = 5.0
     max_concurrent_requests: int = 256
     input_rate_usd_per_token: float = 1e-6
     output_rate_usd_per_token: float = 2e-6
     accuracy_priors: dict[str, float] = {}
-    skip_calibration: bool = False   # set True to register instantly without benchmarking
+    skip_calibration: bool = False
 
 
 @app.post("/router/register", status_code=201)
@@ -108,10 +107,9 @@ async def register_model(req: RegisterRequest) -> dict:
     else:
         raise HTTPException(status_code=400, detail=f"Unknown backend: {req.backend}")
 
-    # Run calibration if no per-domain floors were provided
     capability = req.min_accuracy_capability
     if not capability and not req.skip_calibration:
-        log.info("No min_accuracy_capability provided — running calibration for %s", req.model_id)
+        log.info("Running calibration for %s", req.model_id)
         try:
             from semantic_router.calibration import calibrate
             capability = await calibrate(req.base_url, req.model_id)
@@ -119,7 +117,6 @@ async def register_model(req: RegisterRequest) -> dict:
             log.warning("Calibration failed for %s: %s — using default 0.5", req.model_id, e)
             capability = {"_default": 0.5}
 
-    # Ensure _default fallback exists
     if capability and "_default" not in capability:
         capability["_default"] = min(capability.values())
 
@@ -165,7 +162,7 @@ async def health() -> dict:
     return {"status": "ok", "registered_models": len(registry.list_all())}
 
 
-# ── User management ────────────────────────────────────────────────────────
+# -- User management ---------------------------------------------------------
 
 @app.post("/users/{user_id}/preference", status_code=201)
 async def set_preference(user_id: str, pref: UserPreference) -> dict:

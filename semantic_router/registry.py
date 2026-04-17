@@ -1,6 +1,10 @@
 from __future__ import annotations
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 from semantic_router.adapters.base import ModelAdapter
+
+if TYPE_CHECKING:
+    from semantic_router.reputation_tracker import ReputationTracker
 
 
 @dataclass
@@ -22,16 +26,27 @@ class ModelRegistry:
     def deregister(self, model_id: str) -> None:
         self._models.pop(model_id, None)
 
-    def get_eligible(self, domain: str, min_accuracy: float | None) -> list[ModelAdapter]:
+    def get_eligible(
+        self,
+        domain: str,
+        min_accuracy: float | None,
+        reputation: "ReputationTracker | None" = None,
+    ) -> list[ModelAdapter]:
         results = []
         for cfg in self._models.values():
             if domain not in cfg.domains and "general" not in cfg.domains:
                 continue
             if min_accuracy is not None:
-                # Use domain-specific floor, fall back to "_default", then 0.0
-                capability = cfg.min_accuracy_capability.get(domain) \
-                          or cfg.min_accuracy_capability.get("_default", 0.0)
-                if capability < min_accuracy:
+                # Prefer live production floor derived from judge-scored priors.
+                # Falls back to static calibration floor until data accumulates.
+                live_floor = (
+                    reputation.get_domain_floor(cfg.adapter.model_id, domain)
+                    if reputation is not None else None
+                )
+                floor = live_floor if live_floor is not None \
+                    else cfg.min_accuracy_capability.get(domain) \
+                    or cfg.min_accuracy_capability.get("_default", 0.0)
+                if floor < min_accuracy:
                     continue
             results.append(cfg.adapter)
         return results
