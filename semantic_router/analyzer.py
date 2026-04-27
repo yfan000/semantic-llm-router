@@ -1,15 +1,15 @@
 from __future__ import annotations
+import asyncio
 import re
 from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 from sentence_transformers import SentenceTransformer
 from semantic_router.config import EMBEDDING_MODEL
 
-# ---------------------------------------------------------------------------
-# Complexity — keyword markers (primary signal)
-# ---------------------------------------------------------------------------
-# Strong lexical markers work better than semantic similarity for difficulty
-# because easy and hard questions on the same topic cluster close in embedding space.
+# Single shared thread pool for CPU-bound embedding work.
+# Prevents GIL contention when many async requests arrive concurrently.
+_THREAD_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="embed")
 
 _HARD_MARKERS = [
     r"\bprove\b", r"\bderive\b", r"\btheorem\b", r"\blemma\b", r"\baxiom\b",
@@ -44,7 +44,6 @@ _MEDIUM_MARKERS = [
 
 
 def _keyword_complexity(text: str) -> dict[str, float]:
-    """Return soft scores per complexity level based on keyword matches."""
     t = text.lower()
     hard_hits   = sum(1 for p in _HARD_MARKERS   if re.search(p, t))
     easy_hits   = sum(1 for p in _EASY_MARKERS   if re.search(p, t))
@@ -52,47 +51,30 @@ def _keyword_complexity(text: str) -> dict[str, float]:
     total = hard_hits + easy_hits + medium_hits
     if total == 0:
         return {"easy": 0.33, "medium": 0.33, "hard": 0.33}
-    return {
-        "easy":   easy_hits   / total,
-        "medium": medium_hits / total,
-        "hard":   hard_hits   / total,
-    }
+    return {"easy": easy_hits/total, "medium": medium_hits/total, "hard": hard_hits/total}
 
 
 def _token_complexity(text: str) -> dict[str, float]:
-    """Token count heuristic — longer queries skew harder."""
     n = len(text.split())
-    if n <= 12:
-        return {"easy": 0.70, "medium": 0.20, "hard": 0.10}
-    if n <= 35:
-        return {"easy": 0.20, "medium": 0.55, "hard": 0.25}
+    if n <= 12: return {"easy": 0.70, "medium": 0.20, "hard": 0.10}
+    if n <= 35: return {"easy": 0.20, "medium": 0.55, "hard": 0.25}
     return {"easy": 0.10, "medium": 0.30, "hard": 0.60}
 
 
-# ---------------------------------------------------------------------------
-# Complexity anchors (semantic — secondary, 35% weight)
-# ---------------------------------------------------------------------------
-
 _COMPLEXITY_ANCHORS: dict[str, list[str]] = {
     "easy": [
-        "What is 2 plus 2?",
-        "What is the capital of France?",
-        "Convert 100 Fahrenheit to Celsius.",
-        "What color is the sky?",
-        "Translate hello to Spanish.",
-        "Who invented the telephone?",
-        "What year was the Eiffel Tower built?",
-        "Define photosynthesis.",
-        "How many days are in a week?",
-        "What is the chemical symbol for gold?",
+        "What is 2 plus 2?", "What is the capital of France?",
+        "Convert 100 Fahrenheit to Celsius.", "What color is the sky?",
+        "Translate hello to Spanish.", "Who invented the telephone?",
+        "What year was the Eiffel Tower built?", "Define photosynthesis.",
+        "How many days are in a week?", "What is the chemical symbol for gold?",
     ],
     "medium": [
         "Write a Python function to reverse a linked list.",
         "Explain how TCP handshake works.",
         "Summarise the key points of this article.",
         "What are the pros and cons of microservices?",
-        "Describe the water cycle.",
-        "Compare SQL and NoSQL databases.",
+        "Describe the water cycle.", "Compare SQL and NoSQL databases.",
         "How does garbage collection work in Python?",
         "Write a function to check if a string is a palindrome.",
         "Explain the difference between supervised and unsupervised learning.",
@@ -112,63 +94,38 @@ _COMPLEXITY_ANCHORS: dict[str, list[str]] = {
     ],
 }
 
-# ---------------------------------------------------------------------------
-# Domain anchors
-# ---------------------------------------------------------------------------
-
 _DOMAIN_ANCHORS: dict[str, list[str]] = {
     "code": [
-        "Write Python code to",
-        "Fix this bug in my program",
-        "Implement this algorithm",
-        "Debug the following function",
-        "Refactor this class",
-        "Write a script that",
-        "How do I parse JSON in Python?",
-        "What is wrong with this code?",
+        "Write Python code to", "Fix this bug in my program",
+        "Implement this algorithm", "Debug the following function",
+        "Refactor this class", "Write a script that",
+        "How do I parse JSON in Python?", "What is wrong with this code?",
     ],
     "math": [
-        "Solve this equation",
-        "Calculate the integral of",
-        "Prove this mathematical theorem",
-        "Find the derivative of",
-        "What is the probability of",
-        "Compute the eigenvalues of",
-        "Simplify this expression",
-        "What is the sum of the series",
+        "Solve this equation", "Calculate the integral of",
+        "Prove this mathematical theorem", "Find the derivative of",
+        "What is the probability of", "Compute the eigenvalues of",
+        "Simplify this expression", "What is the sum of the series",
     ],
     "creative": [
-        "Write a short story about",
-        "Compose a poem on",
-        "Create a marketing tagline for",
-        "Write a song lyric",
-        "Generate a creative description of",
-        "Write a dialogue between",
+        "Write a short story about", "Compose a poem on",
+        "Create a marketing tagline for", "Write a song lyric",
+        "Generate a creative description of", "Write a dialogue between",
         "Imagine a world where",
     ],
     "factual": [
-        "What is the definition of",
-        "Who invented",
-        "When did this historical event happen",
-        "What country is",
-        "How many",
-        "What is the capital of",
-        "Who was the first",
-        "What year did",
+        "What is the definition of", "Who invented",
+        "When did this historical event happen", "What country is",
+        "How many", "What is the capital of", "Who was the first", "What year did",
     ],
     "reasoning": [
-        "Compare and contrast",
-        "What are the implications of",
-        "Analyse the argument that",
-        "Evaluate the trade-offs between",
-        "Why does",
-        "What would happen if",
-        "Argue for and against",
+        "Compare and contrast", "What are the implications of",
+        "Analyse the argument that", "Evaluate the trade-offs between",
+        "Why does", "What would happen if", "Argue for and against",
         "What are the pros and cons of",
     ],
 }
 
-# Blend weights for complexity (keyword dominates; semantic is secondary)
 _W_KEYWORD  = 0.50
 _W_TOKEN    = 0.15
 _W_SEMANTIC = 0.35
@@ -201,19 +158,33 @@ class SemanticAnalyzer:
     def _flatten_messages(self, messages: list[dict]) -> str:
         return " ".join(m.get("content", "") for m in messages if m.get("role") == "user")
 
+    def _encode_sync(self, text: str) -> np.ndarray:
+        """CPU-bound encode — always called via thread pool, never inline."""
+        return self._model.encode(text, normalize_embeddings=True)
+
+    async def analyze_async(self, messages: list[dict]) -> QueryMetadata:
+        """Offloads encode() to thread pool so the asyncio event loop is never
+        blocked. With concurrency=50, the sync version serialized all requests
+        on the GIL adding ~1900ms overhead."""
+        assert self._model is not None, "Call load() before analyze_async()"
+        text = self._flatten_messages(messages)
+        loop = asyncio.get_event_loop()
+        embedding = await loop.run_in_executor(_THREAD_POOL, self._encode_sync, text)
+        return self._classify(text, embedding)
+
     def analyze(self, messages: list[dict]) -> QueryMetadata:
+        """Sync fallback — used in calibration and tests."""
         assert self._model is not None, "Call load() before analyze()"
         text = self._flatten_messages(messages)
-        embedding = self._model.encode(text, normalize_embeddings=True)
+        return self._classify(text, self._encode_sync(text))
 
-        # ── Complexity ─────────────────────────────────────────────────────────────────
+    def _classify(self, text: str, embedding: np.ndarray) -> QueryMetadata:
         sem = {
             label: float(np.dot(embedding, anchor))
             for label, anchor in self._complexity_embeddings.items()
         }
         kw  = _keyword_complexity(text)
         tok = _token_complexity(text)
-
         combined = {
             k: _W_SEMANTIC * sem[k] + _W_KEYWORD * kw[k] + _W_TOKEN * tok[k]
             for k in sem
@@ -221,7 +192,6 @@ class SemanticAnalyzer:
         complexity       = max(combined, key=combined.__getitem__)
         complexity_score = combined[complexity]
 
-        # ── Domain ───────────────────────────────────────────────────────────────────
         domain_scores = {
             label: float(np.dot(embedding, anchor))
             for label, anchor in self._domain_embeddings.items()
