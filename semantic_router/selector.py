@@ -28,16 +28,15 @@ def select(
         if (pref.max_latency_ms is None or b.estimated_latency_ms <= pref.max_latency_ms)
         and (pref.min_accuracy is None or b.estimated_accuracy >= pref.min_accuracy)
     ]
+    # Fallback: if no model meets the hard floor, pick the most accurate one available
     if not candidates:
-        raise NoEligibleModelError()
+        candidates = sorted(bids, key=lambda b: b.estimated_accuracy, reverse=True)[:1]
 
     # Stage 2 — 4D weighted score (lower = better)
     def effective_cost(bid: BidResponse) -> float:
-        # Latency overbidders appear more expensive (penalty multiplier > 1)
         return bid.estimated_cost_usd * reputation.get_penalty_multiplier(bid.model_id)
 
     def effective_accuracy(bid: BidResponse) -> float:
-        # Accuracy overbidders appear less accurate (discount < 1)
         discount = reputation.get_accuracy_discount(bid.model_id, domain, complexity)
         return bid.estimated_accuracy * discount
 
