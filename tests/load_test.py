@@ -6,14 +6,14 @@ result to a CSV, and prints a summary analysis report.
 
 Usage:
     cd ~/semantic-llm-router
-    python tests/load_test.py                          # 1000 requests, concurrency 10
+    python tests/load_test.py                              # built-in queries
+    python tests/load_test.py --dataset datasets/hf_1000.json  # HF dataset
     python tests/load_test.py --requests 500 --concurrency 20
     python tests/load_test.py --router http://my-server:8080
     python tests/load_test.py --output results/run1.csv
 
 Output:
-    results/load_test_YYYYMMDD_HHMMSS.csv   (every request logged)
-    Printed analysis report at the end
+    results/load_test_YYYYMMDD_HHMMSS.csv
 """
 from __future__ import annotations
 import argparse
@@ -28,52 +28,34 @@ from statistics import mean
 import httpx
 
 # ---------------------------------------------------------------------------
-# Diverse queries: 5 domains x 3 complexities
+# Built-in queries (239 unique across 5 domains x 3 complexities)
+# Used when --dataset is not specified.
 # ---------------------------------------------------------------------------
 
 QUERIES: dict[tuple[str, str], list[str]] = {
     ("factual", "easy"): [
-        "What is the capital of France?",
-        "What is the chemical symbol for gold?",
-        "How many days are in a leap year?",
-        "Who invented the telephone?",
-        "What is the speed of light in km/s?",
-        "What is the largest planet in our solar system?",
-        "How many continents are there on Earth?",
-        "What is the boiling point of water in Celsius?",
-        "Who painted the Mona Lisa?",
-        "What is the capital of Japan?",
-        "How many bones are in the adult human body?",
-        "What language is spoken in Brazil?",
-        "What is the currency of the United Kingdom?",
-        "How many sides does a hexagon have?",
-        "What is the smallest country in the world?",
-        "Who wrote Romeo and Juliet?",
-        "What is the tallest mountain on Earth?",
-        "What gas do plants use during photosynthesis?",
-        "What is the atomic number of carbon?",
-        "How many planets are in our solar system?",
+        "What is the capital of France?", "What is the chemical symbol for gold?",
+        "How many days are in a leap year?", "Who invented the telephone?",
+        "What is the speed of light in km/s?", "What is the largest planet in our solar system?",
+        "How many continents are there on Earth?", "What is the boiling point of water in Celsius?",
+        "Who painted the Mona Lisa?", "What is the capital of Japan?",
+        "How many bones are in the adult human body?", "What language is spoken in Brazil?",
+        "What is the currency of the United Kingdom?", "How many sides does a hexagon have?",
+        "What is the smallest country in the world?", "Who wrote Romeo and Juliet?",
+        "What is the tallest mountain on Earth?", "What gas do plants use during photosynthesis?",
+        "What is the atomic number of carbon?", "How many planets are in our solar system?",
     ],
     ("factual", "medium"): [
-        "Explain the difference between DNA and RNA.",
-        "What caused the fall of the Roman Empire?",
-        "How does the immune system fight viruses?",
-        "What is the significance of the Magna Carta?",
-        "Explain how vaccines work.",
-        "What are the main causes of climate change?",
-        "How does the stock market work?",
-        "What is the difference between a virus and a bacterium?",
-        "Explain the greenhouse effect.",
-        "What were the main causes of World War I?",
-        "How does the human digestive system work?",
-        "What is the significance of the Industrial Revolution?",
-        "Explain the concept of supply and demand.",
-        "How does GPS navigation work?",
-        "What is the role of the United Nations?",
-        "Explain how antibiotics work.",
+        "Explain the difference between DNA and RNA.", "What caused the fall of the Roman Empire?",
+        "How does the immune system fight viruses?", "What is the significance of the Magna Carta?",
+        "Explain how vaccines work.", "What are the main causes of climate change?",
+        "How does the stock market work?", "What is the difference between a virus and a bacterium?",
+        "Explain the greenhouse effect.", "What were the main causes of World War I?",
+        "How does the human digestive system work?", "What is the significance of the Industrial Revolution?",
+        "Explain the concept of supply and demand.", "How does GPS navigation work?",
+        "What is the role of the United Nations?", "Explain how antibiotics work.",
         "What is the difference between renewable and non-renewable energy?",
-        "How does the brain process memories?",
-        "What is the significance of the Silk Road?",
+        "How does the brain process memories?", "What is the significance of the Silk Road?",
         "Explain what causes earthquakes.",
     ],
     ("factual", "hard"): [
@@ -89,25 +71,18 @@ QUERIES: dict[tuple[str, str], list[str]] = {
         "Explain the game-theoretic foundations of nuclear deterrence.",
     ],
     ("math", "easy"): [
-        "What is 15% of 240?",
-        "What is the square root of 144?",
+        "What is 15% of 240?", "What is the square root of 144?",
         "If a rectangle is 8m wide and 5m tall, what is its area?",
-        "What is 3/4 expressed as a decimal?",
-        "What is 2 to the power of 8?",
+        "What is 3/4 expressed as a decimal?", "What is 2 to the power of 8?",
         "If you buy 6 items at $3.50 each, what is the total?",
         "What is the perimeter of a square with side 7cm?",
         "Convert 100 kilometres to miles (1km = 0.621 miles).",
-        "What is 20% of 85?",
-        "If a train travels at 60 km/h for 2.5 hours, how far does it go?",
-        "What is the sum of angles in a triangle?",
-        "What is 1/3 + 1/4?",
-        "How many seconds are in 2.5 hours?",
-        "If x + 7 = 15, what is x?",
-        "What is the area of a circle with radius 5? (use pi=3.14)",
-        "What is 25% of 200?",
+        "What is 20% of 85?", "If a train travels at 60 km/h for 2.5 hours, how far does it go?",
+        "What is the sum of angles in a triangle?", "What is 1/3 + 1/4?",
+        "How many seconds are in 2.5 hours?", "If x + 7 = 15, what is x?",
+        "What is the area of a circle with radius 5? (use pi=3.14)", "What is 25% of 200?",
         "If a dozen eggs cost $4.80, how much does each egg cost?",
-        "What is 7 squared minus 5 squared?",
-        "Convert 37 degrees Celsius to Fahrenheit.",
+        "What is 7 squared minus 5 squared?", "Convert 37 degrees Celsius to Fahrenheit.",
         "If 3x = 21, what is x?",
     ],
     ("math", "medium"): [
@@ -136,25 +111,25 @@ QUERIES: dict[tuple[str, str], list[str]] = {
     ],
     ("code", "easy"): [
         "Write a Python function to add two numbers.",
-        "Write a function that returns the length of a string.",
         "Write a Python function to check if a number is even.",
-        "Write a function to find the maximum of two numbers.",
         "Write a Python function to reverse a string.",
-        "Write a function that returns True if a list is empty.",
         "Write a Python function to convert Celsius to Fahrenheit.",
         "Write a function to count the vowels in a string.",
         "Write a Python function to check if a string is a palindrome.",
-        "Write a function that returns the first element of a list.",
         "Write a Python function to calculate the factorial of n.",
         "Write a function that squares all numbers in a list.",
         "Write a Python function to find the minimum value in a list.",
-        "Write a function that checks if a number is positive.",
-        "Write a Python function to concatenate two lists.",
         "Write a Python function to check if a year is a leap year.",
         "Write a function that removes duplicates from a list.",
         "Write a Python function to return the nth Fibonacci number.",
         "Write a function that checks if a string contains only digits.",
         "Write a Python function to flatten a list one level deep.",
+        "Write a function to find the maximum of two numbers.",
+        "Write a function that returns True if a list is empty.",
+        "Write a Python function to concatenate two lists.",
+        "Write a function that returns the first element of a list.",
+        "Write a function that checks if a number is positive.",
+        "Write a Python function to find all even numbers in a list.",
     ],
     ("code", "medium"): [
         "Implement a binary search algorithm in Python.",
@@ -239,7 +214,7 @@ QUERIES: dict[tuple[str, str], list[str]] = {
         "Evaluate the philosophical tension between determinism and moral responsibility.",
         "What are the second-order economic effects of automating white-collar jobs?",
         "Analyse the logical consistency of Rawls' veil of ignorance argument.",
-        "How does Gödel's incompleteness theorem limit the foundations of mathematics?",
+        "How does Godel's incompleteness theorem limit the foundations of mathematics?",
         "Evaluate the strategic implications of first-mover advantage in network-effects markets.",
         "What are the epistemological challenges of training AI on internet-scale data?",
         "Analyse the causal mechanisms linking financial deregulation to systemic risk.",
@@ -247,26 +222,16 @@ QUERIES: dict[tuple[str, str], list[str]] = {
         "How do information asymmetries affect market efficiency in healthcare?",
     ],
     ("creative", "easy"): [
-        "Write a two-sentence story about a friendly dragon.",
-        "Write a haiku about the ocean.",
-        "Create a tagline for a coffee shop.",
-        "Write one sentence describing the feeling of rain.",
-        "Write a two-line rhyme about Monday mornings.",
-        "Describe a sunset in one sentence.",
-        "Write a short fortune cookie message.",
-        "Create a slogan for a bookstore.",
-        "Write a two-sentence story about a lost key.",
-        "Describe the smell of fresh bread in one sentence.",
-        "Write a one-line joke about programmers.",
-        "Create a name for a new ice cream flavour.",
-        "Write a two-sentence bedtime story.",
-        "Describe the sound of a thunderstorm in one sentence.",
-        "Create a tagline for a gym.",
-        "Write a haiku about autumn leaves.",
-        "Describe the feeling of finishing a good book.",
-        "Write a two-sentence story about a talking cat.",
-        "Create a product name for a smart umbrella.",
-        "Write a one-sentence description of the colour blue.",
+        "Write a two-sentence story about a friendly dragon.", "Write a haiku about the ocean.",
+        "Create a tagline for a coffee shop.", "Write one sentence describing the feeling of rain.",
+        "Write a two-line rhyme about Monday mornings.", "Describe a sunset in one sentence.",
+        "Write a short fortune cookie message.", "Create a slogan for a bookstore.",
+        "Write a two-sentence story about a lost key.", "Describe the smell of fresh bread in one sentence.",
+        "Write a one-line joke about programmers.", "Create a name for a new ice cream flavour.",
+        "Write a two-sentence bedtime story.", "Describe the sound of a thunderstorm in one sentence.",
+        "Create a tagline for a gym.", "Write a haiku about autumn leaves.",
+        "Describe the feeling of finishing a good book.", "Write a two-sentence story about a talking cat.",
+        "Create a product name for a smart umbrella.", "Write a one-sentence description of the colour blue.",
     ],
     ("creative", "medium"): [
         "Write a short story about a robot learning to paint.",
@@ -308,14 +273,24 @@ MODES = ["cost", "eco", "accuracy", "custom"]
 MODE_WEIGHTS = [0.35, 0.25, 0.25, 0.15]
 
 
-def build_request_list(n: int) -> list[dict]:
+def build_request_list(n: int, dataset_path: str | None = None) -> list[dict]:
+    if dataset_path:
+        import json as _json
+        with open(dataset_path) as f:
+            items = _json.load(f)
+        print(f"  Loaded {len(items)} items from {dataset_path}")
+        random.shuffle(items)
+        if n > len(items):
+            items += random.choices(items, k=n - len(items))
+        return items[:n]
+
     all_queries = []
     for (domain, complexity), queries in QUERIES.items():
         for q in queries:
             all_queries.append({"domain": domain, "complexity": complexity, "query": q})
     random.shuffle(all_queries)
     if n > len(all_queries):
-        all_queries += random.choices(all_queries, k=n - len(all_queries))
+        all_queries.extend(random.choices(all_queries, k=n - len(all_queries)))
     return all_queries[:n]
 
 
@@ -334,24 +309,52 @@ def random_router_params() -> dict:
     return {"mode": mode}
 
 
-async def send_request(client: httpx.AsyncClient, router_url: str, req_id: int, item: dict) -> dict:
+# ---------------------------------------------------------------------------
+# Single request — non-streaming.
+# Do NOT send stream=True: the router's adapter.complete() calls resp.json()
+# which fails on an SSE response and returns HTTP 500.
+# Wall time measures end-to-end latency; actual_latency_ms header gives
+# the router's internal inference measurement.
+# ---------------------------------------------------------------------------
+
+async def send_request(
+    client: httpx.AsyncClient,
+    router_url: str,
+    req_id: int,
+    item: dict,
+) -> dict:
     params = random_router_params()
     payload = {
-        "model": "auto",
+        "model":    "auto",
         "messages": [{"role": "user", "content": item["query"]}],
         "extra_body": {"router": params},
     }
-    t0 = time.monotonic()
+
     result = {
-        "req_id": req_id, "domain": item["domain"], "complexity": item["complexity"],
-        "query": item["query"][:100], "mode": params.get("mode", "custom"),
-        "status": "", "model_winner": "", "bid_latency_ms": "", "actual_latency_ms": "",
-        "charged_usd": "", "energy_j": "", "load": "", "wall_ms": "", "error": "",
+        "req_id":            req_id,
+        "domain":            item["domain"],
+        "complexity":        item["complexity"],
+        "query":             item["query"][:100],
+        "mode":              params.get("mode", "custom"),
+        "status":            "",
+        "model_winner":      "",
+        "bid_latency_ms":    "",
+        "actual_latency_ms": "",
+        "ttft_ms":           "",
+        "output_tokens":     "",
+        "charged_usd":       "",
+        "energy_j":          "",
+        "load":              "",
+        "wall_ms":           "",
+        "error":             "",
     }
+
+    t0 = time.monotonic()
     try:
         resp = await client.post(f"{router_url}/v1/chat/completions", json=payload)
         result["wall_ms"] = int((time.monotonic() - t0) * 1000)
         result["status"]  = resp.status_code
+
         h = resp.headers
         result["model_winner"]      = h.get("x-router-model", "")
         result["bid_latency_ms"]    = h.get("x-router-bid-latency-ms", "")
@@ -359,33 +362,47 @@ async def send_request(client: httpx.AsyncClient, router_url: str, req_id: int, 
         result["charged_usd"]       = h.get("x-router-charged-usd", "")
         result["energy_j"]          = h.get("x-router-energy-j", "")
         result["load"]              = h.get("x-router-load", "")
-        if resp.status_code != 200:
-            result["error"] = resp.json().get("detail", str(resp.status_code))
+        # actual_latency_ms approximates TTFT (time until inference completes)
+        result["ttft_ms"]           = h.get("x-router-actual-latency-ms", "")
+
+        if resp.status_code == 200:
+            body = resp.json()
+            result["output_tokens"] = body.get("usage", {}).get("completion_tokens", "")
+        else:
+            try:
+                result["error"] = resp.json().get("detail", str(resp.status_code))
+            except Exception:
+                result["error"] = resp.text[:200]
+
     except Exception as e:
         result["wall_ms"] = int((time.monotonic() - t0) * 1000)
         result["status"]  = "error"
         result["error"]   = str(e)
+
     return result
 
+
+# ---------------------------------------------------------------------------
+# Analysis
+# ---------------------------------------------------------------------------
 
 def analyse(rows: list[dict]) -> None:
     W = 62
     ok   = [r for r in rows if r["status"] == 200]
     errs = [r for r in rows if r["status"] != 200]
 
-    def sf(v): 
+    def sf(v):
         try: return float(v)
         except: return None
 
     print(f"\n{'='*W}\n  LOAD TEST RESULTS\n{'='*W}")
     print(f"  Total requests : {len(rows)}")
     print(f"  Successful     : {len(ok)}  ({100*len(ok)//max(len(rows),1)}%)")
-    print(f"  Errors/fallback: {len(errs)}")
+    print(f"  Errors         : {len(errs)}")
 
     if not ok:
         return
 
-    # Routing distribution
     print(f"\n{'='*W}\n  ROUTING DISTRIBUTION\n{'='*W}")
     mc: dict[str, int] = {}
     for r in ok:
@@ -395,13 +412,11 @@ def analyse(rows: list[dict]) -> None:
         bar = "█" * int(cnt / len(ok) * 30)
         print(f"  {model:<22} {bar:<30} {100*cnt//len(ok):3}%  ({cnt})")
 
-    # Wall latency
     wv = sorted([sf(r["wall_ms"]) for r in ok if sf(r["wall_ms"])])
     if wv:
         print(f"\n{'='*W}\n  WALL LATENCY (end-to-end ms)\n{'='*W}")
         print(f"  P50={wv[len(wv)//2]:.0f}  P95={wv[int(len(wv)*.95)]:.0f}  P99={wv[int(len(wv)*.99)]:.0f}  mean={mean(wv):.0f}")
 
-    # Per-model latency
     print(f"\n{'='*W}\n  ACTUAL LATENCY PER MODEL\n{'='*W}")
     bm: dict[str, list] = {}
     for r in ok:
@@ -412,18 +427,16 @@ def analyse(rows: list[dict]) -> None:
         vals.sort()
         print(f"  {model:<22} P50={vals[len(vals)//2]:.0f}ms  P95={vals[int(len(vals)*.95)]:.0f}ms  mean={mean(vals):.0f}ms  (n={len(vals)})")
 
-    # Cost & energy
     costs    = [sf(r["charged_usd"]) for r in ok if sf(r["charged_usd"]) is not None]
     energies = [sf(r["energy_j"])    for r in ok if sf(r["energy_j"])    is not None]
     if costs:
-        print(f"\n{'='*W}\n  COST & ENERGY SUMMARY\n{'='*W}")
+        print(f"\n{'='*W}\n  COST & ENERGY\n{'='*W}")
         print(f"  Total cost     : ${sum(costs):.6f}")
         print(f"  Avg per request: ${mean(costs):.8f}")
         if energies:
             print(f"  Total energy   : {sum(energies):.2f} J")
             print(f"  Avg per request: {mean(energies):.3f} J")
 
-    # Routing by domain
     print(f"\n{'='*W}\n  ROUTING BY DOMAIN\n{'='*W}")
     for domain in sorted({r["domain"] for r in ok}):
         dr = [r for r in ok if r["domain"] == domain]
@@ -432,7 +445,6 @@ def analyse(rows: list[dict]) -> None:
         parts = "  ".join(f"{m}:{c}" for m, c in sorted(dc.items(), key=lambda x: -x[1]))
         print(f"  {domain:<12} ({len(dr):4} reqs)  {parts}")
 
-    # Routing by complexity
     print(f"\n{'='*W}\n  ROUTING BY COMPLEXITY\n{'='*W}")
     for cplx in ["easy", "medium", "hard"]:
         cr = [r for r in ok if r["complexity"] == cplx]
@@ -441,7 +453,6 @@ def analyse(rows: list[dict]) -> None:
         parts = "  ".join(f"{m}:{c}" for m, c in sorted(cc.items(), key=lambda x: -x[1]))
         print(f"  {cplx:<8} ({len(cr):4} reqs)  {parts}")
 
-    # Routing by mode
     print(f"\n{'='*W}\n  ROUTING BY MODE\n{'='*W}")
     for mode in ["cost", "eco", "accuracy", "custom"]:
         mr = [r for r in ok if r["mode"] == mode]
@@ -455,7 +466,7 @@ def analyse(rows: list[dict]) -> None:
         print(f"\n{'='*W}\n  ERRORS\n{'='*W}")
         ec: dict[str, int] = {}
         for r in errs:
-            e = r["error"] or str(r["status"])
+            e = r.get("error") or str(r.get("status", "?"))
             ec[e] = ec.get(e, 0) + 1
         for msg, cnt in sorted(ec.items(), key=lambda x: -x[1])[:10]:
             print(f"  {cnt:4}x  {msg[:70]}")
@@ -463,14 +474,19 @@ def analyse(rows: list[dict]) -> None:
     print(f"\n{'='*W}\n")
 
 
-async def run(router_url: str, n_requests: int, concurrency: int, output: str) -> None:
-    requests_list = build_request_list(n_requests)
+# ---------------------------------------------------------------------------
+# Runner
+# ---------------------------------------------------------------------------
+
+async def run(router_url: str, n_requests: int, concurrency: int,
+              output: str, dataset_path: str | None) -> None:
+    requests_list = build_request_list(n_requests, dataset_path)
     os.makedirs(os.path.dirname(output) if os.path.dirname(output) else ".", exist_ok=True)
 
     fieldnames = [
         "req_id", "domain", "complexity", "query", "mode", "status",
         "model_winner", "bid_latency_ms", "actual_latency_ms",
-        "charged_usd", "energy_j", "load", "wall_ms", "error",
+        "ttft_ms", "output_tokens", "charged_usd", "energy_j", "load", "wall_ms", "error",
     ]
 
     results: list[dict] = []
@@ -502,7 +518,6 @@ async def run(router_url: str, n_requests: int, concurrency: int, output: str) -
 
     elapsed = time.monotonic() - t0
     print(f"\r  [{'='*40}] {n_requests}/{n_requests}  ({elapsed:.1f}s, {n_requests/elapsed:.1f} req/s)\n")
-
     analyse(results)
     print(f"  Full results saved to: {output}")
 
@@ -513,11 +528,13 @@ def main() -> None:
     parser.add_argument("--requests",    type=int, default=1000)
     parser.add_argument("--concurrency", type=int, default=10)
     parser.add_argument("--output",      default="")
+    parser.add_argument("--dataset",     default=None,
+                        help="Path to JSON dataset from build_dataset.py")
     args = parser.parse_args()
     if not args.output:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         args.output = f"results/load_test_{ts}.csv"
-    asyncio.run(run(args.router, args.requests, args.concurrency, args.output))
+    asyncio.run(run(args.router, args.requests, args.concurrency, args.output, args.dataset))
 
 
 if __name__ == "__main__":
