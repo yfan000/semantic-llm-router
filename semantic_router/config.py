@@ -15,7 +15,7 @@ MODE_PRESETS: dict[RouterMode, dict] = {
     ),
 }
 
-DEFAULT_PREFERENCE = UserPreference()  # equal weights, no hard constraints
+DEFAULT_PREFERENCE = UserPreference()
 
 # Bidding
 BID_TIMEOUT_MS: int = 200
@@ -36,20 +36,24 @@ DEFAULT_ACCURACY_PRIOR: float = 0.70
 ACCURACY_BID_EMA_ALPHA: float = 0.05
 ACCURACY_BID_GRACE_RATIO: float = 0.90
 
-# Calibration spot-check
-CALIBRATION_RATE: float = 0.01
+# Calibration spot-check disabled.
+# Requires an external API key and causes 500 errors if OPENAI_API_KEY
+# routes through an Anthropic proxy (triggers "Streaming is required" error).
+CALIBRATION_RATE: float = 0.0
 CALIBRATION_DRIFT_THRESHOLD: float = 0.10
 
-# LLM judge — uses registered vLLM endpoints via HTTP (no separate model download).
-# Map: model_id being judged → (judge_base_url, judge_model_id).
+# LLM judge — uses registered vLLM endpoints via HTTP.
+# Map: model_id being judged -> (judge_base_url, judge_model_id).
 # Cross-family pairing avoids self-enhancement bias.
-# Leave empty {} to disable LLM judging (only deterministic math/code scoring).
 # Example:
 #   JUDGE_ENDPOINTS = {
 #       "qwen2.5-1.5b": ("http://localhost:8002", "phi-3.5-mini"),
 #       "phi-3.5-mini":  ("http://localhost:8001", "qwen2.5-1.5b"),
 #   }
 JUDGE_ENDPOINTS: dict[str, tuple[str, str]] = {}
+
+# Benchmark ground-truth lookup for objective online accuracy scoring.
+BENCHMARK_PATH: str | None = "datasets/hf_1000.json"
 
 # Persistence
 USER_PREFS_PATH: str = "user_preferences.json"
