@@ -49,7 +49,9 @@ async def chat_completions(request: Request) -> JSONResponse:
     sla = RequestSLA(**router_params) if router_params else RequestSLA()
     user_id = sla.user_id
     pref = user_reg.resolve_preference(user_id, sla)
-    meta = analyzer.analyze(messages)
+
+    # Semantic classification — runs encode() in thread pool, never blocks event loop
+    meta = await analyzer.analyze_async(messages)
 
     if user_id:
         user_reg.check_budget(user_id, 300, 300.0 / 2.0)
@@ -66,9 +68,7 @@ async def chat_completions(request: Request) -> JSONResponse:
     winning_bid = select(bids, pref, reputation, meta.domain, meta.complexity)
     winning_adapter = registry.get_adapter(winning_bid.model_id)
 
-    # Exclude "stream" so it is never forwarded to vLLM.
-    # adapter.complete() calls resp.json() which fails on SSE responses
-    # and causes a 500 error — this is the root cause of the streaming error.
+    # Exclude "stream" so it is never forwarded to vLLM
     passthrough = {
         k: v for k, v in body.items()
         if k not in ("model", "messages", "extra_body", "stream")
