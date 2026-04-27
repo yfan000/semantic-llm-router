@@ -1,19 +1,18 @@
 """
 load_test.py — 1000-request load test against the real running router.
 
-Sends diverse requests across all domains and complexities, logs every
-result to a CSV, and prints a summary analysis report.
-
 Usage:
-    cd ~/semantic-llm-router
-    python tests/load_test.py                              # built-in queries
+    python tests/load_test.py                                  # mixed modes
+    python tests/load_test.py --mode accuracy                  # all accuracy mode
+    python tests/load_test.py --mode cost                      # all cost mode
+    python tests/load_test.py --mode eco                       # all eco mode
     python tests/load_test.py --dataset datasets/hf_1000.json  # HF dataset
-    python tests/load_test.py --requests 500 --concurrency 20
-    python tests/load_test.py --router http://my-server:8080
+    python tests/load_test.py --requests 1000 --concurrency 50
     python tests/load_test.py --output results/run1.csv
 
 Output:
-    results/load_test_YYYYMMDD_HHMMSS.csv
+    results/load_test_YYYYMMDD_HHMMSS.csv          (mixed modes)
+    results/load_test_accuracy_YYYYMMDD_HHMMSS.csv  (--mode accuracy)
 """
 from __future__ import annotations
 import argparse
@@ -26,11 +25,6 @@ from datetime import datetime
 from statistics import mean
 
 import httpx
-
-# ---------------------------------------------------------------------------
-# Built-in queries (239 unique across 5 domains x 3 complexities)
-# Used when --dataset is not specified.
-# ---------------------------------------------------------------------------
 
 QUERIES: dict[tuple[str, str], list[str]] = {
     ("factual", "easy"): [
@@ -272,6 +266,9 @@ QUERIES: dict[tuple[str, str], list[str]] = {
 MODES = ["cost", "eco", "accuracy", "custom"]
 MODE_WEIGHTS = [0.35, 0.25, 0.25, 0.15]
 
+# Set by --mode flag; when not None, ALL requests use this mode
+_FORCED_MODE: str | None = None
+
 
 def build_request_list(n: int, dataset_path: str | None = None) -> list[dict]:
     if dataset_path:
@@ -283,7 +280,6 @@ def build_request_list(n: int, dataset_path: str | None = None) -> list[dict]:
         if n > len(items):
             items += random.choices(items, k=n - len(items))
         return items[:n]
-
     all_queries = []
     for (domain, complexity), queries in QUERIES.items():
         for q in queries:
@@ -295,6 +291,8 @@ def build_request_list(n: int, dataset_path: str | None = None) -> list[dict]:
 
 
 def random_router_params() -> dict:
+    if _FORCED_MODE is not None:
+        return {"mode": _FORCED_MODE}
     mode = random.choices(MODES, weights=MODE_WEIGHTS)[0]
     if mode == "custom":
         w = [random.random() for _ in range(4)]
@@ -309,52 +307,25 @@ def random_router_params() -> dict:
     return {"mode": mode}
 
 
-# ---------------------------------------------------------------------------
-# Single request — non-streaming.
-# Do NOT send stream=True: the router's adapter.complete() calls resp.json()
-# which fails on an SSE response and returns HTTP 500.
-# Wall time measures end-to-end latency; actual_latency_ms header gives
-# the router's internal inference measurement.
-# ---------------------------------------------------------------------------
-
-async def send_request(
-    client: httpx.AsyncClient,
-    router_url: str,
-    req_id: int,
-    item: dict,
-) -> dict:
+async def send_request(client: httpx.AsyncClient, router_url: str, req_id: int, item: dict) -> dict:
     params = random_router_params()
     payload = {
         "model":    "auto",
         "messages": [{"role": "user", "content": item["query"]}],
         "extra_body": {"router": params},
     }
-
     result = {
-        "req_id":            req_id,
-        "domain":            item["domain"],
-        "complexity":        item["complexity"],
-        "query":             item["query"][:100],
-        "mode":              params.get("mode", "custom"),
-        "status":            "",
-        "model_winner":      "",
-        "bid_latency_ms":    "",
-        "actual_latency_ms": "",
-        "ttft_ms":           "",
-        "output_tokens":     "",
-        "charged_usd":       "",
-        "energy_j":          "",
-        "load":              "",
-        "wall_ms":           "",
-        "error":             "",
+        "req_id": req_id, "domain": item["domain"], "complexity": item["complexity"],
+        "query": item["query"][:100], "mode": params.get("mode", "custom"),
+        "status": "", "model_winner": "", "bid_latency_ms": "", "actual_latency_ms": "",
+        "ttft_ms": "", "output_tokens": "", "charged_usd": "", "energy_j": "",
+        "load": "", "wall_ms": "", "error": "",
     }
-
     t0 = time.monotonic()
     try:
         resp = await client.post(f"{router_url}/v1/chat/completions", json=payload)
         result["wall_ms"] = int((time.monotonic() - t0) * 1000)
         result["status"]  = resp.status_code
-
         h = resp.headers
         result["model_winner"]      = h.get("x-router-model", "")
         result["bid_latency_ms"]    = h.get("x-router-bid-latency-ms", "")
@@ -362,29 +333,19 @@ async def send_request(
         result["charged_usd"]       = h.get("x-router-charged-usd", "")
         result["energy_j"]          = h.get("x-router-energy-j", "")
         result["load"]              = h.get("x-router-load", "")
-        # actual_latency_ms approximates TTFT (time until inference completes)
         result["ttft_ms"]           = h.get("x-router-actual-latency-ms", "")
-
         if resp.status_code == 200:
             body = resp.json()
             result["output_tokens"] = body.get("usage", {}).get("completion_tokens", "")
         else:
-            try:
-                result["error"] = resp.json().get("detail", str(resp.status_code))
-            except Exception:
-                result["error"] = resp.text[:200]
-
+            try:    result["error"] = resp.json().get("detail", str(resp.status_code))
+            except: result["error"] = resp.text[:200]
     except Exception as e:
         result["wall_ms"] = int((time.monotonic() - t0) * 1000)
         result["status"]  = "error"
         result["error"]   = str(e)
-
     return result
 
-
-# ---------------------------------------------------------------------------
-# Analysis
-# ---------------------------------------------------------------------------
 
 def analyse(rows: list[dict]) -> None:
     W = 62
@@ -399,6 +360,8 @@ def analyse(rows: list[dict]) -> None:
     print(f"  Total requests : {len(rows)}")
     print(f"  Successful     : {len(ok)}  ({100*len(ok)//max(len(rows),1)}%)")
     print(f"  Errors         : {len(errs)}")
+    if _FORCED_MODE:
+        print(f"  Mode           : {_FORCED_MODE} (all requests)")
 
     if not ok:
         return
@@ -453,14 +416,15 @@ def analyse(rows: list[dict]) -> None:
         parts = "  ".join(f"{m}:{c}" for m, c in sorted(cc.items(), key=lambda x: -x[1]))
         print(f"  {cplx:<8} ({len(cr):4} reqs)  {parts}")
 
-    print(f"\n{'='*W}\n  ROUTING BY MODE\n{'='*W}")
-    for mode in ["cost", "eco", "accuracy", "custom"]:
-        mr = [r for r in ok if r["mode"] == mode]
-        if not mr: continue
-        mmc: dict[str, int] = {}
-        for r in mr: mmc[r["model_winner"] or "?"] = mmc.get(r["model_winner"] or "?", 0) + 1
-        parts = "  ".join(f"{m}:{c}" for m, c in sorted(mmc.items(), key=lambda x: -x[1]))
-        print(f"  {mode:<10} ({len(mr):4} reqs)  {parts}")
+    if not _FORCED_MODE:
+        print(f"\n{'='*W}\n  ROUTING BY MODE\n{'='*W}")
+        for mode in ["cost", "eco", "accuracy", "custom"]:
+            mr = [r for r in ok if r["mode"] == mode]
+            if not mr: continue
+            mmc: dict[str, int] = {}
+            for r in mr: mmc[r["model_winner"] or "?"] = mmc.get(r["model_winner"] or "?", 0) + 1
+            parts = "  ".join(f"{m}:{c}" for m, c in sorted(mmc.items(), key=lambda x: -x[1]))
+            print(f"  {mode:<10} ({len(mr):4} reqs)  {parts}")
 
     if errs:
         print(f"\n{'='*W}\n  ERRORS\n{'='*W}")
@@ -474,12 +438,8 @@ def analyse(rows: list[dict]) -> None:
     print(f"\n{'='*W}\n")
 
 
-# ---------------------------------------------------------------------------
-# Runner
-# ---------------------------------------------------------------------------
-
 async def run(router_url: str, n_requests: int, concurrency: int,
-              output: str, dataset_path: str | None) -> None:
+              output: str, dataset_path: str | None = None) -> None:
     requests_list = build_request_list(n_requests, dataset_path)
     os.makedirs(os.path.dirname(output) if os.path.dirname(output) else ".", exist_ok=True)
 
@@ -488,13 +448,14 @@ async def run(router_url: str, n_requests: int, concurrency: int,
         "model_winner", "bid_latency_ms", "actual_latency_ms",
         "ttft_ms", "output_tokens", "charged_usd", "energy_j", "load", "wall_ms", "error",
     ]
-
     results: list[dict] = []
     sem = asyncio.Semaphore(concurrency)
     done = 0
     t0 = time.monotonic()
 
     print(f"\n  Sending {n_requests} requests to {router_url} (concurrency={concurrency})")
+    if _FORCED_MODE:
+        print(f"  Mode: {_FORCED_MODE} (all requests)")
     print(f"  Output: {output}\n")
 
     async def bounded(req_id: int, item: dict, writer, f) -> None:
@@ -523,17 +484,28 @@ async def run(router_url: str, n_requests: int, concurrency: int,
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser()
+    global _FORCED_MODE
+    parser = argparse.ArgumentParser(description="Load test the semantic LLM router")
     parser.add_argument("--router",      default="http://localhost:8080")
     parser.add_argument("--requests",    type=int, default=1000)
     parser.add_argument("--concurrency", type=int, default=10)
     parser.add_argument("--output",      default="")
     parser.add_argument("--dataset",     default=None,
                         help="Path to JSON dataset from build_dataset.py")
+    parser.add_argument("--mode",        default=None,
+                        choices=["accuracy", "cost", "eco", "custom"],
+                        help="Force ALL requests to use this router mode (default: mixed)")
     args = parser.parse_args()
+
+    if args.mode:
+        _FORCED_MODE = args.mode
+        print(f"  [Mode] All {args.requests} requests forced to: {args.mode}")
+
     if not args.output:
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        args.output = f"results/load_test_{ts}.csv"
+        ts     = datetime.now().strftime("%Y%m%d_%H%M%S")
+        suffix = f"_{args.mode}" if args.mode else ""
+        args.output = f"results/load_test{suffix}_{ts}.csv"
+
     asyncio.run(run(args.router, args.requests, args.concurrency, args.output, args.dataset))
 
 
