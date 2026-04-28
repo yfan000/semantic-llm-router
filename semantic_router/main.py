@@ -51,8 +51,7 @@ async def chat_completions(request: Request) -> JSONResponse:
     pref = user_reg.resolve_preference(user_id, sla)
 
     # Semantic classification — runs in thread pool, never blocks event loop.
-    # If domain/complexity are provided in router params, use them directly
-    # (avoids misclassification of MMLU/GSM8K/LogiQA benchmark queries).
+    # If domain/complexity are provided in router params, use them directly.
     meta = await analyzer.analyze_async(messages)
     if sla.domain:
         meta.domain = sla.domain
@@ -79,11 +78,21 @@ async def chat_completions(request: Request) -> JSONResponse:
         if k not in ("model", "messages", "extra_body", "stream")
     }
     response_dict, router_headers = await dispatch(
-        adapter=winning_adapter, winning_bid=winning_bid, messages=messages,
-        domain=meta.domain, complexity=meta.complexity, user_id=user_id,
-        user_registry=user_reg, reputation=reputation, sampler=sampler,
+        adapter=winning_adapter,
+        winning_bid=winning_bid,
+        messages=messages,
+        domain=meta.domain,
+        complexity=meta.complexity,
+        user_id=user_id,
+        user_registry=user_reg,
+        reputation=reputation,
+        sampler=sampler,
         extra_kwargs=passthrough,
     )
+    # Debug: verify mode preset is applied. If accuracy-weight=0.25, preset failed.
+    router_headers["X-Router-Accuracy-Weight"] = f"{pref.accuracy_weight:.2f}"
+    router_headers["X-Router-Cost-Weight"]     = f"{pref.cost_weight:.2f}"
+
     return JSONResponse(content=response_dict, headers=router_headers)
 
 
@@ -130,14 +139,11 @@ async def register_model(req: RegisterRequest) -> dict:
     if capability and "_default" not in capability:
         capability["_default"] = min(capability.values())
 
-    # Build accuracy_priors: prefer explicitly provided values, fall back to
-    # min_accuracy_capability so the model never bids DEFAULT_ACCURACY_PRIOR (0.70).
-    # If both are empty, both models bid 0.70 → cost always decides → qwen wins 100%.
     accuracy_priors = dict(req.accuracy_priors)
     if capability:
         for key, score in capability.items():
             if ":" in key and key not in accuracy_priors:
-                accuracy_priors[key] = score   # fill gaps from capability dict
+                accuracy_priors[key] = score
 
     adapter = adapter_cls(
         model_id=req.model_id,
@@ -156,7 +162,7 @@ async def register_model(req: RegisterRequest) -> dict:
     return {
         "registered":              req.model_id,
         "min_accuracy_capability": capability,
-        "accuracy_priors_stored":  accuracy_priors,   # verify what was stored
+        "accuracy_priors_stored":  accuracy_priors,
     }
 
 
@@ -189,7 +195,6 @@ async def model_reputation(model_id: str) -> dict:
 
 @app.get("/router/{model_id}/details")
 async def model_details(model_id: str) -> dict:
-    """Show stored accuracy_priors. If empty or all 0.70, registration failed."""
     adapter = registry.get_adapter(model_id)
     if not adapter:
         raise HTTPException(status_code=404, detail=f"Model '{model_id}' not registered.")
