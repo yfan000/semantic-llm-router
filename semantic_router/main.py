@@ -50,10 +50,9 @@ async def chat_completions(request: Request) -> JSONResponse:
     user_id = sla.user_id
     pref = user_reg.resolve_preference(user_id, sla)
 
-    # Semantic classification — runs encode() in thread pool, never blocks event loop.
-    # If domain/complexity are provided in router params, use them and skip classifier.
-    # This avoids misclassification of structured benchmark queries (MMLU/GSM8K/LogiQA)
-    # which look like factual:easy to MiniLM even when they are math/reasoning.
+    # Semantic classification — runs in thread pool, never blocks event loop.
+    # If domain/complexity are provided in router params, use them directly
+    # (avoids misclassification of MMLU/GSM8K/LogiQA benchmark queries).
     meta = await analyzer.analyze_async(messages)
     if sla.domain:
         meta.domain = sla.domain
@@ -131,19 +130,34 @@ async def register_model(req: RegisterRequest) -> dict:
     if capability and "_default" not in capability:
         capability["_default"] = min(capability.values())
 
+    # Build accuracy_priors: prefer explicitly provided values, fall back to
+    # min_accuracy_capability so the model never bids DEFAULT_ACCURACY_PRIOR (0.70).
+    # If both are empty, both models bid 0.70 → cost always decides → qwen wins 100%.
+    accuracy_priors = dict(req.accuracy_priors)
+    if capability:
+        for key, score in capability.items():
+            if ":" in key and key not in accuracy_priors:
+                accuracy_priors[key] = score   # fill gaps from capability dict
+
     adapter = adapter_cls(
-        model_id=req.model_id, base_url=req.base_url,
+        model_id=req.model_id,
+        base_url=req.base_url,
         efficiency_tokens_per_joule=req.efficiency_tokens_per_joule,
         max_concurrent_requests=req.max_concurrent_requests,
         input_rate_usd_per_token=req.input_rate_usd_per_token,
         output_rate_usd_per_token=req.output_rate_usd_per_token,
-        accuracy_priors=req.accuracy_priors,
+        accuracy_priors=accuracy_priors,
     )
     registry.register(ModelConfig(
-        adapter=adapter, domains=req.domains,
+        adapter=adapter,
+        domains=req.domains,
         min_accuracy_capability=capability,
     ))
-    return {"registered": req.model_id, "min_accuracy_capability": capability}
+    return {
+        "registered":              req.model_id,
+        "min_accuracy_capability": capability,
+        "accuracy_priors_stored":  accuracy_priors,   # verify what was stored
+    }
 
 
 @app.delete("/router/{model_id}")
