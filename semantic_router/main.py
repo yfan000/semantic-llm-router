@@ -154,6 +154,11 @@ async def list_models() -> dict:
     ]}
 
 
+@app.get("/router/health")
+async def health() -> dict:
+    return {"status": "ok", "registered_models": len(registry.list_all())}
+
+
 @app.get("/router/{model_id}/reputation")
 async def model_reputation(model_id: str) -> dict:
     all_rep = reputation.get_all()
@@ -162,9 +167,26 @@ async def model_reputation(model_id: str) -> dict:
     return all_rep[model_id]
 
 
-@app.get("/router/health")
-async def health() -> dict:
-    return {"status": "ok", "registered_models": len(registry.list_all())}
+@app.get("/router/{model_id}/details")
+async def model_details(model_id: str) -> dict:
+    """
+    Show stored accuracy_priors for a model.
+    If accuracy_priors is {} or all values are 0.70, registration did not
+    pass accuracy_priors — both models bid the same default accuracy and
+    cost decides every auction (qwen always wins).
+    """
+    adapter = registry.get_adapter(model_id)
+    if not adapter:
+        raise HTTPException(status_code=404, detail=f"Model '{model_id}' not registered.")
+    return {
+        "model_id":                    adapter.model_id,
+        "base_url":                    adapter.base_url,
+        "efficiency_tokens_per_joule": adapter.efficiency_tokens_per_joule,
+        "input_rate_usd_per_token":    adapter.input_rate,
+        "output_rate_usd_per_token":   adapter.output_rate,
+        "accuracy_priors":             adapter.accuracy_priors,
+        "router_in_flight":            adapter._in_flight,
+    }
 
 
 # -- User management ---------------------------------------------------------
