@@ -45,6 +45,10 @@ class RequestSLA(BaseModel):
     energy_weight: Optional[float] = None
     max_latency_ms: Optional[int] = None
     min_accuracy: Optional[float] = None
+    # Optional domain/complexity override — bypasses the semantic classifier.
+    # Use when the caller knows the query type (e.g. from a labelled dataset).
+    domain: Optional[str] = None      # "code"|"math"|"factual"|"reasoning"|"creative"
+    complexity: Optional[str] = None  # "easy"|"medium"|"hard"
 
 
 class BidRequest(BaseModel):
