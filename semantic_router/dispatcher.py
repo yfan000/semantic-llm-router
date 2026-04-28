@@ -32,7 +32,6 @@ async def dispatch(
     actual_tokens = actual_input_tokens + actual_output_tokens
     actual_energy_j = actual_output_tokens / max(adapter.efficiency_tokens_per_joule, 1e-9)
 
-    # Latency feedback (synchronous, every request)
     reputation.record_latency(
         winning_bid.model_id,
         winning_bid.estimated_latency_ms,
@@ -52,7 +51,6 @@ async def dispatch(
     except (KeyError, IndexError):
         pass
 
-    # Accuracy feedback (async, 5% sample rate, non-blocking)
     sampler.enqueue(SampleItem(
         model_id=winning_bid.model_id,
         domain=domain,
@@ -68,5 +66,9 @@ async def dispatch(
         "X-Router-Bid-Latency-Ms":    str(winning_bid.estimated_latency_ms),
         "X-Router-Actual-Latency-Ms": str(actual_latency_ms),
         "X-Router-Load":              f"{winning_bid.current_load:.2f}",
+        # Bid accuracy — if always 0.700, accuracy_priors were not set at registration
+        "X-Router-Bid-Accuracy":      f"{winning_bid.estimated_accuracy:.3f}",
+        "X-Router-Domain":            domain,
+        "X-Router-Complexity":        complexity,
     }
     return response, metadata
