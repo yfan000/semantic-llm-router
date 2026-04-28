@@ -50,8 +50,15 @@ async def chat_completions(request: Request) -> JSONResponse:
     user_id = sla.user_id
     pref = user_reg.resolve_preference(user_id, sla)
 
-    # Semantic classification — runs encode() in thread pool, never blocks event loop
+    # Semantic classification — runs encode() in thread pool, never blocks event loop.
+    # If domain/complexity are provided in router params, use them and skip classifier.
+    # This avoids misclassification of structured benchmark queries (MMLU/GSM8K/LogiQA)
+    # which look like factual:easy to MiniLM even when they are math/reasoning.
     meta = await analyzer.analyze_async(messages)
+    if sla.domain:
+        meta.domain = sla.domain
+    if sla.complexity:
+        meta.complexity = sla.complexity
 
     if user_id:
         user_reg.check_budget(user_id, 300, 300.0 / 2.0)
@@ -68,7 +75,6 @@ async def chat_completions(request: Request) -> JSONResponse:
     winning_bid = select(bids, pref, reputation, meta.domain, meta.complexity)
     winning_adapter = registry.get_adapter(winning_bid.model_id)
 
-    # Exclude "stream" so it is never forwarded to vLLM
     passthrough = {
         k: v for k, v in body.items()
         if k not in ("model", "messages", "extra_body", "stream")
@@ -169,12 +175,7 @@ async def model_reputation(model_id: str) -> dict:
 
 @app.get("/router/{model_id}/details")
 async def model_details(model_id: str) -> dict:
-    """
-    Show stored accuracy_priors for a model.
-    If accuracy_priors is {} or all values are 0.70, registration did not
-    pass accuracy_priors — both models bid the same default accuracy and
-    cost decides every auction (qwen always wins).
-    """
+    """Show stored accuracy_priors. If empty or all 0.70, registration failed."""
     adapter = registry.get_adapter(model_id)
     if not adapter:
         raise HTTPException(status_code=404, detail=f"Model '{model_id}' not registered.")
