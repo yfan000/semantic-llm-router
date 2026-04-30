@@ -13,8 +13,92 @@ Usage:
 """
 from __future__ import annotations
 import argparse
+import ast
 import csv
+import re
+import subprocess
+import sys
+import tempfile
 from statistics import mean
+
+
+# ---------------------------------------------------------------------------
+# Inline accuracy scoring (mirrors score_accuracy.py)
+# ---------------------------------------------------------------------------
+
+def _extract_numbers(text: str) -> list[float]:
+    return [float(m) for m in re.findall(r"-?\d+(?:\.\d+)?", text)]
+
+
+def _score_math(response: str, ground_truth: str):
+    pred = _extract_numbers(response)
+    true = _extract_numbers(str(ground_truth))
+    if not pred or not true:
+        return None
+    p, t = pred[-1], true[-1]
+    if t == 0:
+        return 1.0 if abs(p) < 0.01 else 0.0
+    return 1.0 if (abs(p - t) / abs(t) < 0.01 or abs(p - t) < 0.01) else 0.0
+
+
+def _score_code(response: str, ground_truth: str):
+    blocks = re.findall(r"```(?:python)?\s*(.*?)```", response, re.DOTALL)
+    code = blocks[0].strip() if blocks else response.strip()
+    try:
+        ast.parse(code)
+    except SyntaxError:
+        return 0.0
+    gt = str(ground_truth)
+    if "assert" in gt or "==" in gt:
+        test_code = code + "\n" + gt
+        with tempfile.NamedTemporaryFile(suffix=".py", mode="w", delete=False) as f:
+            f.write(test_code)
+            fname = f.name
+        try:
+            r = subprocess.run([sys.executable, fname], timeout=5, capture_output=True)
+            return 1.0 if r.returncode == 0 else 0.0
+        except Exception:
+            return 0.0
+    return 0.5  # syntax valid, no test cases
+
+
+def _score_keyword(response: str, ground_truth: str):
+    if not ground_truth or ground_truth.strip() in ("", "None"):
+        return None
+    gt_words = set(w.lower() for w in re.findall(r"\b\w{4,}\b", str(ground_truth)))
+    if not gt_words:
+        return None
+    matches = sum(1 for w in gt_words if w in response.lower())
+    overlap = matches / len(gt_words)
+    return 1.0 if overlap >= 0.5 else overlap
+
+
+_SCORERS = {
+    "math":      _score_math,
+    "code":      _score_code,
+    "factual":   _score_keyword,
+    "reasoning": _score_keyword,
+    "creative":  lambda r, _: 1.0 if len(r.split()) >= 20 else 0.0,
+}
+
+
+def score_row(row: dict):
+    """Return float accuracy score or None if unscorable."""
+    if str(row.get("status", "")) != "200":
+        return None
+    response = row.get("response_text", "")
+    if not response:
+        return None
+    scorer = _SCORERS.get(row.get("domain", "").lower())
+    if scorer is None:
+        return None
+    return scorer(response, row.get("ground_truth", ""))
+
+
+def accuracy_stats(rows: list[dict]) -> tuple[float | None, int, int]:
+    """Return (mean_accuracy, n_scored, n_total)."""
+    scores = [s for r in rows if (s := score_row(r)) is not None]
+    return (mean(scores) if scores else None, len(scores), len(rows))
 
 
 def read_csv(path: str) -> list[dict]:
@@ -317,22 +401,31 @@ def compare(
         print(f"\n{'='*W}")
         print(f"  COMPARISON BY MODE  (router mode vs round-robin baseline)")
         print(f"{'='*W}")
-        print(f"  Round-robin baseline: wall P50={B['wall_p50']:.0f}ms  "
-              f"avg_cost=${B['avg_cost']:.8f}  avg_energy={B['avg_energy']:.3f}J")
 
         baseline_ok = [r for r in baseline_rows if r.get("status") == "200"]
         b_wall = [sf(r["wall_ms"]) for r in baseline_ok if sf(r["wall_ms"]) is not None]
         b_cost = [sf(r["charged_usd"]) for r in baseline_ok if sf(r["charged_usd"]) is not None]
         b_nrg  = [sf(r["energy_j"])    for r in baseline_ok if sf(r["energy_j"])    is not None]
+        bw_p50 = percentile(b_wall, 50) if b_wall else 0
+        bc_avg = mean(b_cost) if b_cost else 0
+        be_avg = mean(b_nrg)  if b_nrg  else 0
+
+        # Compute baseline accuracy once (used as comparison for every mode)
+        b_acc, b_acc_n, b_acc_total = accuracy_stats(baseline_ok)
+
+        b_acc_str = f"{b_acc*100:.1f}%  ({b_acc_n}/{b_acc_total})" if b_acc is not None else "—"
+        print(f"  Round-robin baseline: wall P50={bw_p50:.0f}ms  "
+              f"avg_cost=${bc_avg:.8f}  avg_energy={be_avg:.3f}J  "
+              f"accuracy={b_acc_str}")
 
         for mode in modes_present:
             mr = [r for r in router_ok if r.get("mode") == mode]
             if not mr:
                 continue
 
-            m_wall = [sf(r["wall_ms"])           for r in mr if sf(r["wall_ms"])           is not None]
-            m_cost = [sf(r["charged_usd"])        for r in mr if sf(r["charged_usd"])       is not None]
-            m_nrg  = [sf(r["energy_j"])           for r in mr if sf(r["energy_j"])          is not None]
+            m_wall = [sf(r["wall_ms"])    for r in mr if sf(r["wall_ms"])    is not None]
+            m_cost = [sf(r["charged_usd"]) for r in mr if sf(r["charged_usd"]) is not None]
+            m_nrg  = [sf(r["energy_j"])    for r in mr if sf(r["energy_j"])    is not None]
 
             # Routing distribution for this mode
             mc2: dict[str, int] = {}
@@ -349,16 +442,19 @@ def compare(
             c_avg  = mean(m_cost)            if m_cost else 0
             e_avg  = mean(m_nrg)             if m_nrg  else 0
 
-            bw_p50  = percentile(b_wall, 50) if b_wall else 0
-            bc_avg  = mean(b_cost)            if b_cost else 0
-            be_avg  = mean(b_nrg)             if b_nrg  else 0
+            m_acc, m_acc_n, m_acc_total = accuracy_stats(mr)
 
-            print(f"    Latency  P50={w_p50:.0f}ms  mean={w_mean:.0f}ms  "
-                  f"vs baseline P50={bw_p50:.0f}ms  {pct_change(bw_p50, w_p50)}")
-            print(f"    Cost     avg=${c_avg:.8f}  "
-                  f"vs baseline avg=${bc_avg:.8f}  {pct_change(bc_avg, c_avg)}")
-            print(f"    Energy   avg={e_avg:.3f}J  "
-                  f"vs baseline avg={be_avg:.3f}J  {pct_change(be_avg, e_avg)}")
+            print(f"    Latency  P50={w_p50:.0f}ms  mean={w_mean:.0f}ms"
+                  f"    vs baseline {bw_p50:.0f}ms  {pct_change(bw_p50, w_p50)}")
+            print(f"    Cost     avg=${c_avg:.8f}"
+                  f"  vs baseline ${bc_avg:.8f}  {pct_change(bc_avg, c_avg)}")
+            print(f"    Energy   avg={e_avg:.3f}J"
+                  f"  vs baseline {be_avg:.3f}J  {pct_change(be_avg, e_avg)}")
+            if m_acc is not None:
+                acc_str = f"{m_acc*100:.1f}%  (scored {m_acc_n}/{m_acc_total})"
+                b_ref   = b_acc if b_acc is not None else 0.0
+                print(f"    Accuracy avg={acc_str}"
+                      f"  vs baseline {b_acc_str}  {pct_change(b_ref, m_acc)}")
 
     print(f"\n{'='*W}\n")
 
