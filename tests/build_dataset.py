@@ -341,23 +341,20 @@ def load_creative_fallback(n: int) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 TARGET_DISTRIBUTION = {
-    ("factual",   "easy"):   80,
-    ("factual",   "medium"): 70,
-    ("factual",   "hard"):   50,
-    ("math",      "easy"):   50,
-    ("math",      "medium"): 80,
-    ("math",      "hard"):   70,
-    ("code",      "easy"):   60,
-    ("code",      "medium"): 80,
-    ("code",      "hard"):   50,
-    ("reasoning", "easy"):   70,
-    ("reasoning", "medium"): 80,
-    ("reasoning", "hard"):   50,
-    ("creative",  "easy"):   40,
-    ("creative",  "medium"): 80,
-    ("creative",  "hard"):   40,
+    ("factual",   "easy"):   85,
+    ("factual",   "medium"): 85,
+    ("factual",   "hard"):   80,
+    ("math",      "easy"):   85,
+    ("math",      "medium"): 90,
+    ("math",      "hard"):   75,
+    ("code",      "easy"):   85,
+    ("code",      "medium"): 90,
+    ("code",      "hard"):   75,
+    ("reasoning", "easy"):   85,
+    ("reasoning", "medium"): 90,
+    ("reasoning", "hard"):   75,
 }
-# Total = 950 → pad to 1000 by sampling
+# Total = 1000 across 4 domains (no creative)
 
 
 def build(total: int, output: str) -> None:
@@ -375,20 +372,15 @@ def build(total: int, output: str) -> None:
         print(f"    {name:<20} {len(items):4} items loaded")
         all_items.extend(items)
 
-    add("MMLU",           load_mmlu(200))
-    add("GSM8K",          load_gsm8k(100))
+    add("MMLU",           load_mmlu(260))
+    add("GSM8K",          load_gsm8k(150))
     add("MATH benchmark", load_math_benchmark(100))
-    add("HumanEval",      load_humaneval(80))
-    add("MBPP",           load_mbpp(80))
-    add("APPS",           load_apps(50))
-    add("LogiQA",         load_logiqa(100))
-    add("HellaSwag",      load_hellaswag(80))
-    add("ARC",            load_arc(100))
-
-    wp = load_writing_prompts(150)
-    if len(wp) < 30:
-        wp = load_creative_fallback(150)
-    add("WritingPrompts", wp)
+    add("HumanEval",      load_humaneval(90))
+    add("MBPP",           load_mbpp(90))
+    add("APPS",           load_apps(75))
+    add("LogiQA",         load_logiqa(120))
+    add("HellaSwag",      load_hellaswag(100))
+    add("ARC",            load_arc(120))
 
     print(f"\n  Total raw items: {len(all_items)}")
 
