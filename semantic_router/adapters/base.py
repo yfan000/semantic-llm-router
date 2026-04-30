@@ -14,8 +14,13 @@ class ModelAdapter(ABC):
         input_rate_usd_per_token: float,
         output_rate_usd_per_token: float,
         accuracy_priors: dict[str, float] | None = None,
+        model_name: str = "",
     ) -> None:
         self.model_id = model_id
+        # model_name is sent to the vLLM /v1/chat/completions endpoint.
+        # Defaults to model_id but must match the HuggingFace repo name
+        # that vLLM was launched with (e.g. "Qwen/Qwen2.5-7B-Instruct").
+        self.model_name = model_name or model_id
         self.base_url = base_url.rstrip("/")
         self.efficiency_tokens_per_joule = efficiency_tokens_per_joule
         self.max_concurrent_requests = max_concurrent_requests
