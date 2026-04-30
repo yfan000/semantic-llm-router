@@ -28,7 +28,7 @@ import random
 from collections import defaultdict
 
 # ---------------------------------------------------------------------------
-# Dataset loaders — each returns list of {domain, complexity, query, ground_truth}
+# Dataset loaders — each returns list of {domain, complexity, query}
 # ---------------------------------------------------------------------------
 
 def load_mmlu(n: int) -> list[dict]:
@@ -43,7 +43,7 @@ def load_mmlu(n: int) -> list[dict]:
     MEDIUM_SUBJECTS = [
         "college_biology", "college_chemistry", "college_computer_science",
         "college_mathematics", "college_physics", "college_medicine",
-        "anatomy", "astronomy", "economics",
+        "anatomy", "astronomy", "econometrics",
     ]
     HARD_SUBJECTS = [
         "professional_medicine", "professional_law", "professional_accounting",
@@ -62,7 +62,7 @@ def load_mmlu(n: int) -> list[dict]:
         per_subject = max(1, count // len(subjects))
         for subject in subjects:
             try:
-                ds = load_dataset("cais/mmlu", subject, split="test", trust_remote_code=True)
+                ds = load_dataset("cais/mmlu", subject, split="test", trust_remote_code=False)
                 sample = ds.shuffle(seed=42).select(range(min(per_subject, len(ds))))
                 for row in sample:
                     choices = row["choices"]
@@ -85,7 +85,7 @@ def load_mmlu(n: int) -> list[dict]:
 def load_gsm8k(n: int) -> list[dict]:
     """GSM8K: grade-school math word problems. Complexity = medium."""
     from datasets import load_dataset
-    ds = load_dataset("openai/gsm8k", "main", split="test", trust_remote_code=True)
+    ds = load_dataset("openai/gsm8k", "main", split="test", trust_remote_code=False)
     ds = ds.shuffle(seed=42).select(range(min(n, len(ds))))
     results = []
     for row in ds:
@@ -106,28 +106,36 @@ def load_math_benchmark(n: int) -> list[dict]:
     import re as _re
 
     COMPLEXITY_MAP = {"1": "easy", "2": "easy", "3": "medium", "4": "medium", "5": "hard"}
-    try:
-        ds = load_dataset("lighteval/MATH", "all", split="test", trust_remote_code=True)
-    except Exception:
+    ds = None
+    for name, cfg, split in [
+        ("lighteval/MATH", "all", "test"),
+        ("lighteval/MATH", None, "test"),
+        ("EleutherAI/hendrycks_math", "algebra", "test"),
+    ]:
         try:
-            ds = load_dataset("hendrycks/competition_math", split="test", trust_remote_code=True)
+            ds = load_dataset(name, cfg, split=split) if cfg else load_dataset(name, split=split)
+            break
         except Exception as e:
-            print(f"  [MATH] skipped: {e}")
-            return []
+            print(f"  [MATH/{name}] skipped: {e}")
+
+    if ds is None:
+        print("  [MATH] all sources failed, skipping competition math")
+        return []
 
     ds = ds.shuffle(seed=42).select(range(min(n * 3, len(ds))))
     results = []
     for row in ds:
         level = str(row.get("level", "3")).replace("Level ", "")
         complexity = COMPLEXITY_MAP.get(level, "medium")
-        # Extract boxed answer from solution: \boxed{answer}
-        solution = row.get("solution", "")
+        problem = row.get("problem", row.get("question", ""))
+        solution = row.get("solution", row.get("answer", ""))
         m = _re.search(r"\\boxed\{([^}]+)\}", solution)
         ground_truth = m.group(1) if m else solution.strip()[:50]
-        results.append({
-            "domain": "math", "complexity": complexity,
-            "query": row["problem"], "ground_truth": ground_truth,
-        })
+        if problem:
+            results.append({
+                "domain": "math", "complexity": complexity,
+                "query": problem, "ground_truth": ground_truth,
+            })
 
     return random.sample(results, min(n, len(results)))
 
@@ -136,7 +144,7 @@ def load_humaneval(n: int) -> list[dict]:
     """HumanEval: Python function synthesis. Complexity = medium."""
     from datasets import load_dataset
     try:
-        ds = load_dataset("openai/openai_humaneval", split="test", trust_remote_code=True)
+        ds = load_dataset("openai/openai_humaneval", split="test", trust_remote_code=False)
     except Exception as e:
         print(f"  [HumanEval] skipped: {e}")
         return []
@@ -157,23 +165,37 @@ def load_humaneval(n: int) -> list[dict]:
 def load_mbpp(n: int) -> list[dict]:
     """MBPP: basic Python programming. Complexity = easy."""
     from datasets import load_dataset
-    try:
-        ds = load_dataset("google-research-datasets/mbpp", "sanitized", split="test", trust_remote_code=True)
-    except Exception:
+    ds = None
+    for name, cfg in [
+        ("google-research-datasets/mbpp", "sanitized"),
+        ("google-research-datasets/mbpp", "full"),
+        ("mbpp", None),
+    ]:
         try:
-            ds = load_dataset("mbpp", split="test", trust_remote_code=True)
+            kwargs = {"split": "test"}
+            if cfg:
+                ds = load_dataset(name, cfg, **kwargs)
+            else:
+                ds = load_dataset(name, **kwargs)
+            break
         except Exception as e:
-            print(f"  [MBPP] skipped: {e}")
-            return []
+            print(f"  [MBPP/{name}] skipped: {e}")
+    if ds is None:
+        return []
     ds = ds.shuffle(seed=42).select(range(min(n, len(ds))))
     results = []
     for row in ds:
-        # ground_truth: join assert statements from test_list
-        test_list = row.get("test_list", [])
+        # field name differs between sanitized ("text") and full ("prompt")
+        query_text = row.get("text") or row.get("prompt") or row.get("description", "")
+        test_list = row.get("test_list", row.get("tests", []))
+        if isinstance(test_list, str):
+            test_list = [test_list]
         ground_truth = "\n".join(test_list) if test_list else ""
+        if not query_text:
+            continue
         results.append({
             "domain": "code", "complexity": "easy",
-            "query": f"Write a Python function to: {row['text']}",
+            "query": f"Write a Python function to: {query_text}",
             "ground_truth": ground_truth,
         })
     return results
@@ -183,13 +205,13 @@ def load_apps(n: int) -> list[dict]:
     """APPS: competitive programming. Complexity = hard."""
     from datasets import load_dataset
     try:
-        ds = load_dataset("codeparrot/apps", "all", split="test", trust_remote_code=True)
+        ds = load_dataset("codeparrot/apps", "all", split="test", trust_remote_code=False)
         ds = ds.filter(lambda x: x.get("difficulty") == "interview")
         ds = ds.shuffle(seed=42).select(range(min(n, len(ds))))
         results = []
         for row in ds:
             q = row.get("question", "")[:500]   # cap length
-            results.append({"domain": "code", "complexity": "hard", "query": q, "ground_truth": ""})
+            results.append({"domain": "code", "complexity": "hard", "query": q})
         return results
     except Exception as e:
         print(f"  [APPS] skipped: {e}")
@@ -200,10 +222,10 @@ def load_logiqa(n: int) -> list[dict]:
     """LogiQA: logical reasoning MCQ. Complexity = medium."""
     from datasets import load_dataset
     try:
-        ds = load_dataset("lucasmccabe/logiqa", split="test", trust_remote_code=True)
+        ds = load_dataset("lucasmccabe/logiqa", split="test", trust_remote_code=False)
     except Exception:
         try:
-            ds = load_dataset("logiqa", split="validation", trust_remote_code=True)
+            ds = load_dataset("logiqa", split="validation", trust_remote_code=False)
         except Exception as e:
             print(f"  [LogiQA] skipped: {e}")
             return []
@@ -227,7 +249,7 @@ def load_hellaswag(n: int) -> list[dict]:
     """HellaSwag: commonsense sentence completion. Complexity = easy."""
     from datasets import load_dataset
     try:
-        ds = load_dataset("Rowan/hellaswag", split="validation", trust_remote_code=True)
+        ds = load_dataset("Rowan/hellaswag", split="validation", trust_remote_code=False)
     except Exception as e:
         print(f"  [HellaSwag] skipped: {e}")
         return []
@@ -246,13 +268,13 @@ def load_hellaswag(n: int) -> list[dict]:
 
 
 def load_arc(n: int) -> list[dict]:
-    """ARC-Challenge: science MCQ. Easy->medium, Challenge->hard."""
+    """ARC-Challenge: science MCQ. Easy→medium, Challenge→hard."""
     from datasets import load_dataset
     results = []
     for split_name, complexity, count in [("easy", "easy", n//2), ("challenge", "hard", n - n//2)]:
         try:
             ds = load_dataset("allenai/ai2_arc", f"ARC-{split_name.capitalize()}",
-                              split="test", trust_remote_code=True)
+                              split="test", trust_remote_code=False)
             ds = ds.shuffle(seed=42).select(range(min(count, len(ds))))
             for row in ds:
                 choices = row["choices"]
@@ -273,10 +295,10 @@ def load_writing_prompts(n: int) -> list[dict]:
     """WritingPrompts: creative writing. Short=medium, long=hard."""
     from datasets import load_dataset
     try:
-        ds = load_dataset("euclaise/writingprompts", split="train", trust_remote_code=True)
+        ds = load_dataset("euclaise/writingprompts", split="train", trust_remote_code=False)
     except Exception:
         try:
-            ds = load_dataset("writing_prompts", split="train", trust_remote_code=True)
+            ds = load_dataset("writing_prompts", split="train", trust_remote_code=False)
         except Exception as e:
             print(f"  [WritingPrompts] skipped: {e}")
             return []
@@ -290,8 +312,7 @@ def load_writing_prompts(n: int) -> list[dict]:
             continue
         complexity = "hard" if len(prompt.split()) > 40 else "medium"
         results.append({"domain": "creative", "complexity": complexity,
-                        "query": f"Write a short story or response to this prompt: {prompt}",
-                        "ground_truth": ""})
+                        "query": f"Write a short story or response to this prompt: {prompt}"})
     return random.sample(results, min(n, len(results)))
 
 
@@ -311,7 +332,7 @@ def load_creative_fallback(n: int) -> list[dict]:
     ]
     results = []
     for prompt, complexity in prompts * (n // len(prompts) + 1):
-        results.append({"domain": "creative", "complexity": complexity, "query": prompt, "ground_truth": ""})
+        results.append({"domain": "creative", "complexity": complexity, "query": prompt})
     return results[:n]
 
 
@@ -336,7 +357,7 @@ TARGET_DISTRIBUTION = {
     ("creative",  "medium"): 80,
     ("creative",  "hard"):   40,
 }
-# Total = 950 -> pad to 1000 by sampling
+# Total = 950 → pad to 1000 by sampling
 
 
 def build(total: int, output: str) -> None:
@@ -345,6 +366,7 @@ def build(total: int, output: str) -> None:
 
     os.makedirs(os.path.dirname(output) if os.path.dirname(output) else ".", exist_ok=True)
 
+    # ── Load from each dataset ────────────────────────────────────────────
     print("  Loading datasets:")
 
     all_items: list[dict] = []
@@ -370,7 +392,7 @@ def build(total: int, output: str) -> None:
 
     print(f"\n  Total raw items: {len(all_items)}")
 
-    # Balance by domain/complexity
+    # ── Balance by domain/complexity ─────────────────────────────────────
     buckets: dict[tuple, list[dict]] = defaultdict(list)
     for item in all_items:
         key = (item["domain"], item["complexity"])
@@ -380,7 +402,7 @@ def build(total: int, output: str) -> None:
     for key in sorted(TARGET_DISTRIBUTION):
         avail = len(buckets[key])
         want  = TARGET_DISTRIBUTION[key]
-        status = "ok" if avail >= want else f"only {avail}"
+        status = "✓" if avail >= want else f"⚠ only {avail}"
         print(f"    {key[0]:<12} {key[1]:<8} want={want:3}  {status}")
 
     dataset: list[dict] = []
@@ -390,6 +412,7 @@ def build(total: int, output: str) -> None:
             dataset.extend(random.sample(pool, want))
         else:
             dataset.extend(pool)
+            # Pad from same domain/complexity pool with replacement
             if pool:
                 dataset.extend(random.choices(pool, k=want - len(pool)))
 
@@ -401,18 +424,17 @@ def build(total: int, output: str) -> None:
     random.shuffle(dataset)
     dataset = dataset[:total]
 
+    # ── Save ─────────────────────────────────────────────────────────────
     with open(output, "w") as f:
         json.dump(dataset, f, indent=2)
 
+    # ── Summary ──────────────────────────────────────────────────────────
     print(f"\n  Final dataset: {len(dataset)} requests")
     by_domain: dict[str, int] = defaultdict(int)
     by_cplx:   dict[str, int] = defaultdict(int)
-    gt_count = 0
     for item in dataset:
-        by_domain[item["domain"]]   += 1
-        by_cplx[item["complexity"]] += 1
-        if item.get("ground_truth"):
-            gt_count += 1
+        by_domain[item["domain"]]     += 1
+        by_cplx[item["complexity"]]   += 1
 
     print("\n  By domain:")
     for d, c in sorted(by_domain.items()):
@@ -420,7 +442,7 @@ def build(total: int, output: str) -> None:
     print("\n  By complexity:")
     for c, n2 in sorted(by_cplx.items()):
         print(f"    {c:<8} {n2:4}")
-    print(f"\n  Items with ground_truth: {gt_count}/{total}")
+
     print(f"\n  Saved to: {output}")
     print(f"  Run load test with:")
     print(f"    python tests/load_test.py --dataset {output}\n")
