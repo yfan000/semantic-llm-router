@@ -31,6 +31,26 @@ from statistics import mean
 
 import httpx
 
+# Mirror of config.LATENCY_SLO_MS — used to compute SLO pass/fail for round-robin
+# (round-robin bypasses the router so it receives no X-Router-SLO-* headers)
+LATENCY_SLO_MS: dict[tuple[str, str], int] = {
+    ("factual",   "easy"):   1000,
+    ("factual",   "medium"): 2000,
+    ("factual",   "hard"):   4000,
+    ("math",      "easy"):   1500,
+    ("math",      "medium"): 3000,
+    ("math",      "hard"):   6000,
+    ("code",      "easy"):   2000,
+    ("code",      "medium"): 4000,
+    ("code",      "hard"):   8000,
+    ("reasoning", "easy"):   1500,
+    ("reasoning", "medium"): 3000,
+    ("reasoning", "hard"):   6000,
+    ("creative",  "easy"):   2000,
+    ("creative",  "medium"): 5000,
+    ("creative",  "hard"):   8000,
+}
+
 # ---------------------------------------------------------------------------
 # Backend configuration — must match what you registered with the router
 # ---------------------------------------------------------------------------
@@ -66,7 +86,7 @@ QUERIES: list[tuple[str, str, str]] = [
     ("factual",   "hard",   "Explain the geopolitical implications of the Bretton Woods collapse."),
     ("math",      "easy",   "What is 15% of 240?"),
     ("math",      "easy",   "What is the square root of 144?"),
-    ("math",      "medium", "Solve the quadratic equation x^2 - 5x + 6 = 0."),
+    ("math",      "medium", "Solve the quadratic equation x squared minus 5x plus 6 equals 0."),
     ("math",      "medium", "What is the probability of rolling two sixes in a row?"),
     ("math",      "hard",   "Prove that there are infinitely many prime numbers."),
     ("math",      "hard",   "Solve the differential equation dy/dx = 2xy with y(0) = 1."),
@@ -130,6 +150,8 @@ async def send_request(
         + output_est  * backend["output_rate_usd_per_token"]
     )
 
+    slo_ms = LATENCY_SLO_MS.get((item["domain"], item["complexity"]), None)
+
     result = {
         "req_id":            req_id,
         "domain":            item["domain"],
@@ -147,6 +169,8 @@ async def send_request(
         "energy_j":          "",
         "load":              "",
         "wall_ms":           "",
+        "slo_ms":            str(slo_ms) if slo_ms else "",
+        "slo_violated":      "",   # filled after wall_ms is known
         "response_text":     "",
         "error":             "",
     }
@@ -165,6 +189,8 @@ async def send_request(
         result["actual_latency_ms"] = wall_ms
         result["ttft_ms"]           = wall_ms
         result["status"]            = resp.status_code
+        if slo_ms is not None:
+            result["slo_violated"] = "true" if wall_ms > slo_ms else "false"
 
         if resp.status_code == 200:
             body = resp.json()
@@ -211,7 +237,7 @@ async def run(
         "req_id", "domain", "complexity", "query", "ground_truth", "mode", "status",
         "model_winner", "bid_latency_ms", "actual_latency_ms",
         "ttft_ms", "output_tokens", "charged_usd", "energy_j", "load", "wall_ms",
-        "response_text", "error",
+        "slo_ms", "slo_violated", "response_text", "error",
     ]
 
     results: list[dict] = []
