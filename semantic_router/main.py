@@ -2,6 +2,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from contextlib import asynccontextmanager
+from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -10,6 +11,7 @@ from pydantic import BaseModel
 from semantic_router.analyzer import SemanticAnalyzer
 from semantic_router.accuracy_sampler import AccuracySampler
 from semantic_router.bidder import collect_bids
+from semantic_router.config import LATENCY_SLO_MS
 from semantic_router.dispatcher import dispatch
 from semantic_router.registry import ModelRegistry, ModelConfig
 from semantic_router.reputation_tracker import ReputationTracker
@@ -20,6 +22,8 @@ from semantic_router.selector import select
 from semantic_router.user_registry import UserRegistry
 
 log = logging.getLogger(__name__)
+
+# -- Singletons ---------------------------------------------------------------
 
 analyzer   = SemanticAnalyzer()
 registry   = ModelRegistry()
@@ -40,39 +44,63 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Semantic LLM Router", lifespan=lifespan)
 
 
+# -- Inference endpoint -------------------------------------------------------
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request) -> JSONResponse:
     body: dict = await request.json()
     messages: list[dict] = body.get("messages", [])
-    router_params: dict = body.get("extra_body", {}).get("router", {})
+    extra_body: dict = body.get("extra_body", {})
+    router_params: dict = extra_body.get("router", {})
 
     sla = RequestSLA(**router_params) if router_params else RequestSLA()
     user_id = sla.user_id
+
+    # Resolve user preference (mode -> preset -> per-request overrides)
     pref = user_reg.resolve_preference(user_id, sla)
 
-    # Semantic classification — runs in thread pool, never blocks event loop.
-    # If domain/complexity are provided in router params, use them directly.
+    # Semantic classification — runs encode() in thread pool to avoid blocking event loop.
+    # If domain/complexity are provided in router params, use them and skip classifier.
     meta = await analyzer.analyze_async(messages)
     if sla.domain:
         meta.domain = sla.domain
     if sla.complexity:
         meta.complexity = sla.complexity
 
-    if user_id:
-        user_reg.check_budget(user_id, 300, 300.0 / 2.0)
+    # Apply per-domain/complexity SLO if the user has not set an explicit latency ceiling.
+    # Per-request max_latency_ms in extra_body.router always takes precedence.
+    if pref.max_latency_ms is None:
+        slo_ms = LATENCY_SLO_MS.get((meta.domain, meta.complexity))
+        if slo_ms is not None:
+            pref.max_latency_ms = slo_ms
+            log.info("SLO applied: %s:%s -> %d ms", meta.domain, meta.complexity, slo_ms)
 
+    # Budget pre-check (rough estimate: 300 tokens output, 50 J)
+    estimated_tokens = 300
+    if user_id:
+        estimated_energy_j = 300.0 / 2.0
+        user_reg.check_budget(user_id, estimated_tokens, estimated_energy_j)
+
+    # Get eligible model backends
     adapters = registry.get_eligible(meta.domain, pref.min_accuracy, reputation)
     if not adapters:
         raise HTTPException(status_code=503, detail="No models registered for this domain.")
 
+    # Broadcast bids
     bid_request = BidRequest(
-        messages=messages, complexity=meta.complexity, domain=meta.domain,
-        query_embedding=meta.embedding.tolist(), preference=pref,
+        messages=messages,
+        complexity=meta.complexity,
+        domain=meta.domain,
+        query_embedding=meta.embedding.tolist(),
+        preference=pref,
     )
     bids = await collect_bids(adapters, bid_request)
+
+    # Select winner
     winning_bid = select(bids, pref, reputation, meta.domain, meta.complexity)
     winning_adapter = registry.get_adapter(winning_bid.model_id)
 
+    # Dispatch inference
     passthrough = {
         k: v for k, v in body.items()
         if k not in ("model", "messages", "extra_body", "stream")
@@ -89,18 +117,22 @@ async def chat_completions(request: Request) -> JSONResponse:
         sampler=sampler,
         extra_kwargs=passthrough,
     )
-    # Debug: verify mode preset is applied. If accuracy-weight=0.25, preset failed.
+
     router_headers["X-Router-Accuracy-Weight"] = f"{pref.accuracy_weight:.2f}"
     router_headers["X-Router-Cost-Weight"]     = f"{pref.cost_weight:.2f}"
+    if pref.max_latency_ms is not None:
+        slo_violated = winning_bid.estimated_latency_ms > pref.max_latency_ms
+        router_headers["X-Router-SLO-Ms"]       = str(pref.max_latency_ms)
+        router_headers["X-Router-SLO-Violated"] = "true" if slo_violated else "false"
 
     return JSONResponse(content=response_dict, headers=router_headers)
 
 
-# -- Model fleet management --------------------------------------------------
+# -- Model fleet management ---------------------------------------------------
 
 class RegisterRequest(BaseModel):
     model_id: str
-    backend: str
+    backend: str          # "vllm" | "dynamo" | "ray"
     base_url: str
     domains: list[str]
     min_accuracy_capability: dict[str, float] = {}
@@ -128,7 +160,7 @@ async def register_model(req: RegisterRequest) -> dict:
 
     capability = req.min_accuracy_capability
     if not capability and not req.skip_calibration:
-        log.info("Running calibration for %s", req.model_id)
+        log.info("No min_accuracy_capability provided — running calibration for %s", req.model_id)
         try:
             from semantic_router.calibration import calibrate
             capability = await calibrate(req.base_url, req.model_id)
@@ -160,7 +192,7 @@ async def register_model(req: RegisterRequest) -> dict:
         min_accuracy_capability=capability,
     ))
     return {
-        "registered":              req.model_id,
+        "registered":             req.model_id,
         "min_accuracy_capability": capability,
         "accuracy_priors_stored":  accuracy_priors,
     }
@@ -174,15 +206,13 @@ async def deregister_model(model_id: str) -> dict:
 
 @app.get("/v1/models")
 async def list_models() -> dict:
-    return {"object": "list", "data": [
-        {"id": m, "latency_reliability": reputation.get_latency_reliability(m)}
-        for m in registry.list_all()
-    ]}
-
-
-@app.get("/router/health")
-async def health() -> dict:
-    return {"status": "ok", "registered_models": len(registry.list_all())}
+    models = []
+    for mid in registry.list_all():
+        models.append({
+            "id": mid,
+            "latency_reliability": reputation.get_latency_reliability(mid),
+        })
+    return {"object": "list", "data": models}
 
 
 @app.get("/router/{model_id}/reputation")
@@ -209,7 +239,12 @@ async def model_details(model_id: str) -> dict:
     }
 
 
-# -- User management ---------------------------------------------------------
+@app.get("/router/health")
+async def health() -> dict:
+    return {"status": "ok", "registered_models": len(registry.list_all())}
+
+
+# -- User management ----------------------------------------------------------
 
 @app.post("/users/{user_id}/preference", status_code=201)
 async def set_preference(user_id: str, pref: UserPreference) -> dict:
