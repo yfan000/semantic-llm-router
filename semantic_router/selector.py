@@ -25,17 +25,26 @@ def select(
     if not bids:
         raise NoEligibleModelError()
 
-    log.info("SELECT domain=%s complexity=%s n_bids=%d acc_weight=%.2f cost_weight=%.2f",
-             domain, complexity, len(bids), pref.accuracy_weight, pref.cost_weight)
+    log.info("SELECT domain=%s complexity=%s n_bids=%d acc_weight=%.2f cost_weight=%.2f slo=%s ms",
+             domain, complexity, len(bids), pref.accuracy_weight, pref.cost_weight,
+             pref.max_latency_ms)
 
+    # Stage 1 — hard filter on latency SLO and accuracy floor
     candidates = [
         b for b in bids
         if (pref.max_latency_ms is None or b.estimated_latency_ms <= pref.max_latency_ms)
         and (pref.min_accuracy is None or b.estimated_accuracy >= pref.min_accuracy)
     ]
     if not candidates:
-        candidates = sorted(bids, key=lambda b: b.estimated_accuracy, reverse=True)[:1]
+        # SLO/accuracy violated by all models — fall back to fastest available
+        fastest = sorted(bids, key=lambda b: b.estimated_latency_ms)
+        candidates = fastest[:1]
+        log.warning(
+            "SLO violated by all bids (slo=%s ms) — falling back to fastest: %s (%d ms)",
+            pref.max_latency_ms, candidates[0].model_id, candidates[0].estimated_latency_ms,
+        )
 
+    # Stage 2 — 4D weighted score (lower = better)
     def effective_cost(bid: BidResponse) -> float:
         return bid.estimated_cost_usd * reputation.get_penalty_multiplier(bid.model_id)
 
@@ -55,7 +64,7 @@ def select(
         scores[bid.model_id] = s
         log.info(
             "  %-22s acc=%.3f cost=%.6f lat=%dms energy=%.2fJ "
-            "cost_norm=%.3f lat_norm=%.3f energy_norm=%.3f score=%.4f",
+            "cost_norm=%.3f lat_norm=%.3f energy_norm=%.3f -> score=%.4f",
             bid.model_id, bid.estimated_accuracy, bid.estimated_cost_usd,
             bid.estimated_latency_ms, bid.estimated_energy_j,
             ec / max_cost, bid.estimated_latency_ms / max_lat,
