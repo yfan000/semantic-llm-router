@@ -94,7 +94,9 @@ class VLLMAdapter(ModelAdapter):
     async def complete(self, messages: list[dict], **kwargs) -> dict:
         await self._increment_in_flight()
         try:
-            payload = {"model": self.model_id, "messages": messages, **kwargs}
+            # Use self.model_name (the HuggingFace repo name vLLM was launched with),
+            # NOT self.model_id (the router's friendly alias).
+            payload = {"model": self.model_name, "messages": messages, **kwargs}
             async with httpx.AsyncClient(timeout=120.0) as client:
                 resp = await client.post(
                     f"{self.base_url}/v1/chat/completions", json=payload
