@@ -11,10 +11,10 @@ from pydantic import BaseModel
 from semantic_router.analyzer import SemanticAnalyzer
 from semantic_router.accuracy_sampler import AccuracySampler
 from semantic_router.bidder import collect_bids
-from semantic_router.config import LATENCY_SLO_MS
 from semantic_router.dispatcher import dispatch
 from semantic_router.registry import ModelRegistry, ModelConfig
 from semantic_router.reputation_tracker import ReputationTracker
+from semantic_router.config import LATENCY_SLO_MS
 from semantic_router.schemas import (
     BidRequest, RequestSLA, RouterMode, UserBudget, UserPreference,
 )
@@ -23,7 +23,7 @@ from semantic_router.user_registry import UserRegistry
 
 log = logging.getLogger(__name__)
 
-# -- Singletons ---------------------------------------------------------------
+# ── Singletons ────────────────────────────────────────────────────────────────
 
 analyzer   = SemanticAnalyzer()
 registry   = ModelRegistry()
@@ -44,7 +44,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Semantic LLM Router", lifespan=lifespan)
 
 
-# -- Inference endpoint -------------------------------------------------------
+# ── Inference endpoint ────────────────────────────────────────────────────────
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request) -> JSONResponse:
@@ -56,29 +56,29 @@ async def chat_completions(request: Request) -> JSONResponse:
     sla = RequestSLA(**router_params) if router_params else RequestSLA()
     user_id = sla.user_id
 
-    # Resolve user preference (mode -> preset -> per-request overrides)
+    # Resolve user preference (mode → preset → per-request overrides)
     pref = user_reg.resolve_preference(user_id, sla)
 
     # Semantic classification — runs encode() in thread pool to avoid blocking event loop.
-    # If domain/complexity are provided in router params, use them and skip classifier.
+    # If domain/complexity are provided in router params, use them and skip classifier
+    # (avoids misclassification of structured benchmark queries like MMLU/GSM8K).
     meta = await analyzer.analyze_async(messages)
     if sla.domain:
         meta.domain = sla.domain
     if sla.complexity:
         meta.complexity = sla.complexity
 
-    # Apply per-domain/complexity SLO if the user has not set an explicit latency ceiling.
-    # Per-request max_latency_ms in extra_body.router always takes precedence.
+    # Apply per-domain/complexity SLO if the user hasn't set an explicit latency ceiling
     if pref.max_latency_ms is None:
         slo_ms = LATENCY_SLO_MS.get((meta.domain, meta.complexity))
         if slo_ms is not None:
             pref.max_latency_ms = slo_ms
-            log.info("SLO applied: %s:%s -> %d ms", meta.domain, meta.complexity, slo_ms)
+            log.info("SLO applied: %s:%s → %d ms", meta.domain, meta.complexity, slo_ms)
 
     # Budget pre-check (rough estimate: 300 tokens output, 50 J)
     estimated_tokens = 300
     if user_id:
-        estimated_energy_j = 300.0 / 2.0
+        estimated_energy_j = 300.0 / 2.0  # conservative: assume 2 tok/J
         user_reg.check_budget(user_id, estimated_tokens, estimated_energy_j)
 
     # Get eligible model backends
@@ -101,6 +101,8 @@ async def chat_completions(request: Request) -> JSONResponse:
     winning_adapter = registry.get_adapter(winning_bid.model_id)
 
     # Dispatch inference
+    # Exclude "stream" so it is never forwarded to vLLM — the router's
+    # adapter.complete() calls resp.json() which fails on SSE responses.
     passthrough = {
         k: v for k, v in body.items()
         if k not in ("model", "messages", "extra_body", "stream")
@@ -117,7 +119,6 @@ async def chat_completions(request: Request) -> JSONResponse:
         sampler=sampler,
         extra_kwargs=passthrough,
     )
-
     router_headers["X-Router-Accuracy-Weight"] = f"{pref.accuracy_weight:.2f}"
     router_headers["X-Router-Cost-Weight"]     = f"{pref.cost_weight:.2f}"
     if pref.max_latency_ms is not None:
@@ -128,11 +129,13 @@ async def chat_completions(request: Request) -> JSONResponse:
     return JSONResponse(content=response_dict, headers=router_headers)
 
 
-# -- Model fleet management ---------------------------------------------------
+# ── Model fleet management ────────────────────────────────────────────────────
 
 class RegisterRequest(BaseModel):
-    model_id: str
-    backend: str          # "vllm" | "dynamo" | "ray"
+    model_id: str          # router alias shown in headers and /v1/models
+    model_name: str = ""   # actual HuggingFace name sent to vLLM backend
+                           # (e.g. "Qwen/Qwen2.5-7B-Instruct"); defaults to model_id
+    backend: str           # "vllm" | "dynamo" | "ray"
     base_url: str
     domains: list[str]
     min_accuracy_capability: dict[str, float] = {}
@@ -158,6 +161,7 @@ async def register_model(req: RegisterRequest) -> dict:
     else:
         raise HTTPException(status_code=400, detail=f"Unknown backend: {req.backend}")
 
+    # Run calibration if no per-domain floors were provided
     capability = req.min_accuracy_capability
     if not capability and not req.skip_calibration:
         log.info("No min_accuracy_capability provided — running calibration for %s", req.model_id)
@@ -168,17 +172,23 @@ async def register_model(req: RegisterRequest) -> dict:
             log.warning("Calibration failed for %s: %s — using default 0.5", req.model_id, e)
             capability = {"_default": 0.5}
 
+    # If caller provided partial dict, fill missing domains with "_default" fallback
     if capability and "_default" not in capability:
         capability["_default"] = min(capability.values())
 
+    # Build accuracy_priors: prefer explicitly provided values, fall back to
+    # min_accuracy_capability so the model never bids DEFAULT_ACCURACY_PRIOR (0.70)
+    # for domains that have leaderboard data. This is the critical path:
+    # if accuracy_priors stays empty, both models bid 0.70 and cost always decides.
     accuracy_priors = dict(req.accuracy_priors)
     if capability:
         for key, score in capability.items():
             if ":" in key and key not in accuracy_priors:
-                accuracy_priors[key] = score
+                accuracy_priors[key] = score   # fill gaps from capability dict
 
     adapter = adapter_cls(
         model_id=req.model_id,
+        model_name=req.model_name or req.model_id,
         base_url=req.base_url,
         efficiency_tokens_per_joule=req.efficiency_tokens_per_joule,
         max_concurrent_requests=req.max_concurrent_requests,
@@ -194,7 +204,7 @@ async def register_model(req: RegisterRequest) -> dict:
     return {
         "registered":             req.model_id,
         "min_accuracy_capability": capability,
-        "accuracy_priors_stored":  accuracy_priors,
+        "accuracy_priors_stored":  accuracy_priors,   # confirm what was stored
     }
 
 
@@ -225,6 +235,11 @@ async def model_reputation(model_id: str) -> dict:
 
 @app.get("/router/{model_id}/details")
 async def model_details(model_id: str) -> dict:
+    """
+    Show stored accuracy_priors for a model — use this to verify that
+    registration passed accuracy_priors correctly.
+    If all values show 0.70 (DEFAULT_ACCURACY_PRIOR), the priors were not set.
+    """
     adapter = registry.get_adapter(model_id)
     if not adapter:
         raise HTTPException(status_code=404, detail=f"Model '{model_id}' not registered.")
@@ -244,7 +259,7 @@ async def health() -> dict:
     return {"status": "ok", "registered_models": len(registry.list_all())}
 
 
-# -- User management ----------------------------------------------------------
+# ── User management ───────────────────────────────────────────────────────────
 
 @app.post("/users/{user_id}/preference", status_code=201)
 async def set_preference(user_id: str, pref: UserPreference) -> dict:
