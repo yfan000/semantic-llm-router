@@ -58,17 +58,19 @@ LATENCY_SLO_MS: dict[tuple[str, str], int] = {
 BACKENDS = [
     {
         "model_id":                    "qwen2.5-1.5b",
+        "model_name":                  "Qwen/Qwen2.5-1.5B-Instruct",  # sent to vLLM
         "base_url":                    "http://localhost:8001",
         "input_rate_usd_per_token":    0.0000001,
         "output_rate_usd_per_token":   0.0000002,
         "efficiency_tokens_per_joule": 26.7,
     },
     {
-        "model_id":                    "phi-3.5-mini",
+        "model_id":                    "qwen2.5-7b",
+        "model_name":                  "Qwen/Qwen2.5-7B-Instruct",    # sent to vLLM
         "base_url":                    "http://localhost:8002",
-        "input_rate_usd_per_token":    0.0000002,
-        "output_rate_usd_per_token":   0.0000004,
-        "efficiency_tokens_per_joule": 20.0,
+        "input_rate_usd_per_token":    0.0000003,
+        "output_rate_usd_per_token":   0.0000006,
+        "efficiency_tokens_per_joule": 13.0,
     },
 ]
 
@@ -180,7 +182,7 @@ async def send_request(
         resp = await client.post(
             f"{backend['base_url']}/v1/chat/completions",
             json={
-                "model":    backend["model_id"],
+                "model":    backend.get("model_name", backend["model_id"]),
                 "messages": [{"role": "user", "content": item["query"]}],
             },
         )
