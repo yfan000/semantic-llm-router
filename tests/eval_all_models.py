@@ -1,23 +1,25 @@
 """
-eval_all_models.py — Pre-evaluation matrix: run every request on every model.
+eval_all_models.py — Pre-evaluation matrix.
 
-For each request in the dataset, sends it to ALL configured model backends
-concurrently and scores each response against ground_truth. Produces an
-eval_matrix.csv with one row per (request × model) pair.
+Runs every request in the dataset through ALL model backends before testing.
+Produces eval_matrix.csv with one row per (request x model) pair, containing:
+  - actual wall_ms for each model on each request
+  - accuracy score and is_correct flag
 
-This matrix is then used by compare_ttca.py for exact Time-to-Correct-Answer
-computation — no median-latency simulation needed.
+This matrix is then consumed by compare_ttca.py (--eval-matrix flag) for
+exact Time-to-Correct-Answer computation with no median-latency simulation.
+
+Workflow:
+    1. python tests/eval_all_models.py --dataset datasets/hf_1000.json
+    2. python tests/load_test.py       --dataset datasets/hf_1000.json ...
+    3. python tests/round_robin_test.py --dataset datasets/hf_1000.json ...
+    4. python tests/compare_ttca.py --router ... --baseline ... --eval-matrix results/eval_matrix.csv
 
 Usage:
-    # Configure BACKENDS below, then run:
-    python tests/eval_all_models.py \
-        --dataset datasets/hf_1000.json \
-        --output  results/eval_matrix.csv \
+    python tests/eval_all_models.py \\
+        --dataset     datasets/hf_1000.json \\
+        --output      results/eval_matrix.csv \\
         --concurrency 10
-
-Output columns:
-    req_id, domain, complexity, query, ground_truth,
-    model_id, wall_ms, status, response_text, score, is_correct
 """
 from __future__ import annotations
 
@@ -32,21 +34,19 @@ import sys
 import tempfile
 import time
 from collections import defaultdict
-from datetime import datetime
-from statistics import mean
 from pathlib import Path
 
 import httpx
 
 
 # ---------------------------------------------------------------------------
-# Model backends — edit to match your deployment
+# Model backends — must match what is registered with the router
 # ---------------------------------------------------------------------------
 
 BACKENDS: list[dict] = [
     {
         "model_id":   "qwen2.5-1.5b",
-        "model_name": "Qwen/Qwen2.5-1.5B-Instruct",  # name sent to vLLM
+        "model_name": "Qwen/Qwen2.5-1.5B-Instruct",
         "base_url":   "http://localhost:8001",
     },
     {
@@ -60,16 +60,16 @@ CORRECT_THRESHOLD = 0.7
 
 
 # ---------------------------------------------------------------------------
-# Accuracy scoring (same as score_accuracy.py / compare_ttca.py)
+# Accuracy scoring
 # ---------------------------------------------------------------------------
 
 def _extract_numbers(text: str) -> list[float]:
     return [float(m) for m in re.findall(r"-?\d+(?:\.\d+)?", text)]
 
 
-def _score_math(response: str, ground_truth: str):
+def _score_math(response: str, gt: str):
     pred = _extract_numbers(response)
-    true = _extract_numbers(str(ground_truth))
+    true = _extract_numbers(str(gt))
     if not pred or not true:
         return None
     p, t = pred[-1], true[-1]
@@ -78,17 +78,16 @@ def _score_math(response: str, ground_truth: str):
     return 1.0 if (abs(p - t) / abs(t) < 0.01 or abs(p - t) < 0.01) else 0.0
 
 
-def _score_code(response: str, ground_truth: str):
+def _score_code(response: str, gt: str):
     blocks = re.findall(r"```(?:python)?\s*(.*?)```", response, re.DOTALL)
     code = blocks[0].strip() if blocks else response.strip()
     try:
         ast.parse(code)
     except SyntaxError:
         return 0.0
-    gt = str(ground_truth)
-    if "assert" in gt or "==" in gt:
+    if "assert" in str(gt) or "==" in str(gt):
         with tempfile.NamedTemporaryFile(suffix=".py", mode="w", delete=False) as f:
-            f.write(code + "\n" + gt)
+            f.write(code + "\n" + str(gt))
             fname = f.name
         try:
             r = subprocess.run([sys.executable, fname], timeout=5, capture_output=True)
@@ -98,14 +97,14 @@ def _score_code(response: str, ground_truth: str):
     return 0.5
 
 
-def _score_keyword(response: str, ground_truth: str):
-    if not ground_truth or ground_truth.strip() in ("", "None"):
+def _score_keyword(response: str, gt: str):
+    if not gt or str(gt).strip() in ("", "None"):
         return None
-    gt_words = set(w.lower() for w in re.findall(r"\b\w{4,}\b", str(ground_truth)))
-    if not gt_words:
+    words = set(w.lower() for w in re.findall(r"\b\w{4,}\b", str(gt)))
+    if not words:
         return None
-    matches = sum(1 for w in gt_words if w in response.lower())
-    overlap = matches / len(gt_words)
+    hits = sum(1 for w in words if w in response.lower())
+    overlap = hits / len(words)
     return 1.0 if overlap >= 0.5 else overlap
 
 
@@ -118,17 +117,15 @@ _SCORERS = {
 }
 
 
-def score_response(domain: str, response: str, ground_truth: str):
+def score_response(domain: str, response: str, gt: str):
     if not response:
         return None
     scorer = _SCORERS.get(domain.lower())
-    if scorer is None:
-        return None
-    return scorer(response, ground_truth)
+    return scorer(response, gt) if scorer else None
 
 
 # ---------------------------------------------------------------------------
-# Single inference call to one backend
+# Call one model for one request
 # ---------------------------------------------------------------------------
 
 async def call_model(
@@ -149,6 +146,7 @@ async def call_model(
         "response_text": "",
         "score":         "",
         "is_correct":    "",
+        "error":         "",
     }
 
     t0 = time.monotonic()
@@ -166,12 +164,12 @@ async def call_model(
         result["status"]  = resp.status_code
 
         if resp.status_code == 200:
-            body = resp.json()
+            body    = resp.json()
             choices = body.get("choices", [])
-            response_text = choices[0].get("message", {}).get("content", "") if choices else ""
-            result["response_text"] = response_text
+            text    = choices[0].get("message", {}).get("content", "") if choices else ""
+            result["response_text"] = text
 
-            s = score_response(item["domain"], response_text, item.get("ground_truth", ""))
+            s = score_response(item["domain"], text, item.get("ground_truth", ""))
             if s is not None:
                 result["score"]      = f"{s:.4f}"
                 result["is_correct"] = "true" if s >= CORRECT_THRESHOLD else "false"
@@ -187,124 +185,121 @@ async def call_model(
 
 
 # ---------------------------------------------------------------------------
-# Main runner
+# Runner
 # ---------------------------------------------------------------------------
 
 async def run(dataset_path: str, output: str, concurrency: int) -> None:
     with open(dataset_path) as f:
         items = json.load(f)
 
-    n_requests  = len(items)
-    n_models    = len(BACKENDS)
-    n_total     = n_requests * n_models
+    n_req   = len(items)
+    n_mod   = len(BACKENDS)
+    n_total = n_req * n_mod
 
     Path(output).parent.mkdir(parents=True, exist_ok=True)
 
-    print(f"\n  Eval matrix: {n_requests} requests × {n_models} models = {n_total} calls")
-    print(f"  Models: {', '.join(b['model_id'] for b in BACKENDS)}")
-    print(f"  Concurrency: {concurrency}  |  Output: {output}\n")
+    print(f"\n  Pre-evaluation: {n_req} requests x {n_mod} models = {n_total} calls")
+    print(f"  Models      : {', '.join(b['model_id'] for b in BACKENDS)}")
+    print(f"  Concurrency : {concurrency}  (simultaneous calls across all models)")
+    print(f"  Output      : {output}\n")
 
     fieldnames = [
         "req_id", "domain", "complexity", "query", "ground_truth",
-        "model_id", "wall_ms", "status", "response_text", "score", "is_correct",
+        "model_id", "wall_ms", "status", "response_text", "score", "is_correct", "error",
     ]
 
-    sem    = asyncio.Semaphore(concurrency)
-    done   = 0
-    t0_all = time.monotonic()
+    sem  = asyncio.Semaphore(concurrency)
+    done = 0
+    t0   = time.monotonic()
 
-    async def bounded_call(req_id: int, item: dict, backend: dict, writer, f) -> None:
+    async def bounded(req_id: int, item: dict, backend: dict, writer, f) -> None:
         nonlocal done
         async with sem:
-            async with httpx.AsyncClient(timeout=120.0) as client:
+            async with httpx.AsyncClient() as client:
                 r = await call_model(client, req_id, item, backend)
             writer.writerow(r)
             f.flush()
             done += 1
             if done % max(n_total // 20, 1) == 0:
-                elapsed = time.monotonic() - t0_all
+                elapsed = time.monotonic() - t0
                 bar = "=" * int(done / n_total * 40)
                 print(f"\r  [{bar:<40}] {done}/{n_total}  {done/elapsed:.1f} calls/s",
                       end="", flush=True)
-
-    # Build all (req_id, item, backend) tasks
-    tasks = []
-    for i, item in enumerate(items):
-        for backend in BACKENDS:
-            tasks.append((i, item, backend))
-
-    results: list[dict] = []
 
     with open(output, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
         await asyncio.gather(*[
-            bounded_call(req_id, item, backend, writer, f)
-            for req_id, item, backend in tasks
+            bounded(i, items[i], backend, writer, f)
+            for i in range(n_req)
+            for backend in BACKENDS
         ])
 
-    elapsed = time.monotonic() - t0_all
-    print(f"\r  [{'='*40}] {n_total}/{n_total}  ({elapsed:.1f}s)\n")
+    elapsed = time.monotonic() - t0
+    print(f"\r  [{'='*40}] {n_total}/{n_total}  ({elapsed:.1f}s total)\n")
 
     # --- Summary ---
     with open(output, newline="", encoding="utf-8") as f:
-        all_rows = list(csv.DictReader(f))
+        rows = list(csv.DictReader(f))
 
-    ok = [r for r in all_rows if str(r.get("status")) == "200"]
-    scorable = [r for r in ok if r.get("is_correct") in ("true", "false")]
+    ok       = [r for r in rows if str(r.get("status")) == "200"]
+    scorable = [r for r in ok   if r.get("is_correct") in ("true", "false")]
 
-    print(f"  Total calls : {n_total}")
-    print(f"  Successful  : {len(ok)}")
-    print(f"  Scorable    : {len(scorable)}")
-    print()
+    print(f"  Calls      : {n_total}")
+    print(f"  Successful : {len(ok)}")
+    print(f"  Scorable   : {len(scorable)}")
 
     # Per-model accuracy
-    by_model: dict[str, list] = defaultdict(list)
+    by_model: dict[str, list[bool]] = defaultdict(list)
     for r in scorable:
         by_model[r["model_id"]].append(r["is_correct"] == "true")
 
-    print(f"  {'Model':<26} {'Correct':>8} {'Total':>8} {'Accuracy':>10}")
-    print(f"  {'-'*56}")
-    for model_id, correct_list in sorted(by_model.items()):
-        n_correct = sum(correct_list)
-        n_tot     = len(correct_list)
-        print(f"  {model_id:<26} {n_correct:>8} {n_tot:>8} {n_correct/max(n_tot,1)*100:>9.1f}%")
+    print(f"\n  {'Model':<28} {'Correct':>8} {'Total':>8} {'Accuracy':>10}")
+    print(f"  {'-'*58}")
+    for mid, correct_list in sorted(by_model.items()):
+        n_c = sum(correct_list)
+        n_t = len(correct_list)
+        print(f"  {mid:<28} {n_c:>8} {n_t:>8} {n_c/max(n_t,1)*100:>9.1f}%")
 
-    # Per-domain accuracy per model
-    by_domain_model: dict[tuple, list] = defaultdict(list)
+    # Per-domain breakdown
+    by_dm: dict[tuple, list[bool]] = defaultdict(list)
     for r in scorable:
-        by_domain_model[(r["domain"], r["model_id"])].append(r["is_correct"] == "true")
+        by_dm[(r["domain"], r["model_id"])].append(r["is_correct"] == "true")
 
     domains = sorted({r["domain"] for r in scorable})
     models  = sorted({r["model_id"] for r in scorable})
 
     print(f"\n  {'Domain':<14}", end="")
     for m in models:
-        print(f"  {m[:20]:>22}", end="")
+        print(f"  {m[:22]:>24}", end="")
     print()
-    print(f"  {'-'*(14 + 24*len(models))}")
+    print(f"  {'-'*(14 + 26 * len(models))}")
     for domain in domains:
         print(f"  {domain:<14}", end="")
         for m in models:
-            lst = by_domain_model.get((domain, m), [])
-            if lst:
-                acc = sum(lst) / len(lst) * 100
-                print(f"  {acc:>21.1f}%", end="")
-            else:
-                print(f"  {'—':>22}", end="")
+            lst = by_dm.get((domain, m), [])
+            cell = f"{sum(lst)/len(lst)*100:.1f}%" if lst else "-"
+            print(f"  {cell:>24}", end="")
         print()
 
-    print(f"\n  Eval matrix saved to: {output}")
-    print(f"  Use with: python tests/compare_ttca.py --router results/router.csv "
-          f"--baseline results/rr.csv --eval-matrix {output}\n")
+    print(f"\n  Saved: {output}")
+    print(f"\n  Next steps:")
+    print(f"    python tests/load_test.py --dataset {dataset_path} --mode accuracy \\")
+    print(f"        --output results/router_accuracy.csv")
+    print(f"    python tests/round_robin_test.py --dataset {dataset_path} \\")
+    print(f"        --output results/rr_baseline.csv")
+    print(f"    python tests/compare_ttca.py \\")
+    print(f"        --router results/router_accuracy.csv \\")
+    print(f"        --baseline results/rr_baseline.csv \\")
+    print(f"        --eval-matrix {output}\n")
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Pre-evaluate all requests on all models")
+    parser = argparse.ArgumentParser()
     parser.add_argument("--dataset",     required=True, help="Dataset JSON from build_dataset.py")
     parser.add_argument("--output",      default="results/eval_matrix.csv")
     parser.add_argument("--concurrency", type=int, default=10,
-                        help="Concurrent calls per model (total = concurrency × n_models)")
+                        help="Max simultaneous calls across all models combined")
     args = parser.parse_args()
     asyncio.run(run(args.dataset, args.output, args.concurrency))
 
