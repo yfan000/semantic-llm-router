@@ -252,18 +252,26 @@ def compute_ttca(
         "ttca_failed_mean":    mean(ttca_failed) if ttca_failed else 0.0,
         "n_failed":            len(ttca_failed),
         "model_latencies":     model_latencies,
-        "by_domain":           _by_domain(ok, model_latencies, eval_matrix),
+        "by_domain":            _categorize(ok, model_latencies, eval_matrix,
+                                             key_fn=lambda r: r.get("domain", "unknown")),
+        "by_complexity":        _categorize(ok, model_latencies, eval_matrix,
+                                             key_fn=lambda r: r.get("complexity", "unknown")),
+        "by_domain_complexity": _categorize(ok, model_latencies, eval_matrix,
+                                             key_fn=lambda r:
+                                             f"{r.get('domain','?')}:{r.get('complexity','?')}"),
     }
 
 
-def _by_domain(
+def _categorize(
     ok: list[dict],
     model_latencies: dict[str, float],
     eval_matrix: dict | None,
+    key_fn,          # callable(row) -> str grouping key
 ) -> dict:
-    all_models  = list(model_latencies.keys())
-    exact_mode  = eval_matrix is not None
-    by_domain: dict[str, dict] = defaultdict(lambda: {
+    """Generic breakdown by any grouping key (domain, complexity, domain:complexity)."""
+    all_models = list(model_latencies.keys())
+    exact_mode = eval_matrix is not None
+    buckets: dict[str, dict] = defaultdict(lambda: {
         "first_try": 0, "retry": 0, "unresolved": 0,
         "ttca_resolved": [], "ttca_failed": [],
     })
@@ -278,18 +286,18 @@ def _by_domain(
         except (KeyError, ValueError):
             continue
 
-        d      = row.get("domain", "unknown")
+        key    = key_fn(row)
         winner = row.get("model_winner", "")
 
         if correctness:
-            by_domain[d]["first_try"] += 1
-            by_domain[d]["ttca_resolved"].append(wall)
+            buckets[key]["first_try"] += 1
+            buckets[key]["ttca_resolved"].append(wall)
             continue
 
         other = [m for m in all_models if m != winner]
         if not other:
-            by_domain[d]["unresolved"] += 1
-            by_domain[d]["ttca_failed"].append(wall)
+            buckets[key]["unresolved"] += 1
+            buckets[key]["ttca_failed"].append(wall)
             continue
 
         retry_model = other[0]
@@ -309,24 +317,24 @@ def _by_domain(
 
         total = wall + retry_lat
         if retry_correct or not exact_mode:
-            by_domain[d]["retry"] += 1
-            by_domain[d]["ttca_resolved"].append(total)
+            buckets[key]["retry"] += 1
+            buckets[key]["ttca_resolved"].append(total)
         else:
-            by_domain[d]["unresolved"] += 1
-            by_domain[d]["ttca_failed"].append(total)
+            buckets[key]["unresolved"] += 1
+            buckets[key]["ttca_failed"].append(total)
 
     result = {}
-    for d, v in by_domain.items():
+    for k, v in buckets.items():
         n   = v["first_try"] + v["retry"] + v["unresolved"]
         res = v["ttca_resolved"]
         fal = v["ttca_failed"]
-        result[d] = {
-            "first_try_rate":       v["first_try"] / max(n, 1),
-            "resolution_rate":      (v["first_try"] + v["retry"]) / max(n, 1),
-            "failure_rate":         v["unresolved"] / max(n, 1),
-            "ttca_resolved_mean":   mean(res) if res else 0.0,
-            "ttca_resolved_p50":    sorted(res)[len(res) // 2] if res else 0.0,
-            "ttca_failed_mean":     mean(fal) if fal else 0.0,
+        result[k] = {
+            "first_try_rate":     v["first_try"] / max(n, 1),
+            "resolution_rate":    (v["first_try"] + v["retry"]) / max(n, 1),
+            "failure_rate":       v["unresolved"] / max(n, 1),
+            "ttca_resolved_mean": mean(res) if res else 0.0,
+            "ttca_resolved_p50":  sorted(res)[len(res) // 2] if res else 0.0,
+            "ttca_failed_mean":   mean(fal) if fal else 0.0,
             "n": n,
         }
     return result
@@ -447,9 +455,23 @@ def print_report(results: list[dict]) -> None:
     else:
         print("  (no failures in simulation mode — run with --eval-matrix for exact count)")
 
-    # ── Per-domain breakdown ──────────────────────────────────────────────
+    # helper: print one stats row from a by_X dict
+    def cat_row(label, by_key, cat_key, stat, fmt, higher_better):
+        vals  = [r[by_key].get(cat_key, {}).get(stat, 0.0) for r in results]
+        fmted = [fmt(v) for v in vals]
+        change, hi = "", False
+        if len(results) == 2 and vals[0] and vals[1]:
+            change = pct_change(vals[1], vals[0])
+            hi = (vals[0] > vals[1]) if higher_better else (vals[0] < vals[1])
+        row(f"  {label}", *fmted, *(([change]) if len(results) == 2 else []), highlight=hi)
+
+    def pct_fmt(x):  return f"{x*100:.1f}%"
+    def ms_fmt(x):   return f"{x:.0f} ms" if x else "n/a"
+
+    # ── By domain ────────────────────────────────────────────────────────
     print(f"\n{'='*W}")
-    print(f"  DOMAIN BREAKDOWN")
+    print(f"  BREAKDOWN BY DOMAIN")
+    print(f"{'='*W}")
     all_domains: set[str] = set()
     for r in results:
         all_domains.update(r["by_domain"].keys())
@@ -457,26 +479,64 @@ def print_report(results: list[dict]) -> None:
     for domain in ["math", "code", "factual", "reasoning"]:
         if domain not in all_domains:
             continue
-        print(f"\n  {domain.upper()}")
+        n_vals = [r["by_domain"].get(domain, {}).get("n", 0) for r in results]
+        print(f"\n  {domain.upper()}  (n={'/'.join(str(n) for n in n_vals)})")
         hdr("", *labels, *change_hdr)
-        print(f"  {'-'*74}")
+        print(f"  {'-'*70}")
+        cat_row("First-try rate",      "by_domain", domain, "first_try_rate",     pct_fmt, True)
+        cat_row("Resolution rate",     "by_domain", domain, "resolution_rate",    pct_fmt, True)
+        cat_row("Failure rate",        "by_domain", domain, "failure_rate",       pct_fmt, False)
+        cat_row("TTCA-resolved mean",  "by_domain", domain, "ttca_resolved_mean", ms_fmt,  False)
+        cat_row("TTCA-failed mean",    "by_domain", domain, "ttca_failed_mean",   ms_fmt,  False)
 
-        def drow(label, key, fmt=lambda x: f"{x:.0f} ms", higher_better=False):
-            vals  = [r["by_domain"].get(domain, {}).get(key, 0.0) for r in results]
-            fmted = [fmt(v) for v in vals]
-            change, hi = "", False
-            if len(results) == 2 and vals[0] and vals[1]:
-                change = pct_change(vals[1], vals[0])
-                hi = (vals[0] < vals[1]) if not higher_better else (vals[0] > vals[1])
-            row(f"  {label}", *fmted, *(([change]) if len(results) == 2 else []), highlight=hi)
+    # ── By complexity ────────────────────────────────────────────────────
+    print(f"\n{'='*W}")
+    print(f"  BREAKDOWN BY DIFFICULTY")
+    print(f"{'='*W}")
 
-        drow("First-try rate",   "first_try_rate",
-             fmt=lambda x: f"{x*100:.1f}%", higher_better=True)
-        drow("Failure rate",     "failure_rate",
-             fmt=lambda x: f"{x*100:.1f}%", higher_better=False)
-        drow("TTCA-resolved mean", "ttca_resolved_mean", higher_better=False)
-        drow("TTCA-failed mean",   "ttca_failed_mean",
-             fmt=lambda x: f"{x:.0f} ms" if x else "n/a", higher_better=False)
+    for cplx in ["easy", "medium", "hard"]:
+        n_vals = [r["by_complexity"].get(cplx, {}).get("n", 0) for r in results]
+        if not any(n_vals):
+            continue
+        print(f"\n  {cplx.upper()}  (n={'/'.join(str(n) for n in n_vals)})")
+        hdr("", *labels, *change_hdr)
+        print(f"  {'-'*70}")
+        cat_row("First-try rate",      "by_complexity", cplx, "first_try_rate",     pct_fmt, True)
+        cat_row("Resolution rate",     "by_complexity", cplx, "resolution_rate",    pct_fmt, True)
+        cat_row("Failure rate",        "by_complexity", cplx, "failure_rate",       pct_fmt, False)
+        cat_row("TTCA-resolved mean",  "by_complexity", cplx, "ttca_resolved_mean", ms_fmt,  False)
+        cat_row("TTCA-failed mean",    "by_complexity", cplx, "ttca_failed_mean",   ms_fmt,  False)
+
+    # ── By domain × complexity matrix ────────────────────────────────────
+    print(f"\n{'='*W}")
+    print(f"  DOMAIN × DIFFICULTY MATRIX  (first-try rate  |  TTCA-resolved mean)")
+    print(f"{'='*W}")
+
+    DOMAINS   = ["math", "code", "factual", "reasoning"]
+    COMPLEXITIES = ["easy", "medium", "hard"]
+
+    for r in results:
+        print(f"\n  [{r['label']}]")
+        # header row
+        print(f"  {'':14}", end="")
+        for cplx in COMPLEXITIES:
+            print(f"  {cplx:>22}", end="")
+        print()
+        print(f"  {'-'*80}")
+        for domain in DOMAINS:
+            print(f"  {domain:<14}", end="")
+            for cplx in COMPLEXITIES:
+                key  = f"{domain}:{cplx}"
+                stat = r["by_domain_complexity"].get(key, {})
+                ftr  = stat.get("first_try_rate", 0.0)
+                ttca = stat.get("ttca_resolved_mean", 0.0)
+                n    = stat.get("n", 0)
+                if n:
+                    cell = f"{ftr*100:.0f}% / {ttca:.0f}ms"
+                else:
+                    cell = "-"
+                print(f"  {cell:>22}", end="")
+            print()
 
     # ── Summary ───────────────────────────────────────────────────────────
     if len(results) == 2:
