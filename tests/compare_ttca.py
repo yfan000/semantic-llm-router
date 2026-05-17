@@ -169,10 +169,6 @@ def compute_ttca(
     first_try_ok = retry_ok = unresolved = unscorable = 0
 
     for row in ok:
-        correctness = is_correct(row)
-        if correctness is None:
-            unscorable += 1
-            continue
         try:
             wall   = float(row["wall_ms"])
             req_id = int(row["req_id"])
@@ -181,18 +177,42 @@ def compute_ttca(
             continue
 
         winner = row.get("model_winner", "")
+        other_models = [m for m in all_models if m != winner]
 
-        if correctness:
-            # Correct on first try
-            ttca_resolved.append(wall)
+        if exact_mode:
+            # Use eval_matrix for BOTH first-try and retry correctness.
+            # This makes resolved% = P(at least one model correct) which is
+            # identical for any routing strategy — no non-determinism from
+            # mixing two separate inference runs.
+            em_first = eval_matrix.get((req_id, winner))
+            if em_first is None or str(em_first.get("status")) != "200":
+                unscorable += 1
+                continue
+            if em_first.get("is_correct") not in ("true", "false"):
+                unscorable += 1   # unscorable domain (no ground_truth)
+                continue
+            first_correct = em_first.get("is_correct") == "true"
+            try:
+                first_wall = float(em_first.get("wall_ms", wall))
+            except (TypeError, ValueError):
+                first_wall = wall
+        else:
+            # Simulation mode: score from the actual test response
+            s = is_correct(row)
+            if s is None:
+                unscorable += 1
+                continue
+            first_correct = s
+            first_wall = wall
+
+        if first_correct:
+            ttca_resolved.append(first_wall)
             first_try_ok += 1
             continue
 
         # First model wrong — retry with another model
-        other_models = [m for m in all_models if m != winner]
         if not other_models:
-            # Only one model registered, no retry possible
-            ttca_failed.append(wall)
+            ttca_failed.append(first_wall)
             unresolved += 1
             continue
 
@@ -211,14 +231,13 @@ def compute_ttca(
                 retry_correct = False
         else:
             retry_lat     = model_latencies.get(retry_model, median(model_latencies.values()))
-            retry_correct = True  # simulation: optimistically assume retry succeeds
+            retry_correct = True
 
-        total = wall + retry_lat
+        total = first_wall + retry_lat
         if retry_correct or not exact_mode:
             ttca_resolved.append(total)
             retry_ok += 1
         else:
-            # Both models wrong — user never got a correct answer
             ttca_failed.append(total)
             unresolved += 1
 
@@ -277,9 +296,6 @@ def _categorize(
     })
 
     for row in ok:
-        correctness = is_correct(row)
-        if correctness is None:
-            continue
         try:
             wall   = float(row["wall_ms"])
             req_id = int(row["req_id"])
@@ -288,16 +304,34 @@ def _categorize(
 
         key    = key_fn(row)
         winner = row.get("model_winner", "")
+        other  = [m for m in all_models if m != winner]
 
-        if correctness:
+        if exact_mode:
+            em_first = eval_matrix.get((req_id, winner))
+            if em_first is None or str(em_first.get("status")) != "200":
+                continue
+            if em_first.get("is_correct") not in ("true", "false"):
+                continue
+            first_correct = em_first.get("is_correct") == "true"
+            try:
+                first_wall = float(em_first.get("wall_ms", wall))
+            except (TypeError, ValueError):
+                first_wall = wall
+        else:
+            s = is_correct(row)
+            if s is None:
+                continue
+            first_correct = s
+            first_wall = wall
+
+        if first_correct:
             buckets[key]["first_try"] += 1
-            buckets[key]["ttca_resolved"].append(wall)
+            buckets[key]["ttca_resolved"].append(first_wall)
             continue
 
-        other = [m for m in all_models if m != winner]
         if not other:
             buckets[key]["unresolved"] += 1
-            buckets[key]["ttca_failed"].append(wall)
+            buckets[key]["ttca_failed"].append(first_wall)
             continue
 
         retry_model = other[0]
@@ -315,7 +349,7 @@ def _categorize(
             retry_lat     = model_latencies.get(retry_model, median(model_latencies.values()))
             retry_correct = True
 
-        total = wall + retry_lat
+        total = first_wall + retry_lat
         if retry_correct or not exact_mode:
             buckets[key]["retry"] += 1
             buckets[key]["ttca_resolved"].append(total)
