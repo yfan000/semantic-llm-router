@@ -509,34 +509,34 @@ def print_report(results: list[dict]) -> None:
 
     # ── By domain × complexity matrix ────────────────────────────────────
     print(f"\n{'='*W}")
-    print(f"  DOMAIN × DIFFICULTY MATRIX  (first-try rate  |  TTCA-resolved mean)")
+    print(f"  DOMAIN × DIFFICULTY MATRIX")
+    print(f"  Format: resolved% (after retries) / TTCA mean (resolved requests)")
+    print(f"  resolved% = first-try correct + retried correct — the final success rate")
     print(f"{'='*W}")
 
-    DOMAINS   = ["math", "code", "factual", "reasoning"]
+    DOMAINS      = ["math", "code", "factual", "reasoning"]
     COMPLEXITIES = ["easy", "medium", "hard"]
 
     for r in results:
         print(f"\n  [{r['label']}]")
-        # header row
         print(f"  {'':14}", end="")
         for cplx in COMPLEXITIES:
-            print(f"  {cplx:>22}", end="")
+            print(f"  {cplx:>24}", end="")
         print()
-        print(f"  {'-'*80}")
+        print(f"  {'-'*86}")
         for domain in DOMAINS:
             print(f"  {domain:<14}", end="")
             for cplx in COMPLEXITIES:
                 key  = f"{domain}:{cplx}"
                 stat = r["by_domain_complexity"].get(key, {})
-                ftr  = stat.get("first_try_rate", 0.0)
+                res  = stat.get("resolution_rate", 0.0)   # final rate after retries
                 ttca = stat.get("ttca_resolved_mean", 0.0)
                 n    = stat.get("n", 0)
-                if n:
-                    cell = f"{ftr*100:.0f}% / {ttca:.0f}ms"
-                else:
-                    cell = "-"
-                print(f"  {cell:>22}", end="")
+                cell = f"{res*100:.0f}% / {ttca:.0f}ms" if n else "-"
+                print(f"  {cell:>24}", end="")
             print()
+    print()
+    print(f"  Note: resolved% < 100% means some requests had ALL models wrong (failure_rate)")
 
     # ── Summary ───────────────────────────────────────────────────────────
     if len(results) == 2:
