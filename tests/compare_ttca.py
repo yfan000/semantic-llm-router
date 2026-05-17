@@ -97,11 +97,6 @@ _SCORERS = {
 
 CORRECT_THRESHOLD = 0.7
 
-# When ALL models give wrong answer the user is stuck — we apply a penalty
-# multiplier to TTCA so "no correct answer after N attempts" weighs more
-# than "correct answer after N attempts". Set to 1.0 to disable.
-UNRESOLVED_PENALTY = 3.0
-
 
 def score_row(row: dict):
     if str(row.get("status", "")) != "200":
@@ -167,8 +162,10 @@ def compute_ttca(
     all_models     = list(model_latencies.keys())
     exact_mode     = eval_matrix is not None
 
+    # ttca_resolved: time until user gets correct answer (first-try OR after retry)
+    # ttca_failed:   time user wasted when ALL models gave wrong answer (no resolution)
     ttca_resolved: list[float] = []
-    ttca_all:      list[float] = []
+    ttca_failed:   list[float] = []
     first_try_ok = retry_ok = unresolved = unscorable = 0
 
     for row in ok:
@@ -186,22 +183,22 @@ def compute_ttca(
         winner = row.get("model_winner", "")
 
         if correctness:
+            # Correct on first try
             ttca_resolved.append(wall)
-            ttca_all.append(wall)
             first_try_ok += 1
             continue
 
-        # First model was wrong — need retry
+        # First model wrong — retry with another model
         other_models = [m for m in all_models if m != winner]
         if not other_models:
-            ttca_all.append(wall)
+            # Only one model registered, no retry possible
+            ttca_failed.append(wall)
             unresolved += 1
             continue
 
         retry_model = other_models[0]
 
         if exact_mode:
-            # Look up actual latency + correctness of fallback for this request
             fallback = eval_matrix.get((req_id, retry_model))
             if fallback and str(fallback.get("status")) == "200":
                 try:
@@ -213,22 +210,19 @@ def compute_ttca(
                 retry_lat     = model_latencies.get(retry_model, median(model_latencies.values()))
                 retry_correct = False
         else:
-            # Simulation: median latency, assume success
             retry_lat     = model_latencies.get(retry_model, median(model_latencies.values()))
-            retry_correct = True
+            retry_correct = True  # simulation: optimistically assume retry succeeds
 
         total = wall + retry_lat
         if retry_correct or not exact_mode:
             ttca_resolved.append(total)
-            ttca_all.append(total)
             retry_ok += 1
         else:
-            # All models wrong — apply penalty to signal user is completely stuck
-            ttca_all.append(total * UNRESOLVED_PENALTY)
+            # Both models wrong — user never got a correct answer
+            ttca_failed.append(total)
             unresolved += 1
 
     n_scorable = first_try_ok + retry_ok + unresolved
-    failure_rate = unresolved / max(n_scorable, 1)
 
     def pct(vals: list[float], p: float) -> float:
         if not vals:
@@ -237,25 +231,28 @@ def compute_ttca(
         return s[min(int(len(s) * p / 100), len(s) - 1)]
 
     return {
-        "label":              label,
-        "exact_mode":         exact_mode,
-        "n_total":            len(ok),
-        "n_scorable":         n_scorable,
-        "n_unscorable":       unscorable,
-        "first_try_ok":       first_try_ok,
-        "retry_ok":           retry_ok,
-        "unresolved":         unresolved,
-        "failure_rate":       unresolved / max(n_scorable, 1),
-        "first_try_rate":     first_try_ok / max(n_scorable, 1),
-        "resolution_rate":    (first_try_ok + retry_ok) / max(n_scorable, 1),
-        "ttca_resolved_p50":  pct(ttca_resolved, 50),
-        "ttca_resolved_p95":  pct(ttca_resolved, 95),
-        "ttca_resolved_mean": mean(ttca_resolved) if ttca_resolved else 0.0,
-        "ttca_all_p50":       pct(ttca_all, 50),
-        "ttca_all_p95":       pct(ttca_all, 95),
-        "ttca_all_mean":      mean(ttca_all) if ttca_all else 0.0,
-        "model_latencies":    model_latencies,
-        "by_domain":          _by_domain(ok, model_latencies, eval_matrix),
+        "label":               label,
+        "exact_mode":          exact_mode,
+        "n_total":             len(ok),
+        "n_scorable":          n_scorable,
+        "n_unscorable":        unscorable,
+        "first_try_ok":        first_try_ok,
+        "retry_ok":            retry_ok,
+        "unresolved":          unresolved,
+        "failure_rate":        unresolved / max(n_scorable, 1),
+        "first_try_rate":      first_try_ok / max(n_scorable, 1),
+        "resolution_rate":     (first_try_ok + retry_ok) / max(n_scorable, 1),
+        # TTCA-resolved: distribution of wait time when user DOES get correct answer
+        "ttca_resolved_p50":   pct(ttca_resolved, 50),
+        "ttca_resolved_p95":   pct(ttca_resolved, 95),
+        "ttca_resolved_mean":  mean(ttca_resolved) if ttca_resolved else 0.0,
+        # TTCA-failed: time wasted when user NEVER gets correct answer (all models wrong)
+        "ttca_failed_p50":     pct(ttca_failed, 50),
+        "ttca_failed_p95":     pct(ttca_failed, 95),
+        "ttca_failed_mean":    mean(ttca_failed) if ttca_failed else 0.0,
+        "n_failed":            len(ttca_failed),
+        "model_latencies":     model_latencies,
+        "by_domain":           _by_domain(ok, model_latencies, eval_matrix),
     }
 
 
@@ -267,7 +264,8 @@ def _by_domain(
     all_models  = list(model_latencies.keys())
     exact_mode  = eval_matrix is not None
     by_domain: dict[str, dict] = defaultdict(lambda: {
-        "first_try": 0, "retry": 0, "unresolved": 0, "ttca": []
+        "first_try": 0, "retry": 0, "unresolved": 0,
+        "ttca_resolved": [], "ttca_failed": [],
     })
 
     for row in ok:
@@ -285,13 +283,13 @@ def _by_domain(
 
         if correctness:
             by_domain[d]["first_try"] += 1
-            by_domain[d]["ttca"].append(wall)
+            by_domain[d]["ttca_resolved"].append(wall)
             continue
 
         other = [m for m in all_models if m != winner]
         if not other:
             by_domain[d]["unresolved"] += 1
-            by_domain[d]["ttca"].append(wall)
+            by_domain[d]["ttca_failed"].append(wall)
             continue
 
         retry_model = other[0]
@@ -312,21 +310,24 @@ def _by_domain(
         total = wall + retry_lat
         if retry_correct or not exact_mode:
             by_domain[d]["retry"] += 1
-            by_domain[d]["ttca"].append(total)
+            by_domain[d]["ttca_resolved"].append(total)
         else:
             by_domain[d]["unresolved"] += 1
-            by_domain[d]["ttca"].append(total * UNRESOLVED_PENALTY)
+            by_domain[d]["ttca_failed"].append(total)
 
     result = {}
     for d, v in by_domain.items():
-        total  = v["first_try"] + v["retry"] + v["unresolved"]
-        ttca_v = v["ttca"]
+        n   = v["first_try"] + v["retry"] + v["unresolved"]
+        res = v["ttca_resolved"]
+        fal = v["ttca_failed"]
         result[d] = {
-            "first_try_rate":  v["first_try"] / max(total, 1),
-            "resolution_rate": (v["first_try"] + v["retry"]) / max(total, 1),
-            "ttca_mean":       mean(ttca_v) if ttca_v else 0.0,
-            "ttca_p50":        sorted(ttca_v)[len(ttca_v) // 2] if ttca_v else 0.0,
-            "n": total,
+            "first_try_rate":       v["first_try"] / max(n, 1),
+            "resolution_rate":      (v["first_try"] + v["retry"]) / max(n, 1),
+            "failure_rate":         v["unresolved"] / max(n, 1),
+            "ttca_resolved_mean":   mean(res) if res else 0.0,
+            "ttca_resolved_p50":    sorted(res)[len(res) // 2] if res else 0.0,
+            "ttca_failed_mean":     mean(fal) if fal else 0.0,
+            "n": n,
         }
     return result
 
@@ -374,114 +375,140 @@ def print_report(results: list[dict]) -> None:
             print(f"    {m:<28} {lat:.0f} ms")
     print()
 
-    # Headers
-    print(f"  {'METRIC':<{C1}}", end="")
-    for r in results:
-        print(f"  {r['label'][:20]:<{C2}}", end="")
-    if len(results) == 2:
-        print(f"  {'Change':<{C2}}", end="")
-    print()
-    print(f"  {'-'*74}")
+    labels     = [r["label"][:C2] for r in results]
+    change_hdr = ["Change"] if len(results) == 2 else []
+
+    def hdr(*cols):
+        print(f"  {cols[0]:<{C1}}", end="")
+        for c in cols[1:]:
+            print(f"  {str(c):<{C2}}", end="")
+        print()
 
     def mrow(label, key, fmt=str, higher_better=True):
-        vals = [r[key] for r in results]
+        vals  = [r[key] for r in results]
         fmted = [fmt(v) for v in vals]
-        change = ""
-        hi = False
+        change, hi = "", False
         if len(results) == 2:
             change = pct_change(vals[1], vals[0])
             hi = (vals[0] > vals[1]) if higher_better else (vals[0] < vals[1])
         row(label, *fmted, *(([change]) if len(results) == 2 else []), highlight=hi)
 
-    mrow("First-try success rate",      "first_try_rate",
-         fmt=lambda x: f"{x*100:.1f}%", higher_better=True)
-    mrow("Resolution rate (<=1 retry)", "resolution_rate",
-         fmt=lambda x: f"{x*100:.1f}%", higher_better=True)
-    mrow("Failure rate (all wrong)",    "failure_rate",
-         fmt=lambda x: f"{x*100:.1f}%", higher_better=False)
-
+    # ── Resolution stats ──────────────────────────────────────────────────
+    hdr("OUTCOME", *labels, *change_hdr)
     print(f"  {'-'*74}")
-    print(f"  Counts: first-try correct / retried OK / ALL-WRONG (both models failed)")
+    mrow("First-try success rate",       "first_try_rate",
+         fmt=lambda x: f"{x*100:.1f}%", higher_better=True)
+    mrow("Resolution rate (<=1 retry)",  "resolution_rate",
+         fmt=lambda x: f"{x*100:.1f}%", higher_better=True)
+    mrow("Failure rate (all wrong)",     "failure_rate",
+         fmt=lambda x: f"{x*100:.1f}%", higher_better=False)
+    print(f"  {'-'*74}")
+    print(f"  Counts: first-try correct / retried OK / ALL-WRONG (no correct answer)")
     for r in results:
         unres_pct = r["unresolved"] / max(r["n_scorable"], 1) * 100
-        tag = f"  [{unres_pct:.1f}% no correct answer]" if r["unresolved"] > 0 else ""
+        tag = f"  ({unres_pct:.1f}% of requests had no correct answer)" if r["unresolved"] > 0 else ""
         print(f"    {r['label']}: {r['first_try_ok']} / {r['retry_ok']} / {r['unresolved']}{tag}")
 
+    # ── TTCA — got correct answer ─────────────────────────────────────────
+    print(f"\n{'='*W}")
+    print(f"  TTCA — REQUESTS THAT GOT CORRECT ANSWER  (n first-try + n retried)")
+    print(f"  Time from question to correct answer, including any retry wait")
+    hdr("", *labels, *change_hdr)
     print(f"  {'-'*74}")
-    print(f"  TTCA - resolved requests only (at least one model correct)")
+    mrow("  Count",
+         "resolution_rate",
+         fmt=lambda x: f"{int(x * r['n_scorable'])} / {r['n_scorable']}"
+             if False else "",   # placeholder — print manually below
+         higher_better=True)
+    for r in results:
+        n_res = r["first_try_ok"] + r["retry_ok"]
+        print(f"    [{r['label']}]  {n_res} requests resolved")
     mrow("  P50",  "ttca_resolved_p50",  fmt=lambda x: f"{x:.0f} ms", higher_better=False)
     mrow("  P95",  "ttca_resolved_p95",  fmt=lambda x: f"{x:.0f} ms", higher_better=False)
     mrow("  Mean", "ttca_resolved_mean", fmt=lambda x: f"{x:.0f} ms", higher_better=False)
-    print(f"  {'-'*74}")
-    print(f"  TTCA - all scorable (unresolved penalised x{UNRESOLVED_PENALTY:.0f})")
-    mrow("  P50",  "ttca_all_p50",  fmt=lambda x: f"{x:.0f} ms", higher_better=False)
-    mrow("  P95",  "ttca_all_p95",  fmt=lambda x: f"{x:.0f} ms", higher_better=False)
-    mrow("  Mean", "ttca_all_mean", fmt=lambda x: f"{x:.0f} ms", higher_better=False)
 
-    # Per-domain
-    DOMAINS = ["math", "code", "factual", "reasoning"]
-    print(f"\n  {'DOMAIN BREAKDOWN':<{C1}}", end="")
+    # ── TTCA — never got correct answer ───────────────────────────────────
+    print(f"\n{'='*W}")
+    print(f"  TTCA — REQUESTS THAT NEVER GOT CORRECT ANSWER  (all models wrong)")
+    print(f"  Time wasted waiting through all failed attempts")
+    hdr("", *labels, *change_hdr)
+    print(f"  {'-'*74}")
     for r in results:
-        print(f"  {r['label'][:20]:<{C2}}", end="")
-    print()
-    print(f"  {'-'*74}")
+        print(f"    [{r['label']}]  {r['unresolved']} requests unresolved "
+              f"({r['unresolved']/max(r['n_scorable'],1)*100:.1f}%)")
+    has_failed = any(r["unresolved"] > 0 for r in results)
+    if has_failed:
+        mrow("  P50",  "ttca_failed_p50",  fmt=lambda x: f"{x:.0f} ms" if x else "n/a",
+             higher_better=False)
+        mrow("  P95",  "ttca_failed_p95",  fmt=lambda x: f"{x:.0f} ms" if x else "n/a",
+             higher_better=False)
+        mrow("  Mean", "ttca_failed_mean", fmt=lambda x: f"{x:.0f} ms" if x else "n/a",
+             higher_better=False)
+    else:
+        print("  (no failures in simulation mode — run with --eval-matrix for exact count)")
 
-    all_domains = set()
+    # ── Per-domain breakdown ──────────────────────────────────────────────
+    print(f"\n{'='*W}")
+    print(f"  DOMAIN BREAKDOWN")
+    all_domains: set[str] = set()
     for r in results:
         all_domains.update(r["by_domain"].keys())
 
-    for domain in DOMAINS:
+    for domain in ["math", "code", "factual", "reasoning"]:
         if domain not in all_domains:
             continue
-        print(f"  {domain}")
+        print(f"\n  {domain.upper()}")
+        hdr("", *labels, *change_hdr)
+        print(f"  {'-'*74}")
 
         def drow(label, key, fmt=lambda x: f"{x:.0f} ms", higher_better=False):
-            vals = [r["by_domain"].get(domain, {}).get(key, 0.0) for r in results]
+            vals  = [r["by_domain"].get(domain, {}).get(key, 0.0) for r in results]
             fmted = [fmt(v) for v in vals]
-            change = ""
-            hi = False
+            change, hi = "", False
             if len(results) == 2 and vals[0] and vals[1]:
                 change = pct_change(vals[1], vals[0])
                 hi = (vals[0] < vals[1]) if not higher_better else (vals[0] > vals[1])
-            row(f"    {label}", *fmted, *(([change]) if len(results) == 2 else []), highlight=hi)
+            row(f"  {label}", *fmted, *(([change]) if len(results) == 2 else []), highlight=hi)
 
-        drow("First-try rate", "first_try_rate",
+        drow("First-try rate",   "first_try_rate",
              fmt=lambda x: f"{x*100:.1f}%", higher_better=True)
-        drow("TTCA mean", "ttca_mean", higher_better=False)
-        drow("TTCA P50",  "ttca_p50",  higher_better=False)
+        drow("Failure rate",     "failure_rate",
+             fmt=lambda x: f"{x*100:.1f}%", higher_better=False)
+        drow("TTCA-resolved mean", "ttca_resolved_mean", higher_better=False)
+        drow("TTCA-failed mean",   "ttca_failed_mean",
+             fmt=lambda x: f"{x:.0f} ms" if x else "n/a", higher_better=False)
 
-    # Summary
+    # ── Summary ───────────────────────────────────────────────────────────
     if len(results) == 2:
-        r, b = results[0], results[1]
+        r0, r1 = results[0], results[1]
         print(f"\n{'='*W}")
         print("  SUMMARY")
         print(f"{'='*W}")
-        ftr_d  = (r["first_try_rate"]  - b["first_try_rate"])  * 100
-        rr_d   = (r["resolution_rate"] - b["resolution_rate"]) * 100
-        ttca_d = r["ttca_all_mean"]    - b["ttca_all_mean"]
-        print(f"  First-try success: {r['label']} {ftr_d:+.1f}pp vs {b['label']}")
-        print(f"  Resolution rate:   {r['label']} {rr_d:+.1f}pp vs {b['label']}")
+        ftr_d  = (r0["first_try_rate"]   - r1["first_try_rate"])   * 100
+        rr_d   = (r0["resolution_rate"]  - r1["resolution_rate"])  * 100
+        fail_d = (r0["failure_rate"]     - r1["failure_rate"])      * 100
+        ttca_d = r0["ttca_resolved_mean"] - r1["ttca_resolved_mean"]
+        print(f"  First-try success  : {r0['label']} {ftr_d:+.1f}pp vs {r1['label']}")
+        print(f"  Resolution rate    : {r0['label']} {rr_d:+.1f}pp vs {r1['label']}")
+        print(f"  Failure rate       : {r0['label']} {fail_d:+.1f}pp vs {r1['label']}")
         if ttca_d < 0:
-            pct = abs(ttca_d) / max(b["ttca_all_mean"], 1) * 100
-            print(f"  TTCA improvement:  {r['label']} is {abs(ttca_d):.0f} ms faster "
-                  f"({pct:.1f}% reduction in time-to-correct-answer)")
-        else:
-            print(f"  TTCA:              {b['label']} is {ttca_d:.0f} ms faster per request")
-            print("                     Router trades single-request latency for higher "
-                  "first-try accuracy")
+            pct_imp = abs(ttca_d) / max(r1["ttca_resolved_mean"], 1) * 100
+            print(f"  TTCA (resolved)    : {r0['label']} is {abs(ttca_d):.0f} ms faster "
+                  f"({pct_imp:.1f}% faster time-to-correct-answer)")
+        elif ttca_d > 0:
+            print(f"  TTCA (resolved)    : {r1['label']} is {ttca_d:.0f} ms faster per resolved request")
+            print("                       (router uses slower 7B model which needs fewer retries)")
 
     print(f"\n{'='*W}\n")
-    print(f"  Notes:")
-    print(f"  - Correct threshold: score >= {CORRECT_THRESHOLD:.0%}")
+    print("  Notes:")
+    print(f"  - Correct defined as score >= {CORRECT_THRESHOLD:.0%}")
+    print("  - TTCA-resolved: time until user gets correct answer (first-try or after retry)")
+    print("  - TTCA-failed:   time wasted when ALL models gave wrong answer (no correct answer)")
     if results[0]["exact_mode"]:
-        print("  - Retry latency and correctness from actual eval_matrix per-request data")
-        print("  - Unresolved = BOTH models gave wrong answer for that specific request")
+        print("  - Exact mode: per-request latency and correctness from eval_matrix")
     else:
-        print("  - Retry latency = median wall_ms of fallback model (simulation)")
-        print("  - Run eval_all_models.py and pass --eval-matrix for exact unresolved count")
-    print(f"  - Unresolved TTCA penalised x{UNRESOLVED_PENALTY:.0f}: "
-          f"user waited through all attempts and still got no correct answer")
-    print("  - Use --penalty N to change the multiplier (1.0 = no penalty beyond wait time)")
+        print("  - Simulation mode: retry latency = median of fallback model; retry assumed correct")
+        print("  - Run eval_all_models.py + pass --eval-matrix for exact failure count")
     print()
 
 
@@ -495,17 +522,13 @@ def load_csv(path: str) -> list[dict]:
 
 
 def main() -> None:
-    global UNRESOLVED_PENALTY
     parser = argparse.ArgumentParser(description="Time-to-Correct-Answer comparison")
     parser.add_argument("--router",      required=True, help="Router results CSV")
     parser.add_argument("--baseline",    required=True, help="Round-robin baseline CSV")
     parser.add_argument("--eval-matrix", default=None,
                         help="eval_matrix.csv from eval_all_models.py for exact TTCA")
-    parser.add_argument("--penalty",     type=float, default=UNRESOLVED_PENALTY,
-                        help=f"TTCA multiplier when all models fail (default {UNRESOLVED_PENALTY})")
     args = parser.parse_args()
 
-    UNRESOLVED_PENALTY = args.penalty
     eval_matrix = load_eval_matrix(args.eval_matrix) if args.eval_matrix else None
     if eval_matrix:
         print(f"  Loaded eval matrix: {len(eval_matrix)} (req_id, model_id) entries")
