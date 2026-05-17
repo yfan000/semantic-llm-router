@@ -112,7 +112,8 @@ def build_request_list(n: int, dataset_path: str | None) -> list[dict]:
     if dataset_path:
         with open(dataset_path) as f:
             items = json.load(f)
-        random.shuffle(items)
+        # Do NOT shuffle — req_id must match eval_all_models.py and load_test.py
+        # so that eval_matrix lookups in compare_ttca.py find the correct question.
         if n > len(items):
             items += random.choices(items, k=n - len(items))
         return items[:n]
