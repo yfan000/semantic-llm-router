@@ -117,18 +117,26 @@ def rank_bids(
     # This is mathematically optimal when retry-on-wrong-answer is enabled.
     # A fast model with 50% accuracy (L/p=1000) beats a slow model with 95%
     # accuracy (L/p=2105) because trying fast-first reduces expected total time.
+    #
+    # Latency source (in priority order):
+    #   1. EMA of actual measured latency from dispatcher (most accurate)
+    #   2. Formula estimate from bid (output_tokens/throughput) -- used on cold start
     if pref.mode == RouterMode.TTCA:
         def ttca_score(bid: BidResponse) -> float:
-            acc = max(bid.estimated_accuracy, 0.01)  # avoid division by zero
-            return bid.estimated_latency_ms / acc
+            acc = max(bid.estimated_accuracy, 0.01)
+            measured = reputation.get_avg_latency_ms(bid.model_id)
+            lat = measured if measured is not None else bid.estimated_latency_ms
+            return lat / acc
 
         ranked = sorted(candidates, key=ttca_score)
         for bid in ranked:
+            measured = reputation.get_avg_latency_ms(bid.model_id)
+            lat = measured if measured is not None else bid.estimated_latency_ms
+            src = "measured" if measured is not None else "estimated"
             log.info(
-                "  TTCA %-22s lat=%dms acc=%.3f -> lat/acc=%.1f",
-                bid.model_id, bid.estimated_latency_ms,
-                bid.estimated_accuracy,
-                bid.estimated_latency_ms / max(bid.estimated_accuracy, 0.01),
+                "  TTCA %-22s lat=%.0fms(%s) acc=%.3f -> lat/acc=%.1f",
+                bid.model_id, lat, src,
+                bid.estimated_accuracy, lat / max(bid.estimated_accuracy, 0.01),
             )
         return ranked
 
