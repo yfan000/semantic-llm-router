@@ -25,26 +25,26 @@ def select(
     if not bids:
         raise NoEligibleModelError()
 
-    log.info("SELECT domain=%s complexity=%s n_bids=%d acc_weight=%.2f cost_weight=%.2f slo=%s ms",
-             domain, complexity, len(bids), pref.accuracy_weight, pref.cost_weight,
-             pref.max_latency_ms)
+    log.info("SELECT domain=%s complexity=%s n_bids=%d acc_weight=%.2f cost_weight=%.2f",
+             domain, complexity, len(bids), pref.accuracy_weight, pref.cost_weight)
 
-    # Stage 1 — hard filter on latency SLO and accuracy floor
+    # Stage 1 -- hard filter on latency SLO and accuracy floor
     candidates = [
         b for b in bids
         if (pref.max_latency_ms is None or b.estimated_latency_ms <= pref.max_latency_ms)
         and (pref.min_accuracy is None or b.estimated_accuracy >= pref.min_accuracy)
     ]
     if not candidates:
-        # SLO/accuracy violated by all models — fall back to fastest available
+        # SLO/accuracy violated by all models -- fall back to fastest available
         fastest = sorted(bids, key=lambda b: b.estimated_latency_ms)
         candidates = fastest[:1]
         log.warning(
-            "SLO violated by all bids (slo=%s ms) — falling back to fastest: %s (%d ms)",
+            "SLO violated by all bids (slo=%s ms) -- falling back to fastest: %s (%d ms)",
             pref.max_latency_ms, candidates[0].model_id, candidates[0].estimated_latency_ms,
         )
 
-    # Stage 2 — 4D weighted score (lower = better)
+    # Stage 2 -- 4D weighted score (lower = better)
+    # bid.estimated_accuracy comes from adapter.accuracy_priors (leaderboard values)
     def effective_cost(bid: BidResponse) -> float:
         return bid.estimated_cost_usd * reputation.get_penalty_multiplier(bid.model_id)
 
@@ -74,3 +74,49 @@ def select(
     winner = min(candidates, key=lambda b: scores[b.model_id])
     log.info("  WINNER: %s (score=%.4f)", winner.model_id, scores[winner.model_id])
     return winner
+
+
+def rank_bids(
+    bids: list[BidResponse],
+    pref: UserPreference,
+    reputation: ReputationTracker,
+    domain: str,
+    complexity: str,
+) -> list[BidResponse]:
+    """Return all bids sorted best-first by weighted score.
+
+    Used by the inference retry loop -- if the top model fails during
+    dispatch, the caller tries the next-best model in this ranked list.
+    Unlike select(), this never raises: an empty list is returned when
+    there are no bids.
+    """
+    if not bids:
+        return []
+
+    def effective_cost(bid: BidResponse) -> float:
+        return bid.estimated_cost_usd * reputation.get_penalty_multiplier(bid.model_id)
+
+    # Apply hard filters -- SLO and accuracy floor
+    candidates = [
+        b for b in bids
+        if (pref.max_latency_ms is None or b.estimated_latency_ms <= pref.max_latency_ms)
+        and (pref.min_accuracy is None or b.estimated_accuracy >= pref.min_accuracy)
+    ]
+    if not candidates:
+        # Fall back to all bids sorted by latency when SLO is violated
+        candidates = sorted(bids, key=lambda b: b.estimated_latency_ms)
+
+    max_cost   = max(effective_cost(b) for b in candidates) or 1.0
+    max_lat    = max(b.estimated_latency_ms for b in candidates) or 1.0
+    max_energy = max(b.estimated_energy_j   for b in candidates) or 1.0
+
+    def score(bid: BidResponse) -> float:
+        ec = effective_cost(bid)
+        return (
+            pref.cost_weight     * (ec                       / max_cost)
+            + pref.latency_weight  * (bid.estimated_latency_ms / max_lat)
+            + pref.accuracy_weight * (1.0 - bid.estimated_accuracy)
+            + pref.energy_weight   * (bid.estimated_energy_j   / max_energy)
+        )
+
+    return sorted(candidates, key=score)
