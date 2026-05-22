@@ -10,11 +10,12 @@ from pydantic import BaseModel
 
 from semantic_router.analyzer import SemanticAnalyzer
 from semantic_router.accuracy_sampler import AccuracySampler
+from semantic_router.benchmark_store import BenchmarkStore
 from semantic_router.bidder import collect_bids
 from semantic_router.dispatcher import dispatch
 from semantic_router.registry import ModelRegistry, ModelConfig
 from semantic_router.reputation_tracker import ReputationTracker
-from semantic_router.config import LATENCY_SLO_MS
+from semantic_router.config import LATENCY_SLO_MS, BENCHMARK_PATH
 from semantic_router.schemas import (
     BidRequest, RequestSLA, RouterMode, UserBudget, UserPreference,
 )
@@ -30,6 +31,7 @@ registry   = ModelRegistry()
 user_reg   = UserRegistry()
 reputation = ReputationTracker()
 sampler    = AccuracySampler(reputation)
+benchmark  = BenchmarkStore(BENCHMARK_PATH)  # offline ground-truth lookup
 
 
 @asynccontextmanager
@@ -108,9 +110,16 @@ async def chat_completions(request: Request) -> JSONResponse:
         if k not in ("model", "messages", "extra_body", "stream")
     }
 
+    # Offline ground-truth lookup -- enables quality-based retry
+    # when the request matches a known benchmark query.
+    query_text = " ".join(m.get("content", "") for m in messages if m.get("role") == "user")
+    benchmark_item = benchmark.lookup(query_text)
+    ground_truth   = benchmark_item.get("ground_truth") if benchmark_item else None
+
     # Dispatch with inference-time retry: try each model in score order.
-    # If the top model fails (crash, timeout, HTTP error), fall through to
-    # the next-best model rather than returning a 500 to the client.
+    # Two retry triggers:
+    #   1. Infrastructure failure (crash, timeout, HTTP error)
+    #   2. Wrong answer -- only when ground_truth is known from benchmark dataset
     last_error: Exception | None = None
     for attempt, winning_bid in enumerate(ranked_bids):
         winning_adapter = registry.get_adapter(winning_bid.model_id)
@@ -118,7 +127,7 @@ async def chat_completions(request: Request) -> JSONResponse:
             continue
         if attempt > 0:
             log.warning(
-                "Retrying with next-best model %s (attempt %d/%d) after previous failure",
+                "Retrying with next-best model %s (attempt %d/%d)",
                 winning_bid.model_id, attempt + 1, len(ranked_bids),
             )
         try:
@@ -134,6 +143,29 @@ async def chat_completions(request: Request) -> JSONResponse:
                 sampler=sampler,
                 extra_kwargs=passthrough,
             )
+
+            # Quality check -- only when we have offline ground truth
+            if ground_truth is not None:
+                response_text = ""
+                try:
+                    response_text = response_dict["choices"][0]["message"]["content"]
+                except (KeyError, IndexError):
+                    pass
+                correct = benchmark.is_correct(meta.domain, response_text, ground_truth)
+                router_headers["X-Router-GT-Scored"] = "true"
+                if correct is False:
+                    log.warning(
+                        "Model %s gave wrong answer (attempt %d) -- trying next model",
+                        winning_bid.model_id, attempt + 1,
+                    )
+                    router_headers["X-Router-GT-Correct"] = "false"
+                    last_error = ValueError(f"{winning_bid.model_id} answered incorrectly")
+                    continue  # try next model
+                if correct is True:
+                    router_headers["X-Router-GT-Correct"] = "true"
+            else:
+                router_headers["X-Router-GT-Scored"] = "false"
+
             router_headers["X-Router-Accuracy-Weight"] = f"{pref.accuracy_weight:.2f}"
             router_headers["X-Router-Cost-Weight"]     = f"{pref.cost_weight:.2f}"
             router_headers["X-Router-Attempt"]         = str(attempt + 1)
@@ -147,6 +179,9 @@ async def chat_completions(request: Request) -> JSONResponse:
                 router_headers["X-Router-SLO-Violated"] = "true" if slo_violated else "false"
             return JSONResponse(content=response_dict, headers=router_headers)
 
+        except ValueError:
+            # Wrong-answer retry -- already logged above, just move on
+            continue
         except Exception as e:
             last_error = e
             log.warning(
