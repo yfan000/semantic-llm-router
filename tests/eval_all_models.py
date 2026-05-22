@@ -1,5 +1,5 @@
 """
-eval_all_models.py — Pre-evaluation matrix.
+eval_all_models.py -- Pre-evaluation matrix.
 
 Runs every request in the dataset through ALL model backends before testing.
 Produces eval_matrix.csv with one row per (request x model) pair, containing:
@@ -40,19 +40,34 @@ import httpx
 
 
 # ---------------------------------------------------------------------------
-# Model backends — must match what is registered with the router
+# Model backends -- must match what is registered with the router
+# Sophia 4-model setup:
+#   GPU 0       -> Qwen2.5-7B-Instruct          (port 8000)
+#   GPU 1,2     -> Qwen2.5-14B-Instruct         (port 8001)
+#   GPU 3       -> DeepSeek-R1-Distill-Qwen-7B  (port 8002)
+#   GPU 4,5,6,7 -> Qwen2.5-Coder-32B-Instruct  (port 8003)
 # ---------------------------------------------------------------------------
 
 BACKENDS: list[dict] = [
     {
-        "model_id":   "qwen2.5-1.5b",
-        "model_name": "Qwen/Qwen2.5-1.5B-Instruct",
+        "model_id":   "qwen-7b",
+        "model_name": "Qwen/Qwen2.5-7B-Instruct",
+        "base_url":   "http://localhost:8000",
+    },
+    {
+        "model_id":   "qwen-14b",
+        "model_name": "Qwen/Qwen2.5-14B-Instruct",
         "base_url":   "http://localhost:8001",
     },
     {
-        "model_id":   "qwen2.5-7b",
-        "model_name": "Qwen/Qwen2.5-7B-Instruct",
+        "model_id":   "deepseek-r1-7b",
+        "model_name": "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B",
         "base_url":   "http://localhost:8002",
+    },
+    {
+        "model_id":   "coder-32b",
+        "model_name": "Qwen/Qwen2.5-Coder-32B-Instruct",
+        "base_url":   "http://localhost:8003",
     },
 ]
 
@@ -284,6 +299,8 @@ async def run(dataset_path: str, output: str, concurrency: int) -> None:
 
     print(f"\n  Saved: {output}")
     print(f"\n  Next steps:")
+    print(f"    python tests/extract_priors.py --eval-matrix {output} --output results/priors.json")
+    print(f"    python tests/register_with_priors.py --priors results/priors.json")
     print(f"    python tests/load_test.py --dataset {dataset_path} --mode accuracy \\")
     print(f"        --output results/router_accuracy.csv")
     print(f"    python tests/round_robin_test.py --dataset {dataset_path} \\")
