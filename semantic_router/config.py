@@ -13,11 +13,8 @@ MODE_PRESETS: dict[RouterMode, dict] = {
         accuracy_weight=0.20, cost_weight=0.55,
         latency_weight=0.15, energy_weight=0.10,
     ),
-    # TTCA mode: balanced accuracy + speed to minimise Time-to-Correct-Answer
-    RouterMode.TTCA: dict(
-        accuracy_weight=0.45, cost_weight=0.05,
-        latency_weight=0.45, energy_weight=0.05,
-    ),
+    # TTCA mode uses latency/accuracy scoring in selector.py (not a weighted preset)
+    # -- no entry needed here since rank_bids() handles it directly.
 }
 
 DEFAULT_PREFERENCE = UserPreference()  # equal weights, no hard constraints

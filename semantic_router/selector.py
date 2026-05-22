@@ -1,7 +1,7 @@
 from __future__ import annotations
 import logging
 from fastapi import HTTPException
-from semantic_router.schemas import BidResponse, UserPreference
+from semantic_router.schemas import BidResponse, UserPreference, RouterMode
 from semantic_router.reputation_tracker import ReputationTracker
 
 log = logging.getLogger(__name__)
@@ -89,6 +89,13 @@ def rank_bids(
     dispatch, the caller tries the next-best model in this ranked list.
     Unlike select(), this never raises: an empty list is returned when
     there are no bids.
+
+    TTCA mode uses latency/accuracy directly (not a weighted sum) because
+    E[time to correct answer] = latency / accuracy. This correctly prefers
+    fast models even at lower accuracy when retry is available:
+      E[TTCA small-first] = p*L_s + (1-p)*(L_s+L_l)  (typically lower)
+      E[TTCA large-first] = p*L_l + (1-p)*(L_l+L_s)  (typically higher)
+    Optimal ordering: sort by L/p ascending.
     """
     if not bids:
         return []
@@ -106,6 +113,26 @@ def rank_bids(
         # Fall back to all bids sorted by latency when SLO is violated
         candidates = sorted(bids, key=lambda b: b.estimated_latency_ms)
 
+    # TTCA mode: sort by latency/accuracy (expected time to correct answer).
+    # This is mathematically optimal when retry-on-wrong-answer is enabled.
+    # A fast model with 50% accuracy (L/p=1000) beats a slow model with 95%
+    # accuracy (L/p=2105) because trying fast-first reduces expected total time.
+    if pref.mode == RouterMode.TTCA:
+        def ttca_score(bid: BidResponse) -> float:
+            acc = max(bid.estimated_accuracy, 0.01)  # avoid division by zero
+            return bid.estimated_latency_ms / acc
+
+        ranked = sorted(candidates, key=ttca_score)
+        for bid in ranked:
+            log.info(
+                "  TTCA %-22s lat=%dms acc=%.3f -> lat/acc=%.1f",
+                bid.model_id, bid.estimated_latency_ms,
+                bid.estimated_accuracy,
+                bid.estimated_latency_ms / max(bid.estimated_accuracy, 0.01),
+            )
+        return ranked
+
+    # All other modes: 4D weighted score (lower = better)
     max_cost   = max(effective_cost(b) for b in candidates) or 1.0
     max_lat    = max(b.estimated_latency_ms for b in candidates) or 1.0
     max_energy = max(b.estimated_energy_j   for b in candidates) or 1.0
