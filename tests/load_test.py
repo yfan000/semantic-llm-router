@@ -28,7 +28,7 @@ from statistics import mean, median
 import httpx
 
 # ---------------------------------------------------------------------------
-# 1000 diverse queries: 5 domains × 3 complexities × ~67 queries each
+# 1000 diverse queries: 5 domains x 3 complexities x ~67 queries each
 # ---------------------------------------------------------------------------
 
 QUERIES: dict[tuple[str, str], list[str]] = {
@@ -103,7 +103,7 @@ QUERIES: dict[tuple[str, str], list[str]] = {
         "What is 1/3 + 1/4?",
         "How many seconds are in 2.5 hours?",
         "If x + 7 = 15, what is x?",
-        "What is the area of a circle with radius 5? (use π≈3.14)",
+        "What is the area of a circle with radius 5? (use pi=3.14)",
         "What is 25% of 200?",
         "If a dozen eggs cost $4.80, how much does each egg cost?",
         "What is 7 squared minus 5 squared?",
@@ -111,37 +111,37 @@ QUERIES: dict[tuple[str, str], list[str]] = {
         "If 3x = 21, what is x?",
     ],
     ("math", "medium"): [
-        "Solve the quadratic equation x² - 5x + 6 = 0.",
-        "Find the derivative of f(x) = 3x³ - 2x² + x - 5.",
+        "Solve the quadratic equation x^2 - 5x + 6 = 0.",
+        "Find the derivative of f(x) = 3x^3 - 2x^2 + x - 5.",
         "What is the probability of rolling two sixes in a row with a fair die?",
         "Calculate the compound interest on $1000 at 5% annually for 3 years.",
         "Find the sum of the arithmetic series 3 + 7 + 11 + ... + 99.",
         "What is the determinant of the matrix [[2,3],[1,4]]?",
         "Solve the system: 2x + y = 7 and x - y = 2.",
-        "What is the integral of x² from 0 to 3?",
+        "What is the integral of x^2 from 0 to 3?",
         "Find the nth term formula for the sequence 2, 5, 10, 17, 26, ...",
         "What is the standard deviation of {2, 4, 4, 4, 5, 5, 7, 9}?",
         "Calculate the volume of a cylinder with radius 3 and height 8.",
-        "Solve: log₂(x) = 5.",
+        "Solve: log base 2 of x = 5.",
         "Find the equation of a line passing through (2,3) and (4,7).",
-        "What is the binomial expansion of (x+y)⁴?",
-        "Calculate the area under f(x) = x² between x=1 and x=4.",
+        "What is the binomial expansion of (x+y)^4?",
+        "Calculate the area under f(x) = x^2 between x=1 and x=4.",
         "What is the inverse of the matrix [[1,2],[3,4]]?",
-        "Find all values of x where sin(x) = 0.5 in [0, 2π].",
-        "What is the limit of (x²-1)/(x-1) as x approaches 1?",
+        "Find all values of x where sin(x) = 0.5 in [0, 2*pi].",
+        "What is the limit of (x^2-1)/(x-1) as x approaches 1?",
         "Calculate the expected value of rolling a fair 6-sided die.",
-        "Solve: 2ˣ = 32.",
+        "Solve: 2^x = 32.",
     ],
     ("math", "hard"): [
         "Prove by induction that the sum of the first n natural numbers is n(n+1)/2.",
         "Find the eigenvalues and eigenvectors of the matrix [[3,1],[1,3]].",
-        "Prove that √2 is irrational.",
+        "Prove that sqrt(2) is irrational.",
         "Solve the differential equation dy/dx = 2xy with y(0) = 1.",
         "What is the Fourier transform of a Gaussian function?",
         "Prove the Cauchy-Schwarz inequality for inner product spaces.",
         "Find the general solution to y'' - 3y' + 2y = e^x.",
         "Prove that there are infinitely many prime numbers.",
-        "What is the gradient and Hessian of f(x,y) = x²y + xy²?",
+        "What is the gradient and Hessian of f(x,y) = x^2*y + x*y^2?",
         "Derive the formula for the volume of a sphere using integration.",
     ],
     ("code", "easy"): [
@@ -249,7 +249,7 @@ QUERIES: dict[tuple[str, str], list[str]] = {
         "Evaluate the philosophical tension between determinism and moral responsibility.",
         "What are the second-order economic effects of automating white-collar jobs?",
         "Analyse the logical consistency of Rawls' veil of ignorance argument.",
-        "How does Gödel's incompleteness theorem limit the foundations of mathematics?",
+        "How does Godel's incompleteness theorem limit the foundations of mathematics?",
         "Evaluate the strategic implications of first-mover advantage in network effects markets.",
         "What are the epistemological challenges of training AI on internet-scale data?",
         "Analyse the causal mechanisms linking financial deregulation to systemic risk.",
@@ -322,8 +322,6 @@ def build_request_list(n: int, dataset_path: str | None = None) -> list[dict]:
         with open(dataset_path) as f:
             items = _json.load(f)
         print(f"  Loaded {len(items)} items from {dataset_path}")
-        # Do NOT shuffle — req_id must match eval_all_models.py and round_robin_test.py
-        # so that eval_matrix lookups in compare_ttca.py find the correct question.
         if n > len(items):
             items += random.choices(items, k=n - len(items))
         return items[:n]
@@ -369,9 +367,6 @@ def random_router_params(item: dict | None = None) -> dict:
         else:
             params = {"mode": mode}
 
-    # Pass dataset labels as domain/complexity override so the router uses
-    # the correct category instead of potentially misclassifying structured
-    # benchmark queries (MMLU, GSM8K, HumanEval, LogiQA, etc.)
     if item and item.get("domain"):
         params["domain"] = item["domain"]
     if item and item.get("complexity"):
@@ -380,12 +375,6 @@ def random_router_params(item: dict | None = None) -> dict:
     return params
 
 
-# ---------------------------------------------------------------------------
-# Single request — non-streaming (router does not support SSE pass-through)
-# TTFT and ITL are derived from X-Router-* headers set by the router internally.
-# Wall time = end-to-end latency measured by the client.
-# ---------------------------------------------------------------------------
-
 async def send_request(
     client: httpx.AsyncClient,
     router_url: str,
@@ -393,8 +382,6 @@ async def send_request(
     item: dict,
 ) -> dict:
     params = random_router_params(item)
-    # NOTE: do NOT include "stream": True — the router's adapter.complete()
-    # calls resp.json() which fails on an SSE response, causing a 500 error.
     payload = {
         "model":    "auto",
         "messages": [{"role": "user", "content": item["query"]}],
@@ -412,8 +399,8 @@ async def send_request(
         "model_winner":      "",
         "bid_latency_ms":    "",
         "actual_latency_ms": "",
-        "ttft_ms":           "",   # not available without streaming; use actual_latency_ms
-        "itl_ms":            "",   # not available without streaming
+        "ttft_ms":           "",
+        "itl_ms":            "",
         "output_tokens":     "",
         "charged_usd":       "",
         "energy_j":          "",
@@ -442,9 +429,8 @@ async def send_request(
         result["charged_usd"]       = h.get("x-router-charged-usd", "")
         result["energy_j"]          = h.get("x-router-energy-j", "")
         result["load"]              = h.get("x-router-load", "")
-
-        result["slo_ms"]       = h.get("x-router-slo-ms", "")
-        result["slo_violated"] = h.get("x-router-slo-violated", "")
+        result["slo_ms"]            = h.get("x-router-slo-ms", "")
+        result["slo_violated"]      = h.get("x-router-slo-violated", "")
 
         if resp.status_code == 200:
             body = resp.json()
@@ -468,10 +454,6 @@ async def send_request(
     return result
 
 
-# ---------------------------------------------------------------------------
-# Analysis
-# ---------------------------------------------------------------------------
-
 def analyse(rows: list[dict]) -> None:
     W = 62
     ok    = [r for r in rows if r["status"] == 200]
@@ -492,7 +474,6 @@ def analyse(rows: list[dict]) -> None:
         print("  No successful responses to analyse.")
         return
 
-    # Routing distribution
     print(f"\n{'='*W}")
     print("  ROUTING DISTRIBUTION")
     print(f"{'='*W}")
@@ -501,11 +482,10 @@ def analyse(rows: list[dict]) -> None:
         m = r["model_winner"] or "unknown"
         model_counts[m] = model_counts.get(m, 0) + 1
     for model, cnt in sorted(model_counts.items(), key=lambda x: -x[1]):
-        bar = "█" * int(cnt / len(ok) * 30)
+        bar = "=" * int(cnt / len(ok) * 30)
         pct = 100 * cnt // len(ok)
         print(f"  {model:<22} {bar:<30} {pct:3}%  ({cnt})")
 
-    # Wall latency (end-to-end including router overhead)
     wall_vals = [safe_float(r["wall_ms"]) for r in ok if safe_float(r["wall_ms"])]
     if wall_vals:
         print(f"\n{'='*W}")
@@ -517,7 +497,6 @@ def analyse(rows: list[dict]) -> None:
         print(f"  P99  : {wall_vals[int(len(wall_vals)*.99)]:.0f} ms")
         print(f"  Mean : {mean(wall_vals):.0f} ms")
 
-    # Per-model latency
     print(f"\n{'='*W}")
     print("  ACTUAL LATENCY PER MODEL  (reported by router)")
     print(f"{'='*W}")
@@ -532,7 +511,6 @@ def analyse(rows: list[dict]) -> None:
         print(f"  {model:<22} P50={vals[len(vals)//2]:.0f}ms  "
               f"P95={vals[int(len(vals)*.95)]:.0f}ms  mean={mean(vals):.0f}ms  (n={len(vals)})")
 
-    # Cost
     costs = [safe_float(r["charged_usd"]) for r in ok if safe_float(r["charged_usd"]) is not None]
     if costs:
         print(f"\n{'='*W}")
@@ -542,7 +520,6 @@ def analyse(rows: list[dict]) -> None:
         print(f"  Avg per request: ${mean(costs):.8f}")
         print(f"  Min / Max      : ${min(costs):.8f} / ${max(costs):.8f}")
 
-    # Energy
     energies = [safe_float(r["energy_j"]) for r in ok if safe_float(r["energy_j"]) is not None]
     if energies:
         print(f"\n{'='*W}")
@@ -551,7 +528,6 @@ def analyse(rows: list[dict]) -> None:
         print(f"  Total energy   : {sum(energies):.2f} J")
         print(f"  Avg per request: {mean(energies):.3f} J")
 
-    # Routing by domain
     print(f"\n{'='*W}")
     print("  ROUTING BY DOMAIN")
     print(f"{'='*W}")
@@ -565,7 +541,6 @@ def analyse(rows: list[dict]) -> None:
         parts = "  ".join(f"{m}:{c}" for m, c in sorted(dc.items(), key=lambda x: -x[1]))
         print(f"  {domain:<12} ({len(dreqs):4} reqs)  {parts}")
 
-    # Routing by complexity
     print(f"\n{'='*W}")
     print("  ROUTING BY COMPLEXITY")
     print(f"{'='*W}")
@@ -578,11 +553,10 @@ def analyse(rows: list[dict]) -> None:
         parts = "  ".join(f"{m}:{c}" for m, c in sorted(cc.items(), key=lambda x: -x[1]))
         print(f"  {cplx:<8} ({len(creqs):4} reqs)  {parts}")
 
-    # Mode breakdown
     print(f"\n{'='*W}")
     print("  ROUTING BY MODE")
     print(f"{'='*W}")
-    for mode in ["cost", "eco", "accuracy", "custom"]:
+    for mode in ["cost", "eco", "accuracy", "custom", "ttca"]:
         mreqs = [r for r in ok if r["mode"] == mode]
         if not mreqs: continue
         mc: dict[str, int] = {}
@@ -592,7 +566,6 @@ def analyse(rows: list[dict]) -> None:
         parts = "  ".join(f"{m}:{c}" for m, c in sorted(mc.items(), key=lambda x: -x[1]))
         print(f"  {mode:<10} ({len(mreqs):4} reqs)  {parts}")
 
-    # Errors
     if errs:
         print(f"\n{'='*W}")
         print("  ERRORS")
@@ -606,10 +579,6 @@ def analyse(rows: list[dict]) -> None:
 
     print(f"\n{'='*W}\n")
 
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
 
 async def run(router_url: str, n_requests: int, concurrency: int, output: str,
               dataset_path: str | None = None) -> None:
@@ -673,7 +642,7 @@ def main() -> None:
     parser.add_argument("--dataset",     default=None,
                         help="Path to JSON dataset from build_dataset.py")
     parser.add_argument("--mode",        default=None,
-                        choices=["accuracy", "cost", "eco", "custom"],
+                        choices=["accuracy", "cost", "eco", "custom", "ttca"],
                         help="Force ALL requests to use this router mode (default: mixed)")
     args = parser.parse_args()
 
