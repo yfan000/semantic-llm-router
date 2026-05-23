@@ -1,9 +1,9 @@
 """
 round_robin_test.py — Baseline load test using round-robin model selection.
 
-Sends requests alternately to two vLLM backends, bypassing the semantic router.
-Produces a CSV in the same format as load_test.py so compare_results.py
-can compare them side by side.
+Sends requests to all 4 vLLM backends in round-robin order, bypassing the
+semantic router. Produces a CSV in the same format as load_test.py so
+compare_results.py can compare them side by side.
 
 Usage:
     python tests/round_robin_test.py \
@@ -31,46 +31,61 @@ from statistics import mean
 
 import httpx
 
-# Mirror of config.LATENCY_SLO_MS — used to compute SLO pass/fail for round-robin
-# (round-robin bypasses the router so it receives no X-Router-SLO-* headers)
+# Mirror of config.LATENCY_SLO_MS
 LATENCY_SLO_MS: dict[tuple[str, str], int] = {
     ("factual",   "easy"):   1000,
     ("factual",   "medium"): 2000,
     ("factual",   "hard"):   4000,
-    ("math",      "easy"):   1500,
+    ("math",      "easy"):   1000,
     ("math",      "medium"): 3000,
     ("math",      "hard"):   6000,
-    ("code",      "easy"):   2000,
+    ("code",      "easy"):   1500,
     ("code",      "medium"): 4000,
     ("code",      "hard"):   8000,
-    ("reasoning", "easy"):   1500,
+    ("reasoning", "easy"):   1000,
     ("reasoning", "medium"): 3000,
     ("reasoning", "hard"):   6000,
-    ("creative",  "easy"):   2000,
+    ("creative",  "easy"):   1500,
     ("creative",  "medium"): 5000,
     ("creative",  "hard"):   8000,
 }
 
 # ---------------------------------------------------------------------------
-# Backend configuration — must match what you registered with the router
+# Backend configuration -- Sophia 4-model setup
 # ---------------------------------------------------------------------------
 
 BACKENDS = [
     {
-        "model_id":                    "qwen2.5-1.5b",
-        "model_name":                  "Qwen/Qwen2.5-1.5B-Instruct",  # sent to vLLM
-        "base_url":                    "http://localhost:8001",
-        "input_rate_usd_per_token":    0.0000001,
-        "output_rate_usd_per_token":   0.0000002,
-        "efficiency_tokens_per_joule": 26.7,
+        "model_id":                    "qwen-7b",
+        "model_name":                  "Qwen/Qwen2.5-7B-Instruct",
+        "base_url":                    "http://localhost:8000",
+        "input_rate_usd_per_token":    0.0000003,
+        "output_rate_usd_per_token":   0.0000006,
+        "efficiency_tokens_per_joule": 13.0,
     },
     {
-        "model_id":                    "qwen2.5-7b",
-        "model_name":                  "Qwen/Qwen2.5-7B-Instruct",    # sent to vLLM
+        "model_id":                    "qwen-14b",
+        "model_name":                  "Qwen/Qwen2.5-14B-Instruct",
+        "base_url":                    "http://localhost:8001",
+        "input_rate_usd_per_token":    0.0000005,
+        "output_rate_usd_per_token":   0.0000010,
+        "efficiency_tokens_per_joule": 8.0,
+    },
+    {
+        "model_id":                    "deepseek-r1-7b",
+        "model_name":                  "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B",
         "base_url":                    "http://localhost:8002",
         "input_rate_usd_per_token":    0.0000003,
         "output_rate_usd_per_token":   0.0000006,
         "efficiency_tokens_per_joule": 13.0,
+    },
+    {
+        "model_id":                    "coder-32b",
+        "model_name":                  "Qwen/Qwen2.5-Coder-32B-Instruct",
+        "base_url":                    "http://localhost:8003",
+        "input_rate_usd_per_token":    0.0000010,
+        "output_rate_usd_per_token":   0.0000020,
+        "efficiency_tokens_per_joule": 4.0,
     },
 ]
 
@@ -112,8 +127,6 @@ def build_request_list(n: int, dataset_path: str | None) -> list[dict]:
     if dataset_path:
         with open(dataset_path) as f:
             items = json.load(f)
-        # Do NOT shuffle — req_id must match eval_all_models.py and load_test.py
-        # so that eval_matrix lookups in compare_ttca.py find the correct question.
         if n > len(items):
             items += random.choices(items, k=n - len(items))
         return items[:n]
@@ -125,21 +138,13 @@ def build_request_list(n: int, dataset_path: str | None) -> list[dict]:
     return pool[:n]
 
 
-# ---------------------------------------------------------------------------
-# Single request — sent directly to vLLM, bypassing the router
-# ---------------------------------------------------------------------------
-
 async def send_request(
     client: httpx.AsyncClient,
     req_id: int,
     item: dict,
     backend: dict,
 ) -> dict:
-    input_tokens = sum(
-        len(m.split()) * 1.3
-        for m in [item["query"]]
-    )
-    # Estimate output tokens (same table as router)
+    input_tokens = sum(len(m.split()) * 1.3 for m in [item["query"]])
     OUTPUT_TOKENS = {
         ("factual","easy"):80,   ("factual","medium"):200,   ("factual","hard"):350,
         ("math","easy"):120,     ("math","medium"):280,       ("math","hard"):450,
@@ -149,10 +154,9 @@ async def send_request(
     }
     output_est = OUTPUT_TOKENS.get((item["domain"], item["complexity"]), 300)
     estimated_cost = (
-        input_tokens  * backend["input_rate_usd_per_token"]
-        + output_est  * backend["output_rate_usd_per_token"]
+        input_tokens * backend["input_rate_usd_per_token"]
+        + output_est * backend["output_rate_usd_per_token"]
     )
-
     slo_ms = LATENCY_SLO_MS.get((item["domain"], item["complexity"]), None)
 
     result = {
@@ -173,7 +177,7 @@ async def send_request(
         "load":              "",
         "wall_ms":           "",
         "slo_ms":            str(slo_ms) if slo_ms else "",
-        "slo_violated":      "",   # filled after wall_ms is known
+        "slo_violated":      "",
         "response_text":     "",
         "error":             "",
     }
@@ -201,8 +205,8 @@ async def send_request(
             result["output_tokens"] = out_tokens
             result["energy_j"] = f"{out_tokens / backend['efficiency_tokens_per_joule']:.3f}"
             actual_cost = (
-                input_tokens  * backend["input_rate_usd_per_token"]
-                + out_tokens  * backend["output_rate_usd_per_token"]
+                input_tokens * backend["input_rate_usd_per_token"]
+                + out_tokens * backend["output_rate_usd_per_token"]
             )
             result["charged_usd"] = f"{actual_cost:.8f}"
             choices = body.get("choices", [])
@@ -219,10 +223,6 @@ async def send_request(
     return result
 
 
-# ---------------------------------------------------------------------------
-# Runner
-# ---------------------------------------------------------------------------
-
 async def run(
     n_requests: int,
     concurrency: int,
@@ -232,7 +232,6 @@ async def run(
     items = build_request_list(n_requests, dataset_path)
     os.makedirs(os.path.dirname(output) if os.path.dirname(output) else ".", exist_ok=True)
 
-    # Round-robin cycle over backends
     rr = itertools.cycle(BACKENDS)
     assignments = [next(rr) for _ in range(n_requests)]
 
@@ -278,13 +277,12 @@ async def run(
     ok = [r for r in results if r["status"] == 200]
     print(f"\r  [{'='*40}] {n_requests}/{n_requests}  ({elapsed:.1f}s, {n_requests/elapsed:.1f} req/s)\n")
 
-    # Quick inline summary
     print(f"  Successful : {len(ok)}/{n_requests}")
     mc: dict[str, int] = {}
     for r in ok:
         mc[r["model_winner"]] = mc.get(r["model_winner"], 0) + 1
     for m, c in sorted(mc.items(), key=lambda x: -x[1]):
-        print(f"  {m:<22} {c} requests ({100*c//len(ok)}%)")
+        print(f"  {m:<22} {c} requests ({100*c//max(len(ok),1)}%)")
 
     costs = [float(r["charged_usd"]) for r in ok if r["charged_usd"]]
     if costs:
