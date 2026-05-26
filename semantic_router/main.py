@@ -120,7 +120,12 @@ async def chat_completions(request: Request) -> JSONResponse:
     # Two retry triggers:
     #   1. Infrastructure failure (crash, timeout, HTTP error)
     #   2. Wrong answer -- only when ground_truth is known from benchmark dataset
+    #
+    # Important: quality-based retries save the best available response so far.
+    # If ALL models answer incorrectly we still return the first response rather
+    # than failing the request with 503 -- a wrong answer is better than no answer.
     last_error: Exception | None = None
+    best_response: tuple | None = None  # (response_dict, router_headers) of first successful dispatch
     for attempt, winning_bid in enumerate(ranked_bids):
         winning_adapter = registry.get_adapter(winning_bid.model_id)
         if winning_adapter is None:
@@ -160,6 +165,9 @@ async def chat_completions(request: Request) -> JSONResponse:
                     )
                     router_headers["X-Router-GT-Correct"] = "false"
                     last_error = ValueError(f"{winning_bid.model_id} answered incorrectly")
+                    # Save first wrong response as fallback -- returned if all models fail
+                    if best_response is None:
+                        best_response = (response_dict, router_headers)
                     continue  # try next model
                 if correct is True:
                     router_headers["X-Router-GT-Correct"] = "true"
@@ -189,6 +197,19 @@ async def chat_completions(request: Request) -> JSONResponse:
                 winning_bid.model_id, attempt + 1, e,
             )
             continue
+
+    # All models exhausted.
+    # If we have a quality-retry fallback (wrong answer but model responded),
+    # return it rather than 503 -- a wrong answer is better than no answer.
+    if best_response is not None:
+        response_dict, router_headers = best_response
+        router_headers["X-Router-GT-Correct"]      = "false"
+        router_headers["X-Router-GT-Fallback"]     = "true"
+        router_headers["X-Router-Accuracy-Weight"] = f"{pref.accuracy_weight:.2f}"
+        router_headers["X-Router-Cost-Weight"]     = f"{pref.cost_weight:.2f}"
+        router_headers["X-Router-Attempt"]         = str(len(ranked_bids))
+        log.warning("All models answered incorrectly -- returning best available response")
+        return JSONResponse(content=response_dict, headers=router_headers)
 
     raise HTTPException(
         status_code=503,
@@ -269,7 +290,7 @@ async def register_model(req: RegisterRequest) -> dict:
         min_accuracy_capability=capability,
     ))
     return {
-        "registered":             req.model_id,
+        "registered":              req.model_id,
         "min_accuracy_capability": capability,
         "accuracy_priors_stored":  accuracy_priors,
     }
