@@ -5,9 +5,8 @@ build a balanced 1000-request test set for the semantic LLM router.
 Sources:
   Factual  : MMLU (57 subjects, graded by difficulty)
   Math     : GSM8K (grade-school, medium) + MATH benchmark (competition, hard)
-  Code     : HumanEval (medium) + MBPP (easy)
-  Reasoning: LogiQA (medium) + HellaSwag (easy)
-  Creative : WritingPrompts (medium/hard)
+  Code     : HumanEval (easy/medium split by prompt length) + APPS (hard)
+  Reasoning: LogiQA (medium) + HellaSwag (easy) + ARC (easy/hard)
 
 Install dependencies:
     pip install datasets tqdm
@@ -28,7 +27,7 @@ import random
 from collections import defaultdict
 
 # ---------------------------------------------------------------------------
-# Dataset loaders — each returns list of {domain, complexity, query}
+# Dataset loaders
 # ---------------------------------------------------------------------------
 
 def load_mmlu(n: int) -> list[dict]:
@@ -69,7 +68,6 @@ def load_mmlu(n: int) -> list[dict]:
                     labels  = ["A", "B", "C", "D"]
                     opts    = "\n".join(f"{labels[i]}) {choices[i]}" for i in range(len(choices)))
                     query   = f"{row['question']}\n{opts}"
-                    # ground_truth: the correct answer text (not just the letter)
                     ans_idx = row["answer"]
                     ground_truth = choices[ans_idx] if ans_idx < len(choices) else labels[ans_idx]
                     results.append({
@@ -89,7 +87,6 @@ def load_gsm8k(n: int) -> list[dict]:
     ds = ds.shuffle(seed=42).select(range(min(n, len(ds))))
     results = []
     for row in ds:
-        # Answer format: "... #### 36" — extract the number after ####
         answer = row["answer"]
         parts = answer.split("####")
         ground_truth = parts[-1].strip().replace(",", "") if len(parts) > 1 else answer.strip()
@@ -141,64 +138,37 @@ def load_math_benchmark(n: int) -> list[dict]:
 
 
 def load_humaneval(n: int) -> list[dict]:
-    """HumanEval: Python function synthesis. Complexity = medium."""
+    """HumanEval: Python function synthesis.
+
+    Splits by prompt length:
+      short prompt (<=300 chars) -> easy
+      longer prompt              -> medium
+
+    HumanEval includes the function signature in the prompt so models
+    know exactly what function name to implement, making scoring reliable.
+    MBPP was previously used for code:easy but its tests call a hidden
+    function name unknown to the model, yielding near-zero accuracy.
+    """
     from datasets import load_dataset
     try:
         ds = load_dataset("openai/openai_humaneval", split="test", trust_remote_code=False)
     except Exception as e:
         print(f"  [HumanEval] skipped: {e}")
         return []
-    ds = ds.shuffle(seed=42).select(range(min(n, len(ds))))
+    ds = ds.shuffle(seed=42)
     results = []
     for row in ds:
         prompt = row["prompt"].strip()
         query  = f"Complete the following Python function:\n\n{prompt}"
-        # ground_truth: the canonical test code (contains assert statements)
         ground_truth = row.get("test", "")
+        # Short prompts with simple docstrings are easier problems
+        complexity = "easy" if len(prompt) <= 300 else "medium"
         results.append({
-            "domain": "code", "complexity": "medium",
+            "domain": "code", "complexity": complexity,
             "query": query, "ground_truth": ground_truth,
         })
-    return results
-
-
-def load_mbpp(n: int) -> list[dict]:
-    """MBPP: basic Python programming. Complexity = easy."""
-    from datasets import load_dataset
-    ds = None
-    for name, cfg in [
-        ("google-research-datasets/mbpp", "sanitized"),
-        ("google-research-datasets/mbpp", "full"),
-        ("mbpp", None),
-    ]:
-        try:
-            kwargs = {"split": "test"}
-            if cfg:
-                ds = load_dataset(name, cfg, **kwargs)
-            else:
-                ds = load_dataset(name, **kwargs)
-            break
-        except Exception as e:
-            print(f"  [MBPP/{name}] skipped: {e}")
-    if ds is None:
-        return []
-    ds = ds.shuffle(seed=42).select(range(min(n, len(ds))))
-    results = []
-    for row in ds:
-        # field name differs between sanitized ("text") and full ("prompt")
-        query_text = row.get("text") or row.get("prompt") or row.get("description", "")
-        test_list = row.get("test_list", row.get("tests", []))
-        if isinstance(test_list, str):
-            test_list = [test_list]
-        ground_truth = "\n".join(test_list) if test_list else ""
-        if not query_text:
-            continue
-        results.append({
-            "domain": "code", "complexity": "easy",
-            "query": f"Write a Python function to: {query_text}",
-            "ground_truth": ground_truth,
-        })
-    return results
+    random.shuffle(results)
+    return results[:n]
 
 
 def load_apps(n: int) -> list[dict]:
@@ -210,7 +180,7 @@ def load_apps(n: int) -> list[dict]:
         ds = ds.shuffle(seed=42).select(range(min(n, len(ds))))
         results = []
         for row in ds:
-            q = row.get("question", "")[:500]   # cap length
+            q = row.get("question", "")[:500]
             results.append({"domain": "code", "complexity": "hard", "query": q})
         return results
     except Exception as e:
@@ -232,14 +202,13 @@ def load_logiqa(n: int) -> list[dict]:
     ds = ds.shuffle(seed=42).select(range(min(n, len(ds))))
     results = []
     for row in ds:
-        context = row.get("context", row.get("passage", ""))
+        context  = row.get("context", row.get("passage", ""))
         question = row.get("query",   row.get("question", ""))
         options  = row.get("options", row.get("answers",  []))
         labels   = ["A", "B", "C", "D"]
         opts_str = "\n".join(f"{labels[i]}) {options[i]}" for i in range(min(len(options), 4)))
         query    = f"Context: {context}\n\nQuestion: {question}\n{opts_str}"
-        # ground_truth: the correct answer text
-        ans_idx = row.get("correct_option", row.get("answer", 0))
+        ans_idx  = row.get("correct_option", row.get("answer", 0))
         ground_truth = options[ans_idx] if isinstance(ans_idx, int) and ans_idx < len(options) else str(ans_idx)
         results.append({"domain": "reasoning", "complexity": "medium", "query": query, "ground_truth": ground_truth})
     return results
@@ -260,15 +229,14 @@ def load_hellaswag(n: int) -> list[dict]:
         labels = ["A", "B", "C", "D"]
         opts   = "\n".join(f"{labels[i]}) {row['endings'][i]}" for i in range(len(row["endings"])))
         query  = f"Choose the best continuation:\n\n{ctx}\n\n{opts}"
-        # ground_truth: the correct ending text
-        label = int(row.get("label", 0))
+        label  = int(row.get("label", 0))
         ground_truth = row["endings"][label] if label < len(row["endings"]) else ""
         results.append({"domain": "reasoning", "complexity": "easy", "query": query, "ground_truth": ground_truth})
     return results
 
 
 def load_arc(n: int) -> list[dict]:
-    """ARC-Challenge: science MCQ. Easy→medium, Challenge→hard."""
+    """ARC-Challenge: science MCQ. Easy->easy, Challenge->hard."""
     from datasets import load_dataset
     results = []
     for split_name, complexity, count in [("easy", "easy", n//2), ("challenge", "hard", n - n//2)]:
@@ -281,7 +249,6 @@ def load_arc(n: int) -> list[dict]:
                 opts    = "\n".join(f"{choices['label'][i]}) {choices['text'][i]}"
                           for i in range(len(choices["label"])))
                 query   = f"{row['question']}\n{opts}"
-                # ground_truth: correct answer text
                 ans_key = row.get("answerKey", "A")
                 ans_idx = choices["label"].index(ans_key) if ans_key in choices["label"] else 0
                 ground_truth = choices["text"][ans_idx] if ans_idx < len(choices["text"]) else ans_key
@@ -289,51 +256,6 @@ def load_arc(n: int) -> list[dict]:
         except Exception as e:
             print(f"  [ARC-{split_name}] skipped: {e}")
     return results
-
-
-def load_writing_prompts(n: int) -> list[dict]:
-    """WritingPrompts: creative writing. Short=medium, long=hard."""
-    from datasets import load_dataset
-    try:
-        ds = load_dataset("euclaise/writingprompts", split="train", trust_remote_code=False)
-    except Exception:
-        try:
-            ds = load_dataset("writing_prompts", split="train", trust_remote_code=False)
-        except Exception as e:
-            print(f"  [WritingPrompts] skipped: {e}")
-            return []
-    ds = ds.shuffle(seed=42).select(range(min(n * 2, len(ds))))
-    results = []
-    for row in ds:
-        prompt = row.get("prompt", row.get("story", "")).strip()
-        # Remove Reddit formatting markers
-        prompt = prompt.replace("[WP]", "").replace("[SP]", "").replace("[EU]", "").strip()
-        if len(prompt) < 20 or len(prompt) > 600:
-            continue
-        complexity = "hard" if len(prompt.split()) > 40 else "medium"
-        results.append({"domain": "creative", "complexity": complexity,
-                        "query": f"Write a short story or response to this prompt: {prompt}"})
-    return random.sample(results, min(n, len(results)))
-
-
-def load_creative_fallback(n: int) -> list[dict]:
-    """Fallback creative prompts if WritingPrompts fails."""
-    prompts = [
-        ("Write a short story about a robot who discovers music.", "medium"),
-        ("Write a poem about the passage of time using ocean imagery.", "medium"),
-        ("Create a product description for an AI-powered dream recorder.", "medium"),
-        ("Write a dialogue between the sun and the moon.", "easy"),
-        ("Write a short story from the perspective of the last tree in a city.", "hard"),
-        ("Create a myth explaining why humans dream.", "medium"),
-        ("Write a letter from a future version of yourself to your present self.", "medium"),
-        ("Write a story about a painter who can only paint tomorrow.", "hard"),
-        ("Compose a haiku about artificial intelligence.", "easy"),
-        ("Write a short story where the twist is revealed in the last word.", "hard"),
-    ]
-    results = []
-    for prompt, complexity in prompts * (n // len(prompts) + 1):
-        results.append({"domain": "creative", "complexity": complexity, "query": prompt})
-    return results[:n]
 
 
 # ---------------------------------------------------------------------------
@@ -354,7 +276,6 @@ TARGET_DISTRIBUTION = {
     ("reasoning", "medium"): 90,
     ("reasoning", "hard"):   75,
 }
-# Total = 1000 across 4 domains (no creative)
 
 
 def build(total: int, output: str) -> None:
@@ -363,9 +284,7 @@ def build(total: int, output: str) -> None:
 
     os.makedirs(os.path.dirname(output) if os.path.dirname(output) else ".", exist_ok=True)
 
-    # ── Load from each dataset ────────────────────────────────────────────
     print("  Loading datasets:")
-
     all_items: list[dict] = []
 
     def add(name: str, items: list[dict]) -> None:
@@ -375,8 +294,7 @@ def build(total: int, output: str) -> None:
     add("MMLU",           load_mmlu(260))
     add("GSM8K",          load_gsm8k(150))
     add("MATH benchmark", load_math_benchmark(100))
-    add("HumanEval",      load_humaneval(90))
-    add("MBPP",           load_mbpp(90))
+    add("HumanEval",      load_humaneval(164))  # all 164 items split into easy/medium by prompt length
     add("APPS",           load_apps(75))
     add("LogiQA",         load_logiqa(120))
     add("HellaSwag",      load_hellaswag(100))
@@ -384,7 +302,6 @@ def build(total: int, output: str) -> None:
 
     print(f"\n  Total raw items: {len(all_items)}")
 
-    # ── Balance by domain/complexity ─────────────────────────────────────
     buckets: dict[tuple, list[dict]] = defaultdict(list)
     for item in all_items:
         key = (item["domain"], item["complexity"])
@@ -392,9 +309,9 @@ def build(total: int, output: str) -> None:
 
     print("\n  Available per bucket:")
     for key in sorted(TARGET_DISTRIBUTION):
-        avail = len(buckets[key])
-        want  = TARGET_DISTRIBUTION[key]
-        status = "✓" if avail >= want else f"⚠ only {avail}"
+        avail  = len(buckets[key])
+        want   = TARGET_DISTRIBUTION[key]
+        status = "OK" if avail >= want else f"only {avail}"
         print(f"    {key[0]:<12} {key[1]:<8} want={want:3}  {status}")
 
     dataset: list[dict] = []
@@ -404,29 +321,24 @@ def build(total: int, output: str) -> None:
             dataset.extend(random.sample(pool, want))
         else:
             dataset.extend(pool)
-            # Pad from same domain/complexity pool with replacement
             if pool:
                 dataset.extend(random.choices(pool, k=want - len(pool)))
 
-    # Pad to reach total if needed
     if len(dataset) < total:
-        extra = random.choices(all_items, k=total - len(dataset))
-        dataset.extend(extra)
+        dataset.extend(random.choices(all_items, k=total - len(dataset)))
 
     random.shuffle(dataset)
     dataset = dataset[:total]
 
-    # ── Save ─────────────────────────────────────────────────────────────
     with open(output, "w") as f:
         json.dump(dataset, f, indent=2)
 
-    # ── Summary ──────────────────────────────────────────────────────────
     print(f"\n  Final dataset: {len(dataset)} requests")
     by_domain: dict[str, int] = defaultdict(int)
     by_cplx:   dict[str, int] = defaultdict(int)
     for item in dataset:
-        by_domain[item["domain"]]     += 1
-        by_cplx[item["complexity"]]   += 1
+        by_domain[item["domain"]]   += 1
+        by_cplx[item["complexity"]] += 1
 
     print("\n  By domain:")
     for d, c in sorted(by_domain.items()):
@@ -440,17 +352,12 @@ def build(total: int, output: str) -> None:
     print(f"    python tests/load_test.py --dataset {output}\n")
 
 
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
-
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--output",  default="datasets/hf_1000.json")
-    parser.add_argument("--count",   type=int, default=1000)
-    parser.add_argument("--seed",    type=int, default=42)
+    parser.add_argument("--output", default="datasets/hf_1000.json")
+    parser.add_argument("--count",  type=int, default=1000)
+    parser.add_argument("--seed",   type=int, default=42)
     args = parser.parse_args()
-
     random.seed(args.seed)
     build(args.count, args.output)
 
