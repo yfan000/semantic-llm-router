@@ -100,39 +100,16 @@ def _score_code(response: str, gt: str):
         ast.parse(code)
     except SyntaxError:
         return 0.0
-    gt_str = str(gt)
-    if "assert" not in gt_str and "==" not in gt_str:
+    if "assert" not in str(gt) and "==" not in str(gt):
         return 0.5  # syntax ok but no test to run
-
-    # Extract individual assert statements and run each separately
-    # so partial credit is given when only some tests pass.
-    assert_lines = [
-        line.strip() for line in gt_str.splitlines()
-        if line.strip().startswith("assert")
-    ]
-    if not assert_lines:
-        # No individual asserts found -- run the whole test file
-        with tempfile.NamedTemporaryFile(suffix=".py", mode="w", delete=False) as f:
-            f.write(code + "\n" + gt_str)
-            fname = f.name
-        try:
-            r = subprocess.run([sys.executable, fname], timeout=5, capture_output=True)
-            return 1.0 if r.returncode == 0 else 0.0
-        except Exception:
-            return 0.0
-
-    passed = 0
-    for assert_line in assert_lines:
-        with tempfile.NamedTemporaryFile(suffix=".py", mode="w", delete=False) as f:
-            f.write(code + "\n" + assert_line)
-            fname = f.name
-        try:
-            r = subprocess.run([sys.executable, fname], timeout=5, capture_output=True)
-            if r.returncode == 0:
-                passed += 1
-        except Exception:
-            pass
-    return passed / len(assert_lines)
+    with tempfile.NamedTemporaryFile(suffix=".py", mode="w", delete=False) as f:
+        f.write(code + "\n" + str(gt))
+        fname = f.name
+    try:
+        r = subprocess.run([sys.executable, fname], timeout=5, capture_output=True)
+        return 1.0 if r.returncode == 0 else 0.0  # all-or-nothing
+    except Exception:
+        return 0.0
 
 
 def _score_keyword(response: str, gt: str):
@@ -143,7 +120,7 @@ def _score_keyword(response: str, gt: str):
         return None
     hits = sum(1 for w in words if w in response.lower())
     overlap = hits / len(words)
-    return 1.0 if overlap >= 0.8 else overlap
+    return 1.0 if overlap >= 1.0 else overlap  # 100% keyword match required
 
 
 _SCORERS = {
