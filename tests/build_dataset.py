@@ -1,11 +1,11 @@
 """
-build_dataset.py — Download real benchmark queries from HuggingFace and
+build_dataset.py -- Download real benchmark queries from HuggingFace and
 build a balanced 1000-request test set for the semantic LLM router.
 
 Sources:
   Factual  : MMLU (57 subjects, graded by difficulty)
   Math     : GSM8K (grade-school, medium) + MATH benchmark (competition, hard)
-  Code     : HumanEval (easy/medium split by prompt length) + APPS (hard)
+  Code     : HumanEval (easy/medium) + BigCodeBench (medium/hard) + APPS (hard)
   Reasoning: LogiQA (medium) + HellaSwag (easy) + ARC (easy/hard)
 
 Install dependencies:
@@ -116,7 +116,6 @@ def load_math_benchmark(n: int) -> list[dict]:
             print(f"  [MATH/{name}] skipped: {e}")
 
     if ds is None:
-        print("  [MATH] all sources failed, skipping competition math")
         return []
 
     ds = ds.shuffle(seed=42).select(range(min(n * 3, len(ds))))
@@ -124,7 +123,7 @@ def load_math_benchmark(n: int) -> list[dict]:
     for row in ds:
         level = str(row.get("level", "3")).replace("Level ", "")
         complexity = COMPLEXITY_MAP.get(level, "medium")
-        problem = row.get("problem", row.get("question", ""))
+        problem  = row.get("problem",  row.get("question", ""))
         solution = row.get("solution", row.get("answer", ""))
         m = _re.search(r"\\boxed\{([^}]+)\}", solution)
         ground_truth = m.group(1) if m else solution.strip()[:50]
@@ -133,7 +132,6 @@ def load_math_benchmark(n: int) -> list[dict]:
                 "domain": "math", "complexity": complexity,
                 "query": problem, "ground_truth": ground_truth,
             })
-
     return random.sample(results, min(n, len(results)))
 
 
@@ -144,10 +142,8 @@ def load_humaneval(n: int) -> list[dict]:
       short prompt (<=300 chars) -> easy
       longer prompt              -> medium
 
-    HumanEval includes the function signature in the prompt so models
-    know exactly what function name to implement, making scoring reliable.
-    MBPP was previously used for code:easy but its tests call a hidden
-    function name unknown to the model, yielding near-zero accuracy.
+    HumanEval includes the function signature so models know the function
+    name to implement, making evaluation reliable.
     """
     from datasets import load_dataset
     try:
@@ -161,13 +157,54 @@ def load_humaneval(n: int) -> list[dict]:
         prompt = row["prompt"].strip()
         query  = f"Complete the following Python function:\n\n{prompt}"
         ground_truth = row.get("test", "")
-        # Short prompts with simple docstrings are easier problems
         complexity = "easy" if len(prompt) <= 300 else "medium"
         results.append({
             "domain": "code", "complexity": complexity,
             "query": query, "ground_truth": ground_truth,
         })
     random.shuffle(results)
+    return results[:n]
+
+
+def load_bigcodebench(n: int) -> list[dict]:
+    """BigCodeBench: real-world library usage (numpy, pandas, requests, etc.).
+
+    Better than HumanEval for distinguishing specialized coding models.
+    Tests practical library knowledge where coder-32b excels over general models.
+    HumanEval only tests small isolated functions -- BigCodeBench tests
+    real-world tasks that require knowing specific library APIs.
+
+    Complexity: difficulty <= 2 -> medium, >= 3 -> hard
+    """
+    from datasets import load_dataset
+    try:
+        ds = load_dataset("bigcode/bigcodebench", split="v0.1.2", trust_remote_code=True)
+    except Exception:
+        try:
+            ds = load_dataset("bigcode/bigcodebench", trust_remote_code=True)
+            ds = ds["test"] if "test" in ds else list(ds.values())[0]
+        except Exception as e:
+            print(f"  [BigCodeBench] skipped: {e}")
+            return []
+
+    ds = ds.shuffle(seed=42).select(range(min(n * 2, len(ds))))
+    results = []
+    for row in ds:
+        prompt = row.get("complete_prompt", row.get("instruct_prompt", ""))
+        if not prompt:
+            continue
+        difficulty = row.get("difficulty", 3)
+        try:
+            difficulty = int(difficulty)
+        except Exception:
+            difficulty = 3
+        complexity   = "medium" if difficulty <= 2 else "hard"
+        ground_truth = row.get("test", "")
+        results.append({
+            "domain": "code", "complexity": complexity,
+            "query": f"Complete the following Python task:\n\n{prompt.strip()}",
+            "ground_truth": ground_truth,
+        })
     return results[:n]
 
 
@@ -202,9 +239,9 @@ def load_logiqa(n: int) -> list[dict]:
     ds = ds.shuffle(seed=42).select(range(min(n, len(ds))))
     results = []
     for row in ds:
-        context  = row.get("context", row.get("passage", ""))
-        question = row.get("query",   row.get("question", ""))
-        options  = row.get("options", row.get("answers",  []))
+        context  = row.get("context",  row.get("passage",  ""))
+        question = row.get("query",    row.get("question", ""))
+        options  = row.get("options",  row.get("answers",  []))
         labels   = ["A", "B", "C", "D"]
         opts_str = "\n".join(f"{labels[i]}) {options[i]}" for i in range(min(len(options), 4)))
         query    = f"Context: {context}\n\nQuestion: {question}\n{opts_str}"
@@ -236,7 +273,7 @@ def load_hellaswag(n: int) -> list[dict]:
 
 
 def load_arc(n: int) -> list[dict]:
-    """ARC-Challenge: science MCQ. Easy->easy, Challenge->hard."""
+    """ARC: science MCQ. Easy->easy, Challenge->hard."""
     from datasets import load_dataset
     results = []
     for split_name, complexity, count in [("easy", "easy", n//2), ("challenge", "hard", n - n//2)]:
@@ -294,7 +331,8 @@ def build(total: int, output: str) -> None:
     add("MMLU",           load_mmlu(260))
     add("GSM8K",          load_gsm8k(150))
     add("MATH benchmark", load_math_benchmark(100))
-    add("HumanEval",      load_humaneval(164))  # all 164 items split into easy/medium by prompt length
+    add("HumanEval",      load_humaneval(164))   # easy/medium split by prompt length
+    add("BigCodeBench",   load_bigcodebench(100))  # real-world library tasks (medium/hard)
     add("APPS",           load_apps(75))
     add("LogiQA",         load_logiqa(120))
     add("HellaSwag",      load_hellaswag(100))
