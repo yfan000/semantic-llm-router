@@ -100,16 +100,39 @@ def _score_code(response: str, gt: str):
         ast.parse(code)
     except SyntaxError:
         return 0.0
-    if "assert" in str(gt) or "==" in str(gt):
+    gt_str = str(gt)
+    if "assert" not in gt_str and "==" not in gt_str:
+        return 0.5  # syntax ok but no test to run
+
+    # Extract individual assert statements and run each separately
+    # so partial credit is given when only some tests pass.
+    assert_lines = [
+        line.strip() for line in gt_str.splitlines()
+        if line.strip().startswith("assert")
+    ]
+    if not assert_lines:
+        # No individual asserts found -- run the whole test file
         with tempfile.NamedTemporaryFile(suffix=".py", mode="w", delete=False) as f:
-            f.write(code + "\n" + str(gt))
+            f.write(code + "\n" + gt_str)
             fname = f.name
         try:
             r = subprocess.run([sys.executable, fname], timeout=5, capture_output=True)
             return 1.0 if r.returncode == 0 else 0.0
         except Exception:
             return 0.0
-    return 0.5
+
+    passed = 0
+    for assert_line in assert_lines:
+        with tempfile.NamedTemporaryFile(suffix=".py", mode="w", delete=False) as f:
+            f.write(code + "\n" + assert_line)
+            fname = f.name
+        try:
+            r = subprocess.run([sys.executable, fname], timeout=5, capture_output=True)
+            if r.returncode == 0:
+                passed += 1
+        except Exception:
+            pass
+    return passed / len(assert_lines)
 
 
 def _score_keyword(response: str, gt: str):
@@ -253,7 +276,6 @@ async def run(dataset_path: str, output: str, concurrency: int) -> None:
     elapsed = time.monotonic() - t0
     print(f"\r  [{'='*40}] {n_total}/{n_total}  ({elapsed:.1f}s total)\n")
 
-    # --- Summary ---
     with open(output, newline="", encoding="utf-8") as f:
         rows = list(csv.DictReader(f))
 

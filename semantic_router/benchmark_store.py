@@ -7,7 +7,7 @@ to verify response quality in real time when a matching benchmark query is found
 
 Scoring is fully deterministic (no LLM judge needed):
   math      -- extract final number, compare within 1% tolerance
-  code      -- Python syntax check + optional test execution
+  code      -- run each assert individually, score = passed/total
   factual   -- keyword overlap >= 80% of ground_truth keywords
   reasoning -- keyword overlap >= 80%
   creative  -- non-empty response >= 20 words (always passes)
@@ -108,18 +108,39 @@ class BenchmarkStore:
             ast.parse(code)
         except SyntaxError:
             return 0.0
-        if gt and ("assert" in str(gt) or "==" in str(gt)):
+        if not gt or ("assert" not in str(gt) and "==" not in str(gt)):
+            return 0.5  # syntax ok but no test to run
+
+        gt_str = str(gt)
+        # Extract individual assert statements and run each separately
+        # so partial credit is given when only some tests pass.
+        assert_lines = [
+            line.strip() for line in gt_str.splitlines()
+            if line.strip().startswith("assert")
+        ]
+        if not assert_lines:
+            # No individual asserts -- run the whole test file
             with tempfile.NamedTemporaryFile(suffix=".py", mode="w", delete=False) as f:
-                f.write(code + "\n" + str(gt))
+                f.write(code + "\n" + gt_str)
                 fname = f.name
             try:
-                r = subprocess.run(
-                    [sys.executable, fname], timeout=5, capture_output=True
-                )
+                r = subprocess.run([sys.executable, fname], timeout=5, capture_output=True)
                 return 1.0 if r.returncode == 0 else 0.0
             except Exception:
                 return 0.0
-        return 0.5  # syntax ok but no test to run
+
+        passed = 0
+        for assert_line in assert_lines:
+            with tempfile.NamedTemporaryFile(suffix=".py", mode="w", delete=False) as f:
+                f.write(code + "\n" + assert_line)
+                fname = f.name
+            try:
+                r = subprocess.run([sys.executable, fname], timeout=5, capture_output=True)
+                if r.returncode == 0:
+                    passed += 1
+            except Exception:
+                pass
+        return passed / len(assert_lines)
 
     def _score_keyword(self, response: str, gt: str) -> float | None:
         if not gt or str(gt).strip() in ("", "None"):
