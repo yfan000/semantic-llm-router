@@ -120,7 +120,7 @@ def _score_keyword(response: str, gt: str):
         return None
     hits = sum(1 for w in words if w in response.lower())
     overlap = hits / len(words)
-    return 1.0 if overlap >= 0.5 else overlap
+    return 1.0 if overlap >= 0.8 else overlap
 
 
 _SCORERS = {
@@ -264,7 +264,6 @@ async def run(dataset_path: str, output: str, concurrency: int) -> None:
     print(f"  Successful : {len(ok)}")
     print(f"  Scorable   : {len(scorable)}")
 
-    # Per-model accuracy
     by_model: dict[str, list[bool]] = defaultdict(list)
     for r in scorable:
         by_model[r["model_id"]].append(r["is_correct"] == "true")
@@ -276,7 +275,6 @@ async def run(dataset_path: str, output: str, concurrency: int) -> None:
         n_t = len(correct_list)
         print(f"  {mid:<28} {n_c:>8} {n_t:>8} {n_c/max(n_t,1)*100:>9.1f}%")
 
-    # Per-domain breakdown
     by_dm: dict[tuple, list[bool]] = defaultdict(list)
     for r in scorable:
         by_dm[(r["domain"], r["model_id"])].append(r["is_correct"] == "true")

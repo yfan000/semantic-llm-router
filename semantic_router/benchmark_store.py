@@ -8,8 +8,8 @@ to verify response quality in real time when a matching benchmark query is found
 Scoring is fully deterministic (no LLM judge needed):
   math      -- extract final number, compare within 1% tolerance
   code      -- Python syntax check + optional test execution
-  factual   -- keyword overlap >= 50% of ground_truth keywords
-  reasoning -- keyword overlap >= 50%
+  factual   -- keyword overlap >= 80% of ground_truth keywords
+  reasoning -- keyword overlap >= 80%
   creative  -- non-empty response >= 20 words (always passes)
 
 Usage:
@@ -129,4 +129,4 @@ class BenchmarkStore:
             return None
         hits = sum(1 for w in words if w in response.lower())
         overlap = hits / len(words)
-        return 1.0 if overlap >= 0.5 else overlap
+        return 1.0 if overlap >= 0.8 else overlap
