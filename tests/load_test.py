@@ -27,10 +27,6 @@ from statistics import mean, median
 
 import httpx
 
-# ---------------------------------------------------------------------------
-# 1000 diverse queries: 5 domains x 3 complexities x ~67 queries each
-# ---------------------------------------------------------------------------
-
 QUERIES: dict[tuple[str, str], list[str]] = {
     ("factual", "easy"): [
         "What is the capital of France?",
@@ -315,7 +311,6 @@ QUERIES: dict[tuple[str, str], list[str]] = {
 }
 
 
-# Flatten all queries with metadata, pad/sample to reach target count
 def build_request_list(n: int, dataset_path: str | None = None) -> list[dict]:
     if dataset_path:
         import json as _json
@@ -329,11 +324,7 @@ def build_request_list(n: int, dataset_path: str | None = None) -> list[dict]:
     all_queries = []
     for (domain, complexity), queries in QUERIES.items():
         for q in queries:
-            all_queries.append({
-                "domain": domain,
-                "complexity": complexity,
-                "query": q,
-            })
+            all_queries.append({"domain": domain, "complexity": complexity, "query": q})
 
     random.shuffle(all_queries)
     if n > len(all_queries):
@@ -341,11 +332,8 @@ def build_request_list(n: int, dataset_path: str | None = None) -> list[dict]:
     return all_queries[:n]
 
 
-# Mix of router modes to test different behaviours
 MODES = ["cost", "eco", "accuracy", "custom"]
 MODE_WEIGHTS = [0.35, 0.25, 0.25, 0.15]
-
-# Set by --mode flag; overrides random selection when not None
 _FORCED_MODE: str | None = None
 
 
@@ -371,7 +359,6 @@ def random_router_params(item: dict | None = None) -> dict:
         params["domain"] = item["domain"]
     if item and item.get("complexity"):
         params["complexity"] = item["complexity"]
-
     return params
 
 
@@ -408,16 +395,16 @@ async def send_request(
         "wall_ms":           "",
         "slo_ms":            "",
         "slo_violated":      "",
+        "retries":           "",   # X-Router-Attempt - 1 (0 = first model succeeded)
+        "gt_scored":         "",   # X-Router-GT-Scored
+        "gt_correct":        "",   # X-Router-GT-Correct
         "response_text":     "",
         "error":             "",
     }
 
     t_start = time.monotonic()
     try:
-        resp = await client.post(
-            f"{router_url}/v1/chat/completions",
-            json=payload,
-        )
+        resp = await client.post(f"{router_url}/v1/chat/completions", json=payload)
         wall_ms = int((time.monotonic() - t_start) * 1000)
         result["wall_ms"] = wall_ms
         result["status"]  = resp.status_code
@@ -431,6 +418,13 @@ async def send_request(
         result["load"]              = h.get("x-router-load", "")
         result["slo_ms"]            = h.get("x-router-slo-ms", "")
         result["slo_violated"]      = h.get("x-router-slo-violated", "")
+        attempt = h.get("x-router-attempt", "1")
+        try:
+            result["retries"] = int(attempt) - 1
+        except (ValueError, TypeError):
+            result["retries"] = 0
+        result["gt_scored"]  = h.get("x-router-gt-scored", "")
+        result["gt_correct"] = h.get("x-router-gt-correct", "")
 
         if resp.status_code == 200:
             body = resp.json()
@@ -456,8 +450,8 @@ async def send_request(
 
 def analyse(rows: list[dict]) -> None:
     W = 62
-    ok    = [r for r in rows if r["status"] == 200]
-    errs  = [r for r in rows if r["status"] != 200]
+    ok   = [r for r in rows if r["status"] == 200]
+    errs = [r for r in rows if r["status"] != 200]
 
     def safe_float(v: str) -> float | None:
         try: return float(v)
@@ -523,10 +517,26 @@ def analyse(rows: list[dict]) -> None:
     energies = [safe_float(r["energy_j"]) for r in ok if safe_float(r["energy_j"]) is not None]
     if energies:
         print(f"\n{'='*W}")
-        print("  ENERGY SUMMARY  (tokens/J)")
+        print("  ENERGY SUMMARY")
         print(f"{'='*W}")
         print(f"  Total energy   : {sum(energies):.2f} J")
         print(f"  Avg per request: {mean(energies):.3f} J")
+
+    # Retry summary
+    retry_rows = [r for r in ok if r.get("retries", "") != ""]
+    if retry_rows:
+        retries = [int(r["retries"]) for r in retry_rows]
+        n0 = sum(1 for x in retries if x == 0)
+        n1 = sum(1 for x in retries if x == 1)
+        n2p = sum(1 for x in retries if x >= 2)
+        print(f"\n{'='*W}")
+        print("  RETRY SUMMARY")
+        print(f"{'='*W}")
+        print(f"  0 retries : {n0:4}  ({100*n0//len(retries)}%)")
+        print(f"  1 retry   : {n1:4}  ({100*n1//len(retries)}%)")
+        print(f"  2+ retries: {n2p:4}  ({100*n2p//len(retries)}%)")
+        print(f"  Avg retries      : {sum(retries)/len(retries):.3f}")
+        print(f"  Resolution (<=1) : {100*(n0+n1)//len(retries)}%")
 
     print(f"\n{'='*W}")
     print("  ROUTING BY DOMAIN")
@@ -583,7 +593,6 @@ def analyse(rows: list[dict]) -> None:
 async def run(router_url: str, n_requests: int, concurrency: int, output: str,
               dataset_path: str | None = None) -> None:
     requests_list = build_request_list(n_requests, dataset_path)
-
     os.makedirs(os.path.dirname(output) if os.path.dirname(output) else ".", exist_ok=True)
 
     fieldnames = [
@@ -591,7 +600,8 @@ async def run(router_url: str, n_requests: int, concurrency: int, output: str,
         "status", "model_winner", "bid_latency_ms", "actual_latency_ms",
         "ttft_ms", "itl_ms", "output_tokens",
         "charged_usd", "energy_j", "load", "wall_ms",
-        "slo_ms", "slo_violated", "response_text", "error",
+        "slo_ms", "slo_violated", "retries", "gt_scored", "gt_correct",
+        "response_text", "error",
     ]
 
     results: list[dict] = []
@@ -627,7 +637,6 @@ async def run(router_url: str, n_requests: int, concurrency: int, output: str,
 
     elapsed = time.monotonic() - t0
     print(f"\r  [{'='*40}] {n_requests}/{n_requests}  ({elapsed:.1f}s total, {n_requests/elapsed:.1f} req/s)\n")
-
     analyse(results)
     print(f"  Full results saved to: {output}")
 
