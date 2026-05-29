@@ -8,21 +8,30 @@ results/priors.json -- no hardcoded upgrade/downgrade paths.
 Low accuracy (domain:complexity < ACCURACY_THRESHOLD):
   Case 1: better model not running -> spin it up
   Case 2: better model already running -> refresh its router priors
-          (stale priors cause router to route to the wrong model)
   Case 3: no better model exists -> log accuracy ceiling
 
 Queue overload (vLLM waiting > QUEUE_DEPTH_THRESHOLD):
   Accuracy HIGH (>= HIGH_ACCURACY_THRESHOLD):
-    -> Downgrade: find smallest model above MIN_ACCEPTABLE_ACCURACY
-       (trade excess quality for throughput)
+    -> Downgrade: smallest model above MIN_ACCEPTABLE_ACCURACY floor
   Accuracy borderline:
-    -> Horizontal scale: same model replica (preserve accuracy)
+    -> Horizontal scale: same model replica
 
-Spin-down: model idle < MIN_REQUESTS_TO_STAY in IDLE_WINDOW_S and domains covered.
+Dynamic model interaction with TTCA:
+  When provisioner spins up a model -> POST /router/register -> joins bidding
+  When provisioner spins down       -> DELETE /router/{id}  -> leaves bidding
+  rank_bids() in TTCA mode sorts by lat/acc among currently registered models
+  Router adapts immediately -- no restart needed.
+
+  ROUTER_MODE controls which model is chosen for quality upgrade:
+    accuracy -> most accurate first (maximize quality)
+    ttca     -> lowest lat/acc ratio (fastest model above floor)
+    cost     -> fewest GPUs first (minimize resource usage)
 
 Usage:
+    # TTCA mode: provisioner picks fastest model above accuracy floor
     python provisioner/dynamic_provisioner.py \\
         --router-url http://localhost:8080 \\
+        --router-mode ttca \\
         --initial-models qwen-7b,deepseek-r1-7b
 """
 from __future__ import annotations
@@ -60,6 +69,21 @@ COOLDOWN_S            = 120
 
 MIN_ACCEPTABLE_ACCURACY: float = 0.60   # floor: never use any model below this
 HIGH_ACCURACY_THRESHOLD: float = 0.85   # above this, safe to downgrade for speed
+
+# Router mode: provisioner picks candidates differently per mode.
+#   accuracy -> spin up MOST ACCURATE model above floor
+#   ttca     -> spin up FASTEST model above floor (lowest lat/acc ratio)
+#   cost     -> spin up SMALLEST model (fewest GPUs) above floor
+ROUTER_MODE: str = "accuracy"
+
+# Estimated tokens/sec per GPU count -- used to estimate latency for
+# models not yet running (no measured history available yet).
+ESTIMATED_TOKENS_PER_SEC: dict[int, float] = {
+    1: 2500.0,   # 7B on 1 A100
+    2: 1800.0,   # 14B on 2 A100s
+    4:  900.0,   # 32B on 4 A100s
+    8:  500.0,   # 70B on 8 A100s
+}
 
 HF_HOME = "/eagle/UIC-HPC/yuping/hf_cache"
 
@@ -373,12 +397,7 @@ class DynamicProvisioner:
         ]
 
     async def _refresh_router_priors(self, model_id: str, all_priors: dict) -> None:
-        """Re-register a running model with updated accuracy priors.
-
-        Called when a better model is already running but the router may have
-        stale priors causing it to route to the worse model. Re-registering
-        refreshes the bid accuracy without restarting the model.
-        """
+        """Re-register a running model with updated accuracy priors."""
         rm = self.running.get(model_id)
         if not rm:
             return
@@ -409,24 +428,16 @@ class DynamicProvisioner:
     ) -> bool:
         """Low accuracy in domain:complexity. Three cases:
 
-        Case 1 -- Better model NOT running, fits in GPU budget:
-          Spin it up. Router starts routing hard requests to it.
+        Case 1 -- Better model NOT running, fits in GPU budget -> spin it up
+        Case 2 -- Better model IS already running -> refresh router priors
+                  (stale priors cause router to keep routing to worse model)
+        Case 3 -- No better model exists -> log accuracy ceiling warning
 
-        Case 2 -- Better model IS already running:
-          Router should use it, but may have stale accuracy priors.
-          Re-register it with updated priors so bid selection reflects
-          its true quality. This is a soft fix without spinning anything up.
-
-        Case 3 -- No better model exists (accuracy ceiling):
-          All models covering this domain are at or below current accuracy,
-          or no GPU budget available. Log warning so operator can add a
-          stronger model to MODEL_CATALOG.
-
-        Selection for Cases 1 & 2:
-          - Collect all models (running + not) covering domain with higher accuracy
-          - Sort: best accuracy first, fewest GPUs as tiebreaker
-          - Case 1 wins if any not-running candidate exists (prefers spin-up
-            over refresh since fresh model may have better priors too)
+        Candidate selection is mode-aware (ROUTER_MODE):
+          accuracy -> best accuracy first (most accurate model)
+          ttca     -> lowest lat/acc ratio (fastest model above floor)
+                      TTCA wants E[time to correct answer] = lat/acc minimized
+          cost     -> fewest GPUs first (cheapest option above floor)
         """
         better_running:     list[tuple[ModelSpec, float]] = []
         better_not_running: list[tuple[ModelSpec, float]] = []
@@ -444,23 +455,40 @@ class DynamicProvisioner:
             elif self.gpu_pool.free_count() >= spec.gpus_needed:
                 better_not_running.append((spec, acc))
 
-        better_running.sort(key=lambda x: (-x[1], x[0].gpus_needed))
-        better_not_running.sort(key=lambda x: (-x[1], x[0].gpus_needed))
+        # Sort by ROUTER_MODE priority
+        def _candidate_sort_key(item: tuple[ModelSpec, float]) -> tuple:
+            spec, acc = item
+            if ROUTER_MODE == "ttca":
+                # TTCA: prefer fastest model above floor (lowest lat/acc ratio)
+                # Estimate latency from GPU count when no measured history exists
+                est_output_tokens = 300
+                est_tps    = ESTIMATED_TOKENS_PER_SEC.get(spec.gpus_needed, 1000.0)
+                est_lat_ms = est_output_tokens / est_tps * 1000
+                return (est_lat_ms / max(acc, 0.01), spec.gpus_needed)
+            elif ROUTER_MODE == "cost":
+                # Cost: prefer smallest model (fewest GPUs) above floor
+                return (spec.gpus_needed, -acc)
+            else:
+                # Accuracy (default): prefer most accurate model
+                return (-acc, spec.gpus_needed)
 
-        # Case 1: spin up the best not-running model
+        better_running.sort(key=_candidate_sort_key)
+        better_not_running.sort(key=_candidate_sort_key)
+
+        # Case 1: spin up best not-running model
         if better_not_running:
             best_spec, best_acc = better_not_running[0]
-            log.info("  [Case 1 spin-up] %s acc=%.3f > %.3f for %s:%s",
-                     best_spec.model_id, best_acc, current_accuracy, domain, complexity)
+            log.info("  [Case 1 spin-up] %s acc=%.3f for %s:%s (mode=%s)",
+                     best_spec.model_id, best_acc, domain, complexity, ROUTER_MODE)
             return await self.spin_up(best_spec.model_id, reason=reason)
 
         # Case 2: better model already running -- refresh its router priors
         if better_running:
             best_spec, best_acc = better_running[0]
             log.warning(
-                "  [Case 2 refresh] %s acc=%.3f > %.3f for %s:%s already running "
-                "-- refreshing router priors (stale priors may cause wrong routing)",
-                best_spec.model_id, best_acc, current_accuracy, domain, complexity
+                "  [Case 2 refresh] %s acc=%.3f already running for %s:%s "
+                "-- refreshing router priors (stale priors cause wrong routing)",
+                best_spec.model_id, best_acc, domain, complexity
             )
             await self._refresh_router_priors(best_spec.model_id, all_priors)
             return True
@@ -482,14 +510,11 @@ class DynamicProvisioner:
     ) -> bool:
         """Queue overload. Strategy chosen by current accuracy level.
 
-        Strategy A (Downgrade) -- accuracy is HIGH >= HIGH_ACCURACY_THRESHOLD:
-          We're over-provisioned on quality. Find the smallest model (fewest GPUs)
-          covering the domain above MIN_ACCEPTABLE_ACCURACY floor.
-          Smallest = fastest per request = drains queue most effectively.
+        Strategy A (Downgrade) -- accuracy HIGH >= HIGH_ACCURACY_THRESHOLD:
+          Over-provisioned on quality. Find smallest model above floor.
 
-        Strategy B (Horizontal scale) -- accuracy is borderline:
-          Can't safely downgrade. Spin up same model on different port/GPUs.
-          Doubles throughput with identical accuracy.
+        Strategy B (Horizontal scale) -- accuracy borderline:
+          Spin up same model replica. Preserves accuracy, doubles throughput.
         """
         spec = MODEL_CATALOG.get(overloaded_id)
         if not spec:
@@ -520,11 +545,10 @@ class DynamicProvisioner:
                 candidates.sort(key=lambda x: (x[0].gpus_needed, -x[1]))
                 best, best_acc = candidates[0]
                 log.info("  [Strategy A downgrade] %s (%d GPUs, acc=%.3f) "
-                         "current=%.3f is high -> trade quality for speed",
+                         "current=%.3f -> trade quality for speed",
                          best.model_id, best.gpus_needed, best_acc, current_acc)
                 return await self.spin_up(
-                    best.model_id,
-                    reason=f"downgrade:{overloaded_id}:q={queue_depth}"
+                    best.model_id, reason=f"downgrade:{overloaded_id}:q={queue_depth}"
                 )
             log.info("  Strategy A: no smaller model, trying B")
 
@@ -597,7 +621,7 @@ class DynamicProvisioner:
             await self.spin_up("qwen-7b", reason="bootstrap")
 
     async def run(self, initial_models: list[str] | None = None) -> None:
-        log.info("Dynamic Provisioner started")
+        log.info("Dynamic Provisioner started | mode=%s", ROUTER_MODE)
         log.info("GPU pool: %s | Poll: %ds | Cooldown: %ds",
                  self.gpu_pool, int(self.poll_interval), COOLDOWN_S)
 
@@ -625,14 +649,22 @@ class DynamicProvisioner:
 
 
 def main() -> None:
+    global ROUTER_MODE
     parser = argparse.ArgumentParser(description="Dynamic vLLM provisioner for Sophia")
     parser.add_argument("--router-url",     default="http://localhost:8080")
     parser.add_argument("--total-gpus",     type=int,   default=8)
     parser.add_argument("--poll-interval",  type=float, default=POLL_INTERVAL_S)
     parser.add_argument("--priors-path",    default="results/priors.json")
+    parser.add_argument("--router-mode",    default="accuracy",
+                        choices=["accuracy", "ttca", "cost"],
+                        help="Controls which model is spun up for quality upgrade. "
+                             "accuracy=most accurate, ttca=fastest above floor, cost=fewest GPUs")
     parser.add_argument("--initial-models", default="",
                         help="Comma-separated model IDs to start immediately")
     args = parser.parse_args()
+
+    ROUTER_MODE = args.router_mode
+    log.info("Provisioner router mode: %s", ROUTER_MODE)
 
     initial = [m.strip() for m in args.initial_models.split(",") if m.strip()]
     provisioner = DynamicProvisioner(
