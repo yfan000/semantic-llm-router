@@ -1,20 +1,23 @@
 """
 dynamic_provisioner.py -- Dynamic model provisioning for Sophia.
 
-Monitors router metrics and vLLM queue depth, then automatically spins up
-or shuts down models based on latency, accuracy, and traffic conditions.
+Monitors router metrics and vLLM queue depth, then spins up/down models
+based on accuracy and traffic signals. Decisions are fully data-driven from
+results/priors.json — no hardcoded upgrade/downgrade paths.
 
 Spin-up triggers:
-  - Queue depth > QUEUE_DEPTH_THRESHOLD: scale-out (throughput problem)
-      1. Same model replica (horizontal scale) -- preferred
-      2. Smaller model for same domain (load balance) -- fallback
-      NEVER spin up a larger model for queue overload (larger = slower per request)
-  - Accuracy < ACCURACY_THRESHOLD: quality upgrade (accuracy problem)
-      Spin up next higher-tier model; keep current for easy requests
-  - No model for a domain: bootstrap
+  - Low accuracy (domain:complexity < ACCURACY_THRESHOLD):
+      Search ALL catalog models for the best one that beats current accuracy
+      in that specific category and fits in available GPU budget.
+  - Queue overload (vLLM waiting > QUEUE_DEPTH_THRESHOLD):
+      If current accuracy is HIGH (>= HIGH_ACCURACY_THRESHOLD):
+        → Downgrade: find smallest model above MIN_ACCEPTABLE_ACCURACY floor
+          (trade excess quality for throughput)
+      Else:
+        → Horizontal scale: same model replica (don't risk accuracy drop)
 
 Spin-down triggers:
-  - Model idle < MIN_REQUESTS_TO_STAY in IDLE_WINDOW_S and domains covered by others
+  - Model idle < MIN_REQUESTS_TO_STAY in IDLE_WINDOW_S and domains covered
 
 Usage:
     python provisioner/dynamic_provisioner.py \\
@@ -50,9 +53,16 @@ POLL_INTERVAL_S       = 30
 IDLE_WINDOW_S         = 300
 MIN_REQUESTS_TO_STAY  = 5
 QUEUE_DEPTH_THRESHOLD = 10
-ACCURACY_THRESHOLD    = 0.65
+ACCURACY_THRESHOLD    = 0.65   # below this triggers a quality upgrade
 STARTUP_WAIT_S        = 300
 COOLDOWN_S            = 120
+
+# Floor: never spin up a model below this accuracy even for throughput relief
+MIN_ACCEPTABLE_ACCURACY: float = 0.60
+
+# If current accuracy >= this, we can afford to downgrade to a smaller/faster
+# model for queue overload (we're over-provisioning quality).
+HIGH_ACCURACY_THRESHOLD: float = 0.85
 
 HF_HOME = "/eagle/UIC-HPC/yuping/hf_cache"
 
@@ -116,35 +126,6 @@ MODEL_CATALOG: dict[str, ModelSpec] = {
         min_accuracy_capability={"_default": 0.85},
         efficiency_tokens_per_joule=4.0,
     ),
-}
-
-# UPGRADE_PATH: accuracy problem -> spin up higher-tier model
-# Ordered by accuracy_tier ascending (try smallest upgrade first)
-UPGRADE_PATH: dict[str, list[str]] = {
-    "factual":   ["qwen-7b", "qwen-14b", "qwen-32b"],
-    "reasoning": ["qwen-7b", "qwen-14b", "deepseek-r1-7b", "qwen-32b"],
-    "math":      ["deepseek-r1-7b", "coder-32b"],
-    "code":      ["coder-32b"],
-    "creative":  ["qwen-7b", "qwen-14b", "qwen-32b"],
-}
-
-# THROUGHPUT_PATH: queue overload -> add capacity with smallest model first.
-# A smaller model that partially covers a domain is BETTER than no help,
-# because the router routes easy requests there and leaves hard requests
-# for the specialized model. The overloaded model's queue drains faster.
-#
-# Example: deepseek-r1-7b math queue=12
-#   qwen-7b handles math:easy (93% acc) and math:medium (83% acc)
-#   deepseek keeps math:hard (81% acc) -> queue drops from 12 to ~3
-#
-# IMPORTANT: skip larger models (accuracy_tier check in _try_scale_out) --
-# larger = slower per request = queue gets LONGER not shorter.
-THROUGHPUT_PATH: dict[str, list[str]] = {
-    "factual":   ["qwen-7b", "qwen-14b", "qwen-32b"],
-    "reasoning": ["qwen-7b", "deepseek-r1-7b", "qwen-14b", "qwen-32b"],
-    "math":      ["qwen-7b", "deepseek-r1-7b", "qwen-14b"],  # qwen-7b takes easy/medium math
-    "code":      ["coder-32b"],                               # only specialized option
-    "creative":  ["qwen-7b", "qwen-14b", "qwen-32b"],
 }
 
 # ---------------------------------------------------------------------------
@@ -226,23 +207,25 @@ class DynamicProvisioner:
             ),
         }
 
-    async def _get(self, path: str) -> dict:
+    # ── HTTP helpers ──────────────────────────────────────────────────────────
+
+    async def _router_get(self, path: str) -> dict:
         async with httpx.AsyncClient(timeout=10.0) as c:
             r = await c.get(f"{self.router_url}{path}")
             r.raise_for_status()
             return r.json()
 
-    async def _post(self, path: str, body: dict) -> dict:
+    async def _router_post(self, path: str, body: dict) -> dict:
         async with httpx.AsyncClient(timeout=10.0) as c:
             r = await c.post(f"{self.router_url}{path}", json=body)
             r.raise_for_status()
             return r.json()
 
-    async def _delete(self, path: str) -> None:
+    async def _router_delete(self, path: str) -> None:
         async with httpx.AsyncClient(timeout=10.0) as c:
             await c.delete(f"{self.router_url}{path}")
 
-    async def _vllm_queue(self, base_url: str) -> int:
+    async def _vllm_queue_depth(self, base_url: str) -> int:
         try:
             async with httpx.AsyncClient(timeout=3.0) as c:
                 r = await c.get(f"{base_url}/metrics")
@@ -253,13 +236,13 @@ class DynamicProvisioner:
             pass
         return 0
 
-    async def _reputation(self) -> dict:
+    async def _get_router_reputation(self) -> dict:
         try:
-            models = await self._get("/v1/models")
+            models = await self._router_get("/v1/models")
             result = {}
             for m in models.get("data", []):
                 try:
-                    result[m["id"]] = await self._get(f"/router/{m['id']}/reputation")
+                    result[m["id"]] = await self._router_get(f"/router/{m['id']}/reputation")
                 except Exception:
                     pass
             return result
@@ -280,6 +263,8 @@ class DynamicProvisioner:
                 return json.load(f)
         except Exception:
             return {}
+
+    # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     async def spin_up(self, model_id: str, reason: str) -> bool:
         if model_id in self.running:
@@ -309,7 +294,8 @@ class DynamicProvisioner:
                 ["vllm", "serve", spec.model_name,
                  "--tensor-parallel-size", str(spec.gpus_needed),
                  "--port", str(spec.port)],
-                env={**self._env, "CUDA_VISIBLE_DEVICES": gpu_str, "MASTER_PORT": str(master_port)},
+                env={**self._env, "CUDA_VISIBLE_DEVICES": gpu_str,
+                     "MASTER_PORT": str(master_port)},
                 stdout=lf, stderr=lf,
             )
 
@@ -337,7 +323,7 @@ class DynamicProvisioner:
 
         priors = self._load_priors().get(model_id, {})
         try:
-            await self._post("/router/register", {
+            await self._router_post("/router/register", {
                 "model_id": spec.model_id, "model_name": spec.model_name,
                 "backend": "vllm", "base_url": base_url,
                 "domains": spec.domains,
@@ -360,7 +346,7 @@ class DynamicProvisioner:
 
         log.info(">>> SPIN DOWN %s [%s]", model_id, reason)
         try:
-            await self._delete(f"/router/{model_id}")
+            await self._router_delete(f"/router/{model_id}")
         except Exception as e:
             log.warning("  Deregister failed: %s", e)
 
@@ -380,26 +366,149 @@ class DynamicProvisioner:
         log.info("  %s stopped. Free GPUs: %d", model_id, self.gpu_pool.free_count())
         return True
 
-    # ── Provisioning decisions ────────────────────────────────────────────────
+    # ── General data-driven provisioning decisions ────────────────────────────
 
-    async def _try_scale_out(self, overloaded_id: str, queue_depth: int) -> bool:
-        """Queue overload = THROUGHPUT problem. Add capacity, not quality.
+    def _get_prior(self, model_id: str, domain: str, complexity: str,
+                   all_priors: dict) -> float | None:
+        """Look up accuracy of any model (running or not) from priors file."""
+        priors = all_priors.get(model_id, {})
+        return priors.get(f"{domain}:{complexity}") or priors.get(domain)
 
-        Priority order:
-          1. Same model replica (horizontal scale) -- identical accuracy, max throughput
-          2. Smaller model for same domain -- takes easy/medium requests, drains queue
-          NEVER larger model -- slower per request, queue gets WORSE
+    def _candidates_not_running(self) -> list[ModelSpec]:
+        """All catalog models not currently running (excludes replicas)."""
+        return [
+            spec for mid, spec in MODEL_CATALOG.items()
+            if mid not in self.running and not mid.endswith("-replica")
+        ]
 
-        Example: deepseek-r1-7b math queue=12
-          Option 1: deepseek-replica (1 GPU) -- doubles math throughput [preferred]
-          Option 2: qwen-7b (1 GPU, tier=1) -- handles math:easy (93%) and math:medium (83%)
-                    deepseek queue drops from 12 → ~3 hard-only requests [fallback]
+    async def _try_quality_upgrade(
+        self,
+        domain: str,
+        complexity: str,
+        current_accuracy: float,
+        reason: str,
+        all_priors: dict,
+    ) -> bool:
+        """Low accuracy in domain:complexity — general search for best candidate.
+
+        Algorithm:
+          1. Search ALL models in catalog that are not currently running
+          2. Filter: covers domain, fits in GPU budget,
+             has HIGHER accuracy than current in that specific category,
+             stays above MIN_ACCEPTABLE_ACCURACY floor
+          3. Sort: best accuracy first, fewest GPUs as tiebreaker
+             (prefer a cheaper model if two have similar accuracy)
+          4. Spin up the best candidate
+
+        Current model keeps running — it continues handling easy/fast requests.
+        New model handles the specific category where quality is lacking.
+
+        Example: deepseek-r1-7b math:hard=0.61 < threshold=0.65
+          All candidates checked from MODEL_CATALOG:
+            qwen-7b   math:hard=0.62 > 0.61, 1 GPU  -> candidate
+            qwen-14b  math:hard=0.69 > 0.61, 2 GPUs -> candidate (better)
+            coder-32b math:hard=0.58 < 0.61         -> skip (worse than current)
+          Sort by accuracy DESC: qwen-14b(0.69) > qwen-7b(0.62)
+          -> spin up qwen-14b
+        """
+        candidates: list[tuple[ModelSpec, float]] = []
+        for spec in self._candidates_not_running():
+            if domain not in spec.domains:
+                continue
+            if self.gpu_pool.free_count() < spec.gpus_needed:
+                continue
+            acc = self._get_prior(spec.model_id, domain, complexity, all_priors)
+            if acc is None or acc <= current_accuracy or acc < MIN_ACCEPTABLE_ACCURACY:
+                continue
+            candidates.append((spec, acc))
+
+        if not candidates:
+            log.info("  Quality upgrade: no better candidate for %s:%s (current=%.3f)",
+                     domain, complexity, current_accuracy)
+            return False
+
+        # Best accuracy first; fewest GPUs as tiebreaker (cheaper is better if equal)
+        candidates.sort(key=lambda x: (-x[1], x[0].gpus_needed))
+        best_spec, best_acc = candidates[0]
+        log.info("  Quality upgrade: %s acc=%.3f > %.3f for %s:%s  [%d candidates]",
+                 best_spec.model_id, best_acc, current_accuracy,
+                 domain, complexity, len(candidates))
+        return await self.spin_up(best_spec.model_id, reason=reason)
+
+    async def _try_scale_out(
+        self,
+        overloaded_id: str,
+        queue_depth:   int,
+        domain:        str,
+        all_priors:    dict,
+    ) -> bool:
+        """Queue overload — need more throughput. Strategy depends on accuracy level.
+
+        Strategy A — Downgrade (accuracy is HIGH >= HIGH_ACCURACY_THRESHOLD):
+          We are over-provisioned on quality. Trade excess accuracy for speed.
+          Find the smallest model (fewest GPUs) covering the domain that:
+            - Is not currently running
+            - Fits in available GPUs
+            - Has accuracy >= MIN_ACCEPTABLE_ACCURACY floor
+          Fewest GPUs = fastest per request = most effective at draining queue.
+
+        Strategy B — Horizontal scale (accuracy is borderline):
+          Cannot safely downgrade. Spin up the same model on a different port.
+          Doubles throughput with identical accuracy.
+
+        Example: deepseek-r1-7b math (4 GPUs assumed), accuracy=0.89 (high)
+          Strategy A: find smaller model for math
+            qwen-7b: math:medium=0.83 >= 0.60 floor, 1 GPU < 4 GPUs -> downgrade
+            -> qwen-7b takes easy/medium math; deepseek handles hard math
+            -> queue drops from 12 to ~3 hard-only requests
+
+          deepseek-r1-7b math (1 GPU), accuracy=0.72 (borderline)
+          Strategy B: horizontal scale
+            -> deepseek-replica on port 8012, 1 GPU
+            -> doubles throughput without accuracy drop
         """
         spec = MODEL_CATALOG.get(overloaded_id)
         if not spec:
             return False
 
-        # Option 1: horizontal scale -- same model, different port
+        # Measure current accuracy for this domain (worst-case across complexity levels)
+        domain_priors = {
+            k: v for k, v in all_priors.get(overloaded_id, {}).items()
+            if k.startswith(domain + ":")
+        }
+        current_acc = min(domain_priors.values()) if domain_priors else None
+        accuracy_is_high = (current_acc is not None and
+                            current_acc >= HIGH_ACCURACY_THRESHOLD)
+
+        if accuracy_is_high:
+            # Strategy A: downgrade — find smallest model meeting accuracy floor
+            candidates: list[tuple[ModelSpec, float]] = []
+            for candidate in self._candidates_not_running():
+                if domain not in candidate.domains:
+                    continue
+                if candidate.gpus_needed >= spec.gpus_needed:
+                    continue  # must be smaller (fewer GPUs = faster)
+                if self.gpu_pool.free_count() < candidate.gpus_needed:
+                    continue
+                acc = self._get_prior(candidate.model_id, domain, "medium", all_priors)
+                if acc is None or acc < MIN_ACCEPTABLE_ACCURACY:
+                    continue
+                candidates.append((candidate, acc))
+
+            if candidates:
+                # Fewest GPUs first (maximum throughput gain); accuracy as tiebreaker
+                candidates.sort(key=lambda x: (x[0].gpus_needed, -x[1]))
+                best, best_acc = candidates[0]
+                log.info("  Strategy A downgrade: %s (%d GPUs, acc=%.3f) "
+                         "(current=%.3f is high -> trade quality for speed)",
+                         best.model_id, best.gpus_needed, best_acc, current_acc)
+                return await self.spin_up(
+                    best.model_id,
+                    reason=f"downgrade:{overloaded_id}:q={queue_depth}:acc={best_acc:.2f}"
+                )
+            log.info("  Strategy A: no smaller model available, trying B")
+
+        # Strategy B: horizontal scale — same model, new port
         replica_id = f"{overloaded_id}-replica"
         if replica_id not in MODEL_CATALOG:
             MODEL_CATALOG[replica_id] = ModelSpec(
@@ -414,94 +523,73 @@ class DynamicProvisioner:
             )
 
         if replica_id not in self.running and self.gpu_pool.free_count() >= spec.gpus_needed:
-            log.info("  Scale-out option 1: replica of %s (queue=%d)", overloaded_id, queue_depth)
-            return await self.spin_up(replica_id,
-                                      reason=f"horizontal_scale:{overloaded_id}:q={queue_depth}")
+            log.info("  Strategy B replica: %s (queue=%d, acc=%.3f)",
+                     overloaded_id, queue_depth, current_acc or 0)
+            return await self.spin_up(
+                replica_id,
+                reason=f"horizontal_scale:{overloaded_id}:q={queue_depth}"
+            )
 
-        # Option 2: smaller model load-balance -- takes easy/medium, drains queue
-        for domain in spec.domains:
-            for candidate_id in THROUGHPUT_PATH.get(domain, []):
-                if candidate_id in (overloaded_id, replica_id):
-                    continue
-                if candidate_id in self.running:
-                    continue
-                candidate = MODEL_CATALOG[candidate_id]
-                if candidate.accuracy_tier > spec.accuracy_tier:
-                    continue  # skip larger -- slower per request
-                if self.gpu_pool.free_count() < candidate.gpus_needed:
-                    continue
-                log.info("  Scale-out option 2: smaller model %s for domain=%s",
-                         candidate_id, domain)
-                return await self.spin_up(candidate_id,
-                                          reason=f"load_balance:{overloaded_id}:q={queue_depth}")
-
-        log.warning("  Scale-out: no options available (all GPUs used)")
+        log.warning("  Scale-out: no options (GPUs full or no suitable model)")
         return False
 
-    async def _try_quality_upgrade(self, domain: str, reason: str, current_tier: int) -> bool:
-        """Low accuracy = QUALITY problem. Need smarter model, not more copies.
-
-        Spins up next higher-tier model. Current model keeps running
-        for easy/fast requests; new model handles complex ones.
-        """
-        for model_id in UPGRADE_PATH.get(domain, []):
-            spec = MODEL_CATALOG[model_id]
-            if spec.accuracy_tier <= current_tier:
-                continue
-            if model_id in self.running:
-                continue
-            if self.gpu_pool.free_count() < spec.gpus_needed:
-                log.warning("  Quality upgrade: want %s but %d GPUs free (need %d)",
-                            model_id, self.gpu_pool.free_count(), spec.gpus_needed)
-                continue
-            log.info("  Quality upgrade: %s (tier %d->%d) for domain=%s",
-                     model_id, current_tier, spec.accuracy_tier, domain)
-            return await self.spin_up(model_id, reason=reason)
-        return False
+    # ── Main policy loop ──────────────────────────────────────────────────────
 
     async def evaluate_and_act(self) -> None:
-        reputation = await self._reputation()
+        reputation = await self._get_router_reputation()
+        all_priors = self._load_priors()  # accuracy for ALL models, not just running
 
         for model_id, rm in list(self.running.items()):
             spec     = rm.spec
             base_url = f"http://localhost:{spec.port}"
 
             # Spin-down: idle
-            reqs = rm.requests_in_window(IDLE_WINDOW_S)
-            if reqs < MIN_REQUESTS_TO_STAY:
+            reqs_in_window = rm.requests_in_window(IDLE_WINDOW_S)
+            if reqs_in_window < MIN_REQUESTS_TO_STAY:
                 covered = all(
-                    any(domain in MODEL_CATALOG[other].domains
-                        for other in self.running if other != model_id)
+                    any(other_id != model_id and
+                        domain in MODEL_CATALOG[other_id].domains
+                        for other_id in self.running)
                     for domain in spec.domains
                 )
                 if covered:
-                    log.info("TRIGGER idle: %s (%d reqs/%ds, covered)", model_id, reqs, IDLE_WINDOW_S)
-                    await self.spin_down(model_id, "idle")
+                    log.info("TRIGGER idle: %s only %d reqs in %ds, domains covered",
+                             model_id, reqs_in_window, IDLE_WINDOW_S)
+                    await self.spin_down(model_id, reason="idle")
                     continue
 
             # Spin-up: queue overload (throughput problem)
-            q = await self._vllm_queue(base_url)
-            if q > QUEUE_DEPTH_THRESHOLD:
-                log.info("TRIGGER queue_overload: %s has %d waiting", model_id, q)
-                await self._try_scale_out(model_id, q)
+            queue_depth = await self._vllm_queue_depth(base_url)
+            if queue_depth > QUEUE_DEPTH_THRESHOLD:
+                log.info("TRIGGER queue_overload: %s has %d waiting", model_id, queue_depth)
+                for domain in spec.domains:
+                    if await self._try_scale_out(model_id, queue_depth, domain, all_priors):
+                        break
 
             # Spin-up: low accuracy (quality problem)
             rep    = reputation.get(model_id, {})
             priors = rep.get("accuracy_priors", {})
             for key, acc in priors.items():
                 if acc < ACCURACY_THRESHOLD:
-                    domain = key.split(":")[0]
-                    log.info("TRIGGER low_accuracy: %s %s=%.3f", model_id, key, acc)
+                    parts      = key.split(":")
+                    domain     = parts[0]
+                    complexity = parts[1] if len(parts) > 1 else "medium"
+                    log.info("TRIGGER low_accuracy: %s %s=%.3f < %.2f",
+                             model_id, key, acc, ACCURACY_THRESHOLD)
                     await self._try_quality_upgrade(
-                        domain,
+                        domain=domain,
+                        complexity=complexity,
+                        current_accuracy=acc,
                         reason=f"low_accuracy:{model_id}:{key}",
-                        current_tier=spec.accuracy_tier,
+                        all_priors=all_priors,
                     )
 
         # Bootstrap: nothing running
         if not self.running:
             log.info("TRIGGER bootstrap")
-            await self.spin_up("qwen-7b", "bootstrap")
+            await self.spin_up("qwen-7b", reason="bootstrap")
+
+    # ── Run loop ──────────────────────────────────────────────────────────────
 
     async def run(self, initial_models: list[str] | None = None) -> None:
         log.info("Dynamic Provisioner started")
@@ -510,7 +598,7 @@ class DynamicProvisioner:
 
         for model_id in (initial_models or []):
             if model_id in MODEL_CATALOG:
-                await self.spin_up(model_id, "initial")
+                await self.spin_up(model_id, reason="initial")
             else:
                 log.warning("Unknown initial model: %s", model_id)
 
@@ -528,8 +616,12 @@ class DynamicProvisioner:
     async def shutdown(self) -> None:
         log.info("Shutting down")
         for model_id in list(self.running.keys()):
-            await self.spin_down(model_id, "shutdown")
+            await self.spin_down(model_id, reason="shutdown")
 
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Dynamic vLLM provisioner for Sophia")
