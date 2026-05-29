@@ -6,7 +6,8 @@ based on accuracy and traffic signals. Decisions are fully data-driven from
 results/priors.json -- no hardcoded upgrade/downgrade paths.
 
 Low accuracy (domain:complexity < ACCURACY_THRESHOLD):
-  Case 1: better model not running -> spin it up (gated by TTCA analysis)
+  Case 1: better model not running -> spin up the MINIMUM SUFFICIENT model
+          (cheapest model that crosses ACCURACY_THRESHOLD, not the most accurate)
   Case 2: better model already running -> refresh its router priors
   Case 3: no better model exists -> log accuracy ceiling
 
@@ -17,11 +18,13 @@ Queue overload (vLLM waiting > QUEUE_DEPTH_THRESHOLD):
     -> Horizontal scale: same model replica
 
 TTCA-aware spin-up gate (TTCA_TARGET_MS, TTCA_MIN_IMPROVEMENT):
-  Spinning up a new model costs GPUs + startup time. Only spin up if:
-    1. Current E[TTCA] > TTCA_TARGET_MS  (TTCA is actually bad)
-    2. Candidate reduces E[TTCA] by >= TTCA_MIN_IMPROVEMENT  (it helps enough)
-  This prevents spinning up when accuracy is below threshold but users
-  are already getting correct answers fast enough via retries.
+  Only spin up if E[TTCA] > target AND candidate improves E[TTCA] by >= min %.
+
+Selection strategy by ROUTER_MODE:
+  accuracy -> cheapest model that crosses threshold (Phase 1),
+              else most accurate above floor (Phase 2 best effort)
+  ttca     -> lowest lat/acc ratio (fastest model above floor)
+  cost     -> fewest GPUs above floor
 
 Usage:
     python provisioner/dynamic_provisioner.py \\
@@ -75,12 +78,8 @@ ESTIMATED_TOKENS_PER_SEC: dict[int, float] = {
     8:  500.0,
 }
 
-# TTCA spin-up gate:
-#   E[TTCA] = avg_latency / resolution_rate
-#   Only spin up if: E[TTCA] > TTCA_TARGET_MS AND improvement >= TTCA_MIN_IMPROVEMENT
-#   Set TTCA_TARGET_MS = None to disable (always spin up on trigger).
-TTCA_TARGET_MS:       float | None = 3000.0  # target: correct answer within 3s
-TTCA_MIN_IMPROVEMENT: float        = 0.20    # candidate must improve E[TTCA] by >= 20%
+TTCA_TARGET_MS:       float | None = 3000.0
+TTCA_MIN_IMPROVEMENT: float        = 0.20
 
 HF_HOME = "/eagle/UIC-HPC/yuping/hf_cache"
 
@@ -184,9 +183,8 @@ class RunningModel:
     pid:           int
     gpus:          list[int]
     started_at:    float
-    request_times: deque = field(default_factory=lambda: deque(maxlen=1000))
-    # (latency_ms, attempts) tuples for TTCA measurement
-    latency_samples: list = field(default_factory=list)
+    request_times:   deque = field(default_factory=lambda: deque(maxlen=1000))
+    latency_samples: list  = field(default_factory=list)  # [(lat_ms, attempts)]
 
     def record_request(self) -> None:
         self.request_times.append(time.monotonic())
@@ -385,26 +383,15 @@ class DynamicProvisioner:
     # ── TTCA measurement and gate ─────────────────────────────────────────────
 
     def _compute_effective_ttca(self, model_id: str, all_priors: dict) -> float | None:
-        """Estimate E[TTCA] from live request history.
-
-        E[TTCA] ≈ avg_latency_first_attempt / resolution_rate
-
-        Resolution rate = fraction resolved correctly on first attempt.
-        Returns None if < 10 samples (insufficient data).
-        """
         rm = self.running.get(model_id)
-        if not rm:
+        if not rm or len(rm.latency_samples) < 10:
             return None
-        samples = rm.latency_samples  # [(latency_ms, attempts), ...]
-        if len(samples) < 10:
-            return None
+        samples    = rm.latency_samples
         total_lat  = sum(lat for lat, _ in samples)
         resolved_1 = sum(1 for _, att in samples if att == 1)
         avg_lat    = total_lat / len(samples)
         res_rate   = resolved_1 / len(samples)
-        if res_rate < 0.01:
-            return float("inf")
-        return avg_lat / res_rate
+        return float("inf") if res_rate < 0.01 else avg_lat / res_rate
 
     def _estimate_ttca_with_candidate(
         self,
@@ -412,23 +399,14 @@ class DynamicProvisioner:
         candidate_lat:  float,
         candidate_acc:  float,
     ) -> float:
-        """Estimate E[TTCA] if candidate is added to the model pool.
-
-        Uses cascade formula (models tried in lat/acc order):
-          E[TTCA] = sum_i P(first i-1 wrong) * cumulative_lat_i * P(model_i correct)
-        """
-        all_models = current_models + [(candidate_lat, candidate_acc)]
-        all_models.sort(key=lambda x: x[0] / max(x[1], 0.01))
-
-        e_ttca         = 0.0
-        p_all_wrong    = 1.0
-        cumulative_lat = 0.0
-        for lat, acc in all_models:
-            cumulative_lat += lat
-            e_ttca         += p_all_wrong * acc * cumulative_lat
-            p_all_wrong    *= (1.0 - acc)
-        e_ttca += p_all_wrong * cumulative_lat
-        return e_ttca
+        all_m = sorted(current_models + [(candidate_lat, candidate_acc)],
+                       key=lambda x: x[0] / max(x[1], 0.01))
+        e, pw, cl = 0.0, 1.0, 0.0
+        for lat, acc in all_m:
+            cl += lat
+            e  += pw * acc * cl
+            pw *= (1.0 - acc)
+        return e + pw * cl
 
     def _should_spin_up_for_ttca(
         self,
@@ -437,51 +415,18 @@ class DynamicProvisioner:
         candidate_acc:  float,
         current_models: list[tuple[float, float]],
     ) -> bool:
-        """TTCA gate: only spin up if improvement justifies the GPU cost.
-
-        Conditions (both must be true):
-          1. Current E[TTCA] > TTCA_TARGET_MS   -- TTCA is actually bad
-          2. New E[TTCA] improves by >= TTCA_MIN_IMPROVEMENT  -- candidate helps
-
-        If TTCA_TARGET_MS is None, gate is disabled (always spin up).
-        If no live data yet (current_e_ttca=None), spin up conservatively.
-
-        Example:
-          current E[TTCA] = 4500ms > 3000ms target   -> condition 1 met
-          new E[TTCA]     = 3200ms
-          improvement     = (4500-3200)/4500 = 28.9% >= 20%  -> condition 2 met
-          -> spin up ✓
-
-          current E[TTCA] = 1800ms <= 3000ms target  -> condition 1 NOT met
-          -> skip, TTCA already acceptable ✗
-
-          current E[TTCA] = 4500ms > 3000ms (condition 1 met)
-          new E[TTCA]     = 4300ms
-          improvement     = 4.4% < 20% min  -> condition 2 NOT met
-          -> skip, marginal gain not worth the GPU ✗
-        """
-        if TTCA_TARGET_MS is None:
+        if TTCA_TARGET_MS is None or current_e_ttca is None:
             return True
-        if current_e_ttca is None:
-            return True  # no data yet, spin up conservatively
-
         if current_e_ttca <= TTCA_TARGET_MS:
-            log.info("  TTCA gate: E[TTCA]=%.0fms <= target %.0fms -- skip",
+            log.info("  TTCA gate: E[TTCA]=%.0fms <= %.0fms target -- skip",
                      current_e_ttca, TTCA_TARGET_MS)
             return False
-
-        new_e_ttca  = self._estimate_ttca_with_candidate(
-            current_models, candidate_lat, candidate_acc)
-        improvement = (current_e_ttca - new_e_ttca) / current_e_ttca
-
-        if improvement < TTCA_MIN_IMPROVEMENT:
-            log.info("  TTCA gate: improvement=%.1f%% < %.0f%% min (%.0f->%.0fms) -- skip",
-                     improvement * 100, TTCA_MIN_IMPROVEMENT * 100,
-                     current_e_ttca, new_e_ttca)
+        new_e   = self._estimate_ttca_with_candidate(current_models, candidate_lat, candidate_acc)
+        impr    = (current_e_ttca - new_e) / current_e_ttca
+        if impr < TTCA_MIN_IMPROVEMENT:
+            log.info("  TTCA gate: improvement=%.1f%% < %.0f%% -- skip", impr*100, TTCA_MIN_IMPROVEMENT*100)
             return False
-
-        log.info("  TTCA gate: improvement=%.1f%% (%.0f->%.0fms) -- spin up",
-                 improvement * 100, current_e_ttca, new_e_ttca)
+        log.info("  TTCA gate: improvement=%.1f%% (%.0f->%.0fms) -- spin up", impr*100, current_e_ttca, new_e)
         return True
 
     # ── General data-driven provisioning decisions ────────────────────────────
@@ -501,13 +446,11 @@ class DynamicProvisioner:
         rm = self.running.get(model_id)
         if not rm:
             return
-        spec     = rm.spec
-        priors   = all_priors.get(model_id, {})
-        base_url = f"http://localhost:{spec.port}"
+        spec, priors = rm.spec, all_priors.get(model_id, {})
         try:
             await self._router_post("/router/register", {
                 "model_id": spec.model_id, "model_name": spec.model_name,
-                "backend": "vllm", "base_url": base_url,
+                "backend": "vllm", "base_url": f"http://localhost:{spec.port}",
                 "domains": spec.domains,
                 "min_accuracy_capability": spec.min_accuracy_capability,
                 "accuracy_priors": priors,
@@ -528,9 +471,26 @@ class DynamicProvisioner:
     ) -> bool:
         """Low accuracy. Three cases:
 
-        Case 1: better model NOT running -> spin up (if TTCA gate passes)
+        Case 1: better model NOT running -> spin it up (TTCA gate may block)
         Case 2: better model IS running  -> refresh router priors
         Case 3: no better model          -> log ceiling
+
+        Candidate selection strategy by ROUTER_MODE:
+
+          accuracy (two-phase):
+            Phase 1: models that cross ACCURACY_THRESHOLD, sorted by fewest GPUs
+                     -> cheapest model that actually solves the problem
+                     -> avoids spinning up 32B when 14B would fix it
+            Phase 2: models below threshold but above floor, sorted by highest acc
+                     -> best effort when no model can fully solve it
+
+          ttca: lowest lat/acc ratio first (fastest model above floor)
+          cost: fewest GPUs first (cheapest model above floor)
+
+        Example (accuracy mode):
+          current=0.61, threshold=0.65
+          qwen-14b: acc=0.69 >= 0.65 -> Phase 1, 2 GPUs  <- CHOSEN
+          coder-32b: acc=0.88 >= 0.65 -> Phase 1, 4 GPUs  <- skipped (more expensive)
         """
         better_running:     list[tuple[ModelSpec, float]] = []
         better_not_running: list[tuple[ModelSpec, float]] = []
@@ -556,16 +516,20 @@ class DynamicProvisioner:
                 return (est_lat / max(acc, 0.01), spec.gpus_needed)
             elif ROUTER_MODE == "cost":
                 return (spec.gpus_needed, -acc)
-            return (-acc, spec.gpus_needed)
+            else:
+                # accuracy: minimum sufficient first
+                # Phase 1 (group 0): models that cross threshold, fewest GPUs first
+                # Phase 2 (group 1): best effort (highest acc), when no model crosses threshold
+                crosses = acc >= ACCURACY_THRESHOLD
+                return (0, spec.gpus_needed, -acc) if crosses else (1, -acc, spec.gpus_needed)
 
         better_running.sort(key=_sort_key)
         better_not_running.sort(key=_sort_key)
 
-        # Case 1: spin up best not-running model (if TTCA gate passes)
+        # Case 1: spin up best not-running model (TTCA gate may block)
         if better_not_running:
             best_spec, best_acc = better_not_running[0]
 
-            # Build current model pool for TTCA estimation
             current_models: list[tuple[float, float]] = []
             for mid, rm2 in self.running.items():
                 a = self._get_prior(mid, domain, complexity, all_priors)
@@ -575,19 +539,16 @@ class DynamicProvisioner:
 
             cand_tps = ESTIMATED_TOKENS_PER_SEC.get(best_spec.gpus_needed, 1000.0)
             cand_lat = 300 / cand_tps * 1000
-
-            # Live E[TTCA] if available
             current_e_ttca = next(
                 (t for mid in self.running
                  if (t := self._compute_effective_ttca(mid, all_priors)) is not None),
                 None
             )
 
-            if self._should_spin_up_for_ttca(
-                current_e_ttca, cand_lat, best_acc, current_models
-            ):
-                log.info("  [Case 1 spin-up] %s acc=%.3f for %s:%s (mode=%s)",
-                         best_spec.model_id, best_acc, domain, complexity, ROUTER_MODE)
+            if self._should_spin_up_for_ttca(current_e_ttca, cand_lat, best_acc, current_models):
+                phase = "phase1" if best_acc >= ACCURACY_THRESHOLD else "phase2-best-effort"
+                log.info("  [Case 1 %s] %s acc=%.3f for %s:%s (mode=%s)",
+                         phase, best_spec.model_id, best_acc, domain, complexity, ROUTER_MODE)
                 return await self.spin_up(best_spec.model_id, reason=reason)
 
         # Case 2: better model already running -> refresh priors
@@ -598,52 +559,40 @@ class DynamicProvisioner:
             await self._refresh_router_priors(best_spec.model_id, all_priors)
             return True
 
-        # Case 3: accuracy ceiling
         log.warning("  [Case 3 ceiling] no model beats %.3f for %s:%s",
                     current_accuracy, domain, complexity)
         return False
 
     async def _try_scale_out(
-        self,
-        overloaded_id: str,
-        queue_depth:   int,
-        domain:        str,
-        all_priors:    dict,
+        self, overloaded_id: str, queue_depth: int, domain: str, all_priors: dict
     ) -> bool:
-        """Queue overload. Downgrade if accuracy high, else horizontal scale."""
         spec = MODEL_CATALOG.get(overloaded_id)
         if not spec:
             return False
 
-        domain_priors = {
-            k: v for k, v in all_priors.get(overloaded_id, {}).items()
-            if k.startswith(domain + ":")
-        }
+        domain_priors = {k: v for k, v in all_priors.get(overloaded_id, {}).items()
+                         if k.startswith(domain + ":")}
         current_acc   = min(domain_priors.values()) if domain_priors else None
         accuracy_high = current_acc is not None and current_acc >= HIGH_ACCURACY_THRESHOLD
 
         if accuracy_high:
             candidates: list[tuple[ModelSpec, float]] = []
             for candidate in self._candidates_not_running():
-                if domain not in candidate.domains:
-                    continue
-                if candidate.gpus_needed >= spec.gpus_needed:
+                if domain not in candidate.domains or candidate.gpus_needed >= spec.gpus_needed:
                     continue
                 if self.gpu_pool.free_count() < candidate.gpus_needed:
                     continue
                 acc = self._get_prior(candidate.model_id, domain, "medium", all_priors)
-                if acc is None or acc < MIN_ACCEPTABLE_ACCURACY:
-                    continue
-                candidates.append((candidate, acc))
+                if acc and acc >= MIN_ACCEPTABLE_ACCURACY:
+                    candidates.append((candidate, acc))
 
             if candidates:
                 candidates.sort(key=lambda x: (x[0].gpus_needed, -x[1]))
                 best, best_acc = candidates[0]
-                log.info("  [Strategy A downgrade] %s (%d GPUs, acc=%.3f) current=%.3f",
+                log.info("  [Downgrade] %s (%d GPU, acc=%.3f) current=%.3f",
                          best.model_id, best.gpus_needed, best_acc, current_acc)
-                return await self.spin_up(
-                    best.model_id, reason=f"downgrade:{overloaded_id}:q={queue_depth}"
-                )
+                return await self.spin_up(best.model_id,
+                                          reason=f"downgrade:{overloaded_id}:q={queue_depth}")
 
         replica_id = f"{overloaded_id}-replica"
         if replica_id not in MODEL_CATALOG:
@@ -656,10 +605,9 @@ class DynamicProvisioner:
             )
 
         if replica_id not in self.running and self.gpu_pool.free_count() >= spec.gpus_needed:
-            log.info("  [Strategy B replica] %s queue=%d", overloaded_id, queue_depth)
-            return await self.spin_up(
-                replica_id, reason=f"horizontal_scale:{overloaded_id}:q={queue_depth}"
-            )
+            log.info("  [Replica] %s queue=%d", overloaded_id, queue_depth)
+            return await self.spin_up(replica_id,
+                                      reason=f"horizontal_scale:{overloaded_id}:q={queue_depth}")
 
         log.warning("  Scale-out: no options (GPUs full)")
         return False
@@ -669,39 +617,35 @@ class DynamicProvisioner:
         all_priors = self._load_priors()
 
         for model_id, rm in list(self.running.items()):
-            spec     = rm.spec
-            base_url = f"http://localhost:{spec.port}"
+            spec, base_url = rm.spec, f"http://localhost:{rm.spec.port}"
 
             reqs = rm.requests_in_window(IDLE_WINDOW_S)
             if reqs < MIN_REQUESTS_TO_STAY:
                 covered = all(
-                    any(other_id != model_id and
-                        domain in MODEL_CATALOG[other_id].domains
-                        for other_id in self.running)
+                    any(oid != model_id and domain in MODEL_CATALOG[oid].domains
+                        for oid in self.running)
                     for domain in spec.domains
                 )
                 if covered:
-                    log.info("TRIGGER idle: %s %d reqs/%ds", model_id, reqs, IDLE_WINDOW_S)
+                    log.info("TRIGGER idle: %s %d/%ds", model_id, reqs, IDLE_WINDOW_S)
                     await self.spin_down(model_id, reason="idle")
                     continue
 
             q = await self._vllm_queue_depth(base_url)
             if q > QUEUE_DEPTH_THRESHOLD:
-                log.info("TRIGGER queue_overload: %s has %d waiting", model_id, q)
+                log.info("TRIGGER queue: %s has %d waiting", model_id, q)
                 for domain in spec.domains:
                     if await self._try_scale_out(model_id, q, domain, all_priors):
                         break
 
-            rep    = reputation.get(model_id, {})
-            priors = rep.get("accuracy_priors", {})
-            for key, acc in priors.items():
+            rep = reputation.get(model_id, {})
+            for key, acc in rep.get("accuracy_priors", {}).items():
                 if acc < ACCURACY_THRESHOLD:
-                    parts      = key.split(":")
-                    domain     = parts[0]
-                    complexity = parts[1] if len(parts) > 1 else "medium"
-                    log.info("TRIGGER low_accuracy: %s %s=%.3f", model_id, key, acc)
+                    parts = key.split(":")
+                    log.info("TRIGGER accuracy: %s %s=%.3f", model_id, key, acc)
                     await self._try_quality_upgrade(
-                        domain=domain, complexity=complexity,
+                        domain=parts[0],
+                        complexity=parts[1] if len(parts) > 1 else "medium",
                         current_accuracy=acc,
                         reason=f"low_accuracy:{model_id}:{key}",
                         all_priors=all_priors,
@@ -712,8 +656,8 @@ class DynamicProvisioner:
             await self.spin_up("qwen-7b", reason="bootstrap")
 
     async def run(self, initial_models: list[str] | None = None) -> None:
-        log.info("Dynamic Provisioner started | mode=%s | TTCA target=%.0fms",
-                 ROUTER_MODE, TTCA_TARGET_MS or 0)
+        log.info("Provisioner started | mode=%s | TTCA target=%s",
+                 ROUTER_MODE, f"{TTCA_TARGET_MS:.0f}ms" if TTCA_TARGET_MS else "disabled")
         log.info("GPU pool: %s | Poll: %ds | Cooldown: %ds",
                  self.gpu_pool, int(self.poll_interval), COOLDOWN_S)
 
@@ -721,7 +665,7 @@ class DynamicProvisioner:
             if model_id in MODEL_CATALOG:
                 await self.spin_up(model_id, reason="initial")
             else:
-                log.warning("Unknown initial model: %s", model_id)
+                log.warning("Unknown: %s", model_id)
 
         while True:
             try:
@@ -743,17 +687,17 @@ class DynamicProvisioner:
 def main() -> None:
     global ROUTER_MODE, TTCA_TARGET_MS, TTCA_MIN_IMPROVEMENT
     parser = argparse.ArgumentParser(description="Dynamic vLLM provisioner for Sophia")
-    parser.add_argument("--router-url",        default="http://localhost:8080")
-    parser.add_argument("--total-gpus",        type=int,   default=8)
-    parser.add_argument("--poll-interval",     type=float, default=POLL_INTERVAL_S)
-    parser.add_argument("--priors-path",       default="results/priors.json")
-    parser.add_argument("--router-mode",       default="accuracy",
+    parser.add_argument("--router-url",       default="http://localhost:8080")
+    parser.add_argument("--total-gpus",       type=int,   default=8)
+    parser.add_argument("--poll-interval",    type=float, default=POLL_INTERVAL_S)
+    parser.add_argument("--priors-path",      default="results/priors.json")
+    parser.add_argument("--router-mode",      default="accuracy",
                         choices=["accuracy", "ttca", "cost"])
-    parser.add_argument("--ttca-target-ms",    type=float, default=3000.0,
-                        help="Spin up only if E[TTCA] exceeds this (ms). 0=disable gate.")
-    parser.add_argument("--ttca-min-improve",  type=float, default=0.20,
+    parser.add_argument("--ttca-target-ms",   type=float, default=3000.0,
+                        help="Spin up only if E[TTCA] > this ms. 0=disable gate.")
+    parser.add_argument("--ttca-min-improve", type=float, default=0.20,
                         help="Minimum E[TTCA] improvement fraction to justify spin-up.")
-    parser.add_argument("--initial-models",    default="",
+    parser.add_argument("--initial-models",   default="",
                         help="Comma-separated model IDs to start immediately")
     args = parser.parse_args()
 
@@ -761,15 +705,13 @@ def main() -> None:
     TTCA_TARGET_MS       = args.ttca_target_ms if args.ttca_target_ms > 0 else None
     TTCA_MIN_IMPROVEMENT = args.ttca_min_improve
     log.info("mode=%s | TTCA target=%s | min_improve=%.0f%%",
-             ROUTER_MODE, f"{TTCA_TARGET_MS:.0f}ms" if TTCA_TARGET_MS else "disabled",
+             ROUTER_MODE, f"{TTCA_TARGET_MS:.0f}ms" if TTCA_TARGET_MS else "off",
              TTCA_MIN_IMPROVEMENT * 100)
 
     initial = [m.strip() for m in args.initial_models.split(",") if m.strip()]
     provisioner = DynamicProvisioner(
-        router_url=args.router_url,
-        total_gpus=args.total_gpus,
-        poll_interval=args.poll_interval,
-        priors_path=args.priors_path,
+        router_url=args.router_url, total_gpus=args.total_gpus,
+        poll_interval=args.poll_interval, priors_path=args.priors_path,
     )
 
     async def _run():
