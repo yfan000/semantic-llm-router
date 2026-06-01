@@ -664,6 +664,11 @@ class DynamicProvisioner:
             else:
                 log.warning("Unknown: %s", model_id)
 
+        # Reset cooldown after initial models are ready so startup spin-up
+        # does not block reactive scale-out during the first poll window.
+        self._last_action_time = 0.0
+        log.info("Initial models ready. Cooldown reset -- reactive scaling enabled.")
+
         while True:
             try:
                 running_str = ", ".join(
