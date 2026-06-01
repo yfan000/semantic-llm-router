@@ -10,30 +10,21 @@ Low accuracy (domain:complexity < ACCURACY_THRESHOLD):
   Case 2: better model already running -> refresh its router priors
   Case 3: no better model exists -> log accuracy ceiling
 
-Queue overload (vLLM waiting > QUEUE_DEPTH_THRESHOLD):
-  Accuracy HIGH -> Downgrade to smaller model
-  Accuracy borderline -> Horizontal scale (same model replica)
+Overload detection (_vllm_overloaded) -- THREE signals:
+  1. num_requests_waiting > QUEUE_DEPTH_THRESHOLD  (classic waiting queue)
+  2. num_requests_running > RUNNING_THRESHOLD       (continuous batch full)
+  3. kv_cache_usage_perc > KV_CACHE_THRESHOLD      (GPU memory pressure)
+  vLLM continuous batching keeps waiting=0 even under heavy load.
+  running and kv_cache are better indicators of actual overload.
 
-Process health check (_check_dead_processes):
-  Runs every poll via HTTP GET /health (not PID signal).
-  vLLM spawns child processes; pkill kills workers but parent PID stays
-  alive as a zombie -- os.kill(pid,0) would see it as alive.
-  HTTP health check is definitive: no response = model is dead.
-
-TTCA-aware spin-up gate:
-  Only spin up if E[TTCA] > TTCA_TARGET_MS AND improvement >= TTCA_MIN_IMPROVEMENT.
-
-Latency estimation (_estimate_latency_ms) for not-running models:
-  1. model_reputation.json avg_latency_ms (historical -- most accurate)
-  2. ModelSpec.expected_tokens_per_sec (per-model benchmark)
-  3. ESTIMATED_TOKENS_PER_SEC[gpus] (GPU count fallback -- roughest)
+Process health check: HTTP GET /health (not PID signal).
+TTCA-aware spin-up gate: only spin up if E[TTCA] improvement justifies GPU cost.
 
 Usage:
     python provisioner/dynamic_provisioner.py \\
         --router-url http://localhost:8080 \\
         --router-mode ttca \\
-        --ttca-target-ms 3000 \\
-        --initial-models qwen-7b,deepseek-r1-7b
+        --initial-models qwen-7b
 """
 from __future__ import annotations
 
@@ -63,7 +54,9 @@ log = logging.getLogger(__name__)
 POLL_INTERVAL_S       = 30
 IDLE_WINDOW_S         = 300
 MIN_REQUESTS_TO_STAY  = 5
-QUEUE_DEPTH_THRESHOLD = 10
+QUEUE_DEPTH_THRESHOLD = 10      # num_requests_waiting trigger
+RUNNING_THRESHOLD     = 20      # num_requests_running trigger (continuous batching)
+KV_CACHE_THRESHOLD    = 0.70    # kv_cache_usage_perc trigger (0-1)
 ACCURACY_THRESHOLD    = 0.65
 STARTUP_WAIT_S        = 300
 COOLDOWN_S            = 120
@@ -239,16 +232,46 @@ class DynamicProvisioner:
         async with httpx.AsyncClient(timeout=10.0) as c:
             await c.delete(f"{self.router_url}{path}")
 
-    async def _vllm_queue_depth(self, base_url: str) -> int:
+    async def _vllm_overloaded(self, base_url: str) -> tuple[bool, str]:
+        """Check if vLLM is overloaded using three signals.
+
+        vLLM continuous batching keeps num_requests_waiting=0 even under heavy
+        load because all requests go to "running" state immediately.
+        We check three signals to detect real overload:
+
+          1. num_requests_waiting > QUEUE_DEPTH_THRESHOLD  (classic queue)
+          2. num_requests_running > RUNNING_THRESHOLD      (batch full)
+          3. kv_cache_usage_perc  > KV_CACHE_THRESHOLD    (GPU memory full)
+        """
         try:
             async with httpx.AsyncClient(timeout=3.0) as c:
                 r = await c.get(f"{base_url}/metrics")
-                for line in r.text.splitlines():
-                    if "vllm:num_requests_waiting" in line and not line.startswith("#"):
-                        return int(float(line.split()[-1]))
+            metrics: dict[str, float] = {}
+            for line in r.text.splitlines():
+                if line.startswith("#") or not line.strip():
+                    continue
+                key = line.split("{")[0].split()[0]
+                try:
+                    metrics[key] = float(line.split()[-1])
+                except (ValueError, IndexError):
+                    pass
+
+            waiting  = metrics.get("vllm:num_requests_waiting", 0.0)
+            running  = metrics.get("vllm:num_requests_running",  0.0)
+            kv_cache = metrics.get("vllm:kv_cache_usage_perc",   0.0)
+
+            log.debug("  metrics: waiting=%.0f running=%.0f kv=%.2f",
+                      waiting, running, kv_cache)
+
+            if waiting > QUEUE_DEPTH_THRESHOLD:
+                return True, f"waiting={waiting:.0f}>{QUEUE_DEPTH_THRESHOLD}"
+            if running > RUNNING_THRESHOLD:
+                return True, f"running={running:.0f}>{RUNNING_THRESHOLD}"
+            if kv_cache > KV_CACHE_THRESHOLD:
+                return True, f"kv_cache={kv_cache:.2f}>{KV_CACHE_THRESHOLD}"
         except Exception:
             pass
-        return 0
+        return False, ""
 
     async def _get_router_reputation(self) -> dict:
         try:
@@ -378,48 +401,28 @@ class DynamicProvisioner:
         log.info("  %s stopped. Free GPUs: %d", model_id, self.gpu_pool.free_count())
         return True
 
-    # ── Process health check ──────────────────────────────────────────────────
-
     async def _check_dead_processes(self) -> None:
-        """Detect models that are dead or unresponsive via HTTP health check.
-
-        Uses GET /health rather than os.kill(pid, 0) because:
-        - vLLM spawns multiple child processes
-        - pkill kills the workers but parent PID stays alive as zombie
-        - os.kill(pid, 0) sees zombie as alive → bootstrap never fires
-        - HTTP /health is definitive: no response = model is dead
-
-        On detection: deregister from router, kill zombie, release GPUs.
-        Next poll cycle sees empty fleet → TRIGGER bootstrap.
-        """
         for model_id, rm in list(self.running.items()):
             base_url = f"http://localhost:{rm.spec.port}"
             alive = False
             try:
                 async with httpx.AsyncClient(timeout=5.0) as c:
-                    r = await c.get(f"{base_url}/health")
-                    alive = (r.status_code == 200)
+                    alive = (await c.get(f"{base_url}/health")).status_code == 200
             except Exception:
                 alive = False
-
             if not alive:
-                log.warning("DETECTED dead/unresponsive: %s (port=%d) -- cleaning up",
-                            model_id, rm.spec.port)
+                log.warning("DETECTED dead: %s -- cleaning up", model_id)
                 try:
                     await self._router_delete(f"/router/{model_id}")
                 except Exception:
                     pass
-                # Kill any remaining zombie process
                 try:
                     os.kill(rm.pid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
                 self.gpu_pool.release(model_id)
                 del self.running[model_id]
-                log.warning("  Removed %s. Free GPUs: %d",
-                            model_id, self.gpu_pool.free_count())
-
-    # ── Latency estimation ────────────────────────────────────────────────────
+                log.warning("  Removed %s. Free GPUs: %d", model_id, self.gpu_pool.free_count())
 
     def _estimate_latency_ms(self, model_id: str, output_tokens: int = 300) -> float:
         import json
@@ -439,8 +442,6 @@ class DynamicProvisioner:
         gpus = spec.gpus_needed if spec else 1
         return output_tokens / ESTIMATED_TOKENS_PER_SEC.get(gpus, 1000.0) * 1000
 
-    # ── TTCA measurement and gate ─────────────────────────────────────────────
-
     def _compute_effective_ttca(self, model_id: str, all_priors: dict) -> float | None:
         rm = self.running.get(model_id)
         if not rm or len(rm.latency_samples) < 10:
@@ -459,9 +460,7 @@ class DynamicProvisioner:
                        key=lambda x: x[0] / max(x[1], 0.01))
         e, pw, cl = 0.0, 1.0, 0.0
         for lat, acc in all_m:
-            cl += lat
-            e  += pw * acc * cl
-            pw *= (1.0 - acc)
+            cl += lat; e += pw * acc * cl; pw *= (1.0 - acc)
         return e + pw * cl
 
     def _should_spin_up_for_ttca(
@@ -472,20 +471,9 @@ class DynamicProvisioner:
         if TTCA_TARGET_MS is None or current_e_ttca is None:
             return True
         if current_e_ttca <= TTCA_TARGET_MS:
-            log.info("  TTCA gate: E[TTCA]=%.0fms <= %.0fms -- skip",
-                     current_e_ttca, TTCA_TARGET_MS)
             return False
         new_e = self._estimate_ttca_with_candidate(current_models, candidate_lat, candidate_acc)
-        impr  = (current_e_ttca - new_e) / current_e_ttca
-        if impr < TTCA_MIN_IMPROVEMENT:
-            log.info("  TTCA gate: improvement=%.1f%% < %.0f%% -- skip",
-                     impr * 100, TTCA_MIN_IMPROVEMENT * 100)
-            return False
-        log.info("  TTCA gate: improvement=%.1f%% (%.0f->%.0fms) -- spin up",
-                 impr * 100, current_e_ttca, new_e)
-        return True
-
-    # ── General data-driven provisioning decisions ────────────────────────────
+        return (current_e_ttca - new_e) / current_e_ttca >= TTCA_MIN_IMPROVEMENT
 
     def _get_prior(self, model_id: str, domain: str, complexity: str,
                    all_priors: dict) -> float | None:
@@ -493,10 +481,8 @@ class DynamicProvisioner:
         return priors.get(f"{domain}:{complexity}") or priors.get(domain)
 
     def _candidates_not_running(self) -> list[ModelSpec]:
-        return [
-            spec for mid, spec in MODEL_CATALOG.items()
-            if mid not in self.running and not mid.endswith("-replica")
-        ]
+        return [spec for mid, spec in MODEL_CATALOG.items()
+                if mid not in self.running and not mid.endswith("-replica")]
 
     async def _refresh_router_priors(self, model_id: str, all_priors: dict) -> None:
         rm = self.running.get(model_id)
@@ -513,9 +499,8 @@ class DynamicProvisioner:
                 "efficiency_tokens_per_joule": spec.efficiency_tokens_per_joule,
                 "skip_calibration": True,
             })
-            log.info("  Refreshed priors for %s", model_id)
         except Exception as e:
-            log.warning("  Failed: %s", e)
+            log.warning("  Refresh failed: %s", e)
 
     async def _try_quality_upgrade(
         self, domain: str, complexity: str, current_accuracy: float,
@@ -541,9 +526,8 @@ class DynamicProvisioner:
                 return (self._estimate_latency_ms(spec.model_id) / max(acc, 0.01), spec.gpus_needed)
             elif ROUTER_MODE == "cost":
                 return (spec.gpus_needed, -acc)
-            else:
-                crosses = acc >= ACCURACY_THRESHOLD
-                return (0, spec.gpus_needed, -acc) if crosses else (1, -acc, spec.gpus_needed)
+            crosses = acc >= ACCURACY_THRESHOLD
+            return (0, spec.gpus_needed, -acc) if crosses else (1, -acc, spec.gpus_needed)
 
         better_running.sort(key=_sort_key)
         better_not_running.sort(key=_sort_key)
@@ -563,8 +547,8 @@ class DynamicProvisioner:
             )
             if self._should_spin_up_for_ttca(current_e_ttca, cand_lat, best_acc, current_models):
                 phase = "phase1" if best_acc >= ACCURACY_THRESHOLD else "phase2"
-                log.info("  [Case 1 %s] %s acc=%.3f lat=%.0fms for %s:%s",
-                         phase, best_spec.model_id, best_acc, cand_lat, domain, complexity)
+                log.info("  [Case 1 %s] %s acc=%.3f for %s:%s", phase, best_spec.model_id,
+                         best_acc, domain, complexity)
                 return await self.spin_up(best_spec.model_id, reason=reason)
 
         if better_running:
@@ -601,8 +585,7 @@ class DynamicProvisioner:
             if candidates:
                 candidates.sort(key=lambda x: (x[0].gpus_needed, -x[1]))
                 best, best_acc = candidates[0]
-                log.info("  [Downgrade] %s (%d GPU, acc=%.3f)",
-                         best.model_id, best.gpus_needed, best_acc)
+                log.info("  [Downgrade] %s (%d GPU)", best.model_id, best.gpus_needed)
                 return await self.spin_up(best.model_id,
                                           reason=f"downgrade:{overloaded_id}:q={queue_depth}")
 
@@ -618,7 +601,7 @@ class DynamicProvisioner:
             )
 
         if replica_id not in self.running and self.gpu_pool.free_count() >= spec.gpus_needed:
-            log.info("  [Replica] %s queue=%d", overloaded_id, queue_depth)
+            log.info("  [Replica] %s", overloaded_id)
             return await self.spin_up(replica_id,
                                       reason=f"horizontal_scale:{overloaded_id}:q={queue_depth}")
 
@@ -626,9 +609,7 @@ class DynamicProvisioner:
         return False
 
     async def evaluate_and_act(self) -> None:
-        # HTTP health check for dead/crashed models -- must run before anything else
         await self._check_dead_processes()
-
         reputation = await self._get_router_reputation()
         all_priors = self._load_priors()
 
@@ -647,11 +628,11 @@ class DynamicProvisioner:
                     await self.spin_down(model_id, reason="idle")
                     continue
 
-            q = await self._vllm_queue_depth(base_url)
-            if q > QUEUE_DEPTH_THRESHOLD:
-                log.info("TRIGGER queue: %s has %d waiting", model_id, q)
+            overloaded, reason = await self._vllm_overloaded(base_url)
+            if overloaded:
+                log.info("TRIGGER overload: %s [%s]", model_id, reason)
                 for domain in spec.domains:
-                    if await self._try_scale_out(model_id, q, domain, all_priors):
+                    if await self._try_scale_out(model_id, 11, domain, all_priors):
                         break
 
             rep = reputation.get(model_id, {})
@@ -709,19 +690,14 @@ def main() -> None:
     parser.add_argument("--priors-path",      default="results/priors.json")
     parser.add_argument("--router-mode",      default="accuracy",
                         choices=["accuracy", "ttca", "cost"])
-    parser.add_argument("--ttca-target-ms",   type=float, default=3000.0,
-                        help="Spin up only if E[TTCA] > this ms. 0=disable gate.")
+    parser.add_argument("--ttca-target-ms",   type=float, default=3000.0)
     parser.add_argument("--ttca-min-improve", type=float, default=0.20)
-    parser.add_argument("--initial-models",   default="",
-                        help="Comma-separated model IDs to start immediately")
+    parser.add_argument("--initial-models",   default="")
     args = parser.parse_args()
 
     ROUTER_MODE          = args.router_mode
     TTCA_TARGET_MS       = args.ttca_target_ms if args.ttca_target_ms > 0 else None
     TTCA_MIN_IMPROVEMENT = args.ttca_min_improve
-    log.info("mode=%s | TTCA target=%s | min_improve=%.0f%%",
-             ROUTER_MODE, f"{TTCA_TARGET_MS:.0f}ms" if TTCA_TARGET_MS else "off",
-             TTCA_MIN_IMPROVEMENT * 100)
 
     initial = [m.strip() for m in args.initial_models.split(",") if m.strip()]
     provisioner = DynamicProvisioner(
