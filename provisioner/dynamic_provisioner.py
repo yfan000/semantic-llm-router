@@ -17,6 +17,12 @@ Overload detection (_vllm_overloaded) -- THREE signals:
   vLLM continuous batching keeps waiting=0 even under heavy load.
   running and kv_cache are better indicators of actual overload.
 
+Idle spin-down ordering:
+  Replicas (scale-out helpers) always spin down before their base model.
+  A base model is protected from idle spin-down while its replica is active.
+  Own replicas are excluded from domain-coverage checks so they can never
+  trigger a base model spin-down.
+
 Process health check: HTTP GET /health (not PID signal).
 TTCA-aware spin-up gate: only spin up if E[TTCA] improvement justifies GPU cost.
 
@@ -618,15 +624,25 @@ class DynamicProvisioner:
 
             reqs = rm.requests_in_window(IDLE_WINDOW_S)
             if reqs < MIN_REQUESTS_TO_STAY:
-                covered = all(
-                    any(oid != model_id and domain in MODEL_CATALOG[oid].domains
-                        for oid in self.running)
-                    for domain in spec.domains
-                )
-                if covered:
-                    log.info("TRIGGER idle: %s %d/%ds", model_id, reqs, IDLE_WINDOW_S)
-                    await self.spin_down(model_id, reason="idle")
-                    continue
+                # A base model must not be spun down while its replica is still
+                # active. The replica (scale-out helper) always spins down first
+                # when load drops, then the base model can be reconsidered.
+                if f"{model_id}-replica" in self.running:
+                    log.debug("Skipping idle check for %s: replica still active", model_id)
+                else:
+                    # Exclude own replicas from domain-coverage so a replica can
+                    # never be the sole reason a base model is considered covered.
+                    covered = all(
+                        any(oid != model_id
+                            and not oid.startswith(f"{model_id}-")
+                            and domain in MODEL_CATALOG[oid].domains
+                            for oid in self.running)
+                        for domain in spec.domains
+                    )
+                    if covered:
+                        log.info("TRIGGER idle: %s %d/%ds", model_id, reqs, IDLE_WINDOW_S)
+                        await self.spin_down(model_id, reason="idle")
+                        continue
 
             overloaded, reason = await self._vllm_overloaded(base_url)
             if overloaded:
