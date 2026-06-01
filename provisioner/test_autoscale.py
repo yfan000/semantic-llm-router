@@ -19,11 +19,11 @@ from statistics import mean
 
 import httpx
 
-ROUTER_URL  = "http://localhost:8080"
-CONCURRENCY = 40    # concurrent requests -- enough to build a queue
-TOTAL       = 200   # total requests in flood phase
-MAX_TOKENS  = 300   # longer responses = more GPU time = longer queue buildup
-IDLE_WAIT_S = 400   # seconds to wait after flood (> IDLE_WINDOW_S=300 in provisioner)
+ROUTER_URL   = "http://localhost:8080"
+CONCURRENCY  = 80    # concurrent requests — higher = faster queue buildup
+TOTAL        = 500   # total requests in flood phase
+MAX_TOKENS   = 800   # longer responses = more GPU time = queue builds faster
+IDLE_WAIT_S  = 400   # seconds to wait after flood (> IDLE_WINDOW_S=300 in provisioner)
 
 
 async def get_models() -> list[str]:
@@ -69,12 +69,24 @@ async def send_request(client: httpx.AsyncClient, req_id: int) -> dict:
 async def flood_phase() -> None:
     print(f"\n{'='*60}")
     print(f"  PHASE 1: FLOOD  ({TOTAL} requests, concurrency={CONCURRENCY})")
+    print(f"  Max tokens: {MAX_TOKENS} per request (longer = more GPU time)")
     print(f"  Goal: queue > 10 -> provisioner spins up a new model")
     print(f"{'='*60}")
 
     models_before = await get_models()
     print(f"  Models before: {models_before}")
-    print(f"  Sending {TOTAL} requests...\n")
+
+    # Check queue depth before flood
+    try:
+        async with httpx.AsyncClient(timeout=3.0) as c:
+            r = await c.get("http://localhost:8000/metrics")
+            for line in r.text.splitlines():
+                if "num_requests_waiting" in line and not line.startswith("#"):
+                    print(f"  Queue depth before: {line.split()[-1]}")
+    except Exception:
+        pass
+
+    print(f"\n  Sending {TOTAL} requests...\n")
 
     results = []
     sem  = asyncio.Semaphore(CONCURRENCY)
@@ -84,20 +96,30 @@ async def flood_phase() -> None:
     async def bounded(req_id: int) -> None:
         nonlocal done
         async with sem:
-            async with httpx.AsyncClient(timeout=120.0) as client:
+            async with httpx.AsyncClient(timeout=300.0) as client:
                 r = await send_request(client, req_id)
             results.append(r)
             done += 1
-            if done % 10 == 0:
+            if done % 20 == 0:
                 elapsed = time.monotonic() - t0
                 models  = await get_models()
                 ok      = sum(1 for x in results if x["ok"])
+                # Also check queue depth
+                q = "?"
+                try:
+                    async with httpx.AsyncClient(timeout=2.0) as c2:
+                        m = await c2.get("http://localhost:8000/metrics")
+                        for line in m.text.splitlines():
+                            if "num_requests_waiting" in line and not line.startswith("#"):
+                                q = line.split()[-1]
+                except Exception:
+                    pass
                 print(f"  [{elapsed:5.1f}s] {done:3d}/{TOTAL}  "
-                      f"({ok} ok)  models={models}")
+                      f"({ok} ok)  queue={q}  models={models}")
 
     await asyncio.gather(*[bounded(i) for i in range(TOTAL)])
 
-    elapsed     = time.monotonic() - t0
+    elapsed      = time.monotonic() - t0
     models_after = await get_models()
     ok           = [r for r in results if r["ok"]]
     failed       = [r for r in results if not r["ok"]]
@@ -115,25 +137,30 @@ async def flood_phase() -> None:
         print(f"  P50={wall_ms[len(wall_ms)//2]}ms  "
               f"P95={wall_ms[int(len(wall_ms)*.95)]}ms  "
               f"mean={int(mean(wall_ms))}ms")
-    print(f"  Routing: {by_model}")
+    print(f"  Routing:       {by_model}")
     print(f"  Models before: {models_before}")
     print(f"  Models after:  {models_after}")
 
     new  = set(models_after) - set(models_before)
     gone = set(models_before) - set(models_after)
     if new:
-        print(f"\n  SCALE-UP: {new} was spun up!")
+        print(f"\n  SCALE-UP:   {new} spun up!")
     if gone:
-        print(f"\n  SCALE-DOWN: {gone} was spun down!")
+        print(f"\n  SCALE-DOWN: {gone} spun down!")
     if not new and not gone:
-        print(f"\n  No model changes yet.")
-        print(f"  Check provisioner log: tail -f ~/vllm_logs/provisioner.log")
-        print(f"  The new model may still be starting up (takes 2-5 min).")
+        print(f"\n  No model changes detected during flood.")
+        print(f"  The queue may not have built up to > 10.")
+        print(f"  Try: python provisioner/test_autoscale.py --concurrency 120 --total 800")
+        print(f"  Watch queue: watch -n2 'curl -s http://localhost:8000/metrics | grep waiting'")
 
     if failed:
+        errs: dict[str, int] = {}
+        for r in failed:
+            e = r.get("error", "?")[:60]
+            errs[e] = errs.get(e, 0) + 1
         print(f"\n  Errors ({len(failed)}):")
-        for r in failed[:3]:
-            print(f"    req {r['req_id']}: {r.get('error')}")
+        for e, n in sorted(errs.items(), key=lambda x: -x[1])[:3]:
+            print(f"    {n}x  {e}")
 
 
 async def idle_phase() -> None:
@@ -146,8 +173,8 @@ async def idle_phase() -> None:
     print(f"  Models now: {models_before}")
     print(f"  Waiting {IDLE_WAIT_S}s with no traffic...\n")
 
-    t0           = time.monotonic()
-    prev_models  = models_before
+    t0          = time.monotonic()
+    prev_models = models_before
 
     while time.monotonic() - t0 < IDLE_WAIT_S:
         await asyncio.sleep(10)
@@ -165,7 +192,8 @@ async def idle_phase() -> None:
     if len(models_after) < len(models_before):
         print(f"  SCALE-DOWN: {set(models_before) - set(models_after)} spun down!")
     else:
-        print(f"  No change — idle window may not have elapsed yet in provisioner.")
+        print(f"  Models unchanged.")
+        print(f"  The provisioner's IDLE_WINDOW_S=300 requires 5 min of no traffic.")
 
 
 async def main(phase: str) -> None:
@@ -199,12 +227,17 @@ if __name__ == "__main__":
     parser.add_argument("--router-url",  default=ROUTER_URL)
     parser.add_argument("--phase",       default="both",
                         choices=["both", "flood", "idle", "monitor"])
-    parser.add_argument("--concurrency", type=int, default=CONCURRENCY)
-    parser.add_argument("--total",       type=int, default=TOTAL)
+    parser.add_argument("--concurrency", type=int, default=CONCURRENCY,
+                        help="Concurrent requests (default 80)")
+    parser.add_argument("--total",       type=int, default=TOTAL,
+                        help="Total requests to send (default 500)")
+    parser.add_argument("--max-tokens",  type=int, default=MAX_TOKENS,
+                        help="Max tokens per response (default 800, longer=more queue)")
     args = parser.parse_args()
 
     ROUTER_URL  = args.router_url
     CONCURRENCY = args.concurrency
     TOTAL       = args.total
+    MAX_TOKENS  = args.max_tokens
 
     asyncio.run(main(args.phase))
