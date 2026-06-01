@@ -15,8 +15,10 @@ Queue overload (vLLM waiting > QUEUE_DEPTH_THRESHOLD):
   Accuracy borderline -> Horizontal scale (same model replica)
 
 Process health check (_check_dead_processes):
-  Runs every poll. Detects models killed externally (pkill, OOM, crash).
-  Releases their GPUs and removes from self.running so bootstrap can recover.
+  Runs every poll via HTTP GET /health (not PID signal).
+  vLLM spawns child processes; pkill kills workers but parent PID stays
+  alive as a zombie -- os.kill(pid,0) would see it as alive.
+  HTTP health check is definitive: no response = model is dead.
 
 TTCA-aware spin-up gate:
   Only spin up if E[TTCA] > TTCA_TARGET_MS AND improvement >= TTCA_MIN_IMPROVEMENT.
@@ -379,35 +381,47 @@ class DynamicProvisioner:
     # ── Process health check ──────────────────────────────────────────────────
 
     async def _check_dead_processes(self) -> None:
-        """Detect models whose vLLM process died unexpectedly (pkill, OOM, crash).
+        """Detect models that are dead or unresponsive via HTTP health check.
 
-        Without this check: when a process is killed externally, self.running still
-        contains the model so bootstrap never fires and GPUs are never freed.
+        Uses GET /health rather than os.kill(pid, 0) because:
+        - vLLM spawns multiple child processes
+        - pkill kills the workers but parent PID stays alive as zombie
+        - os.kill(pid, 0) sees zombie as alive → bootstrap never fires
+        - HTTP /health is definitive: no response = model is dead
 
-        Uses os.kill(pid, 0): signal 0 checks if process exists without sending
-        any actual signal. Raises ProcessLookupError if process is dead.
-
-        Runs at the start of every evaluate_and_act() poll cycle.
+        On detection: deregister from router, kill zombie, release GPUs.
+        Next poll cycle sees empty fleet → TRIGGER bootstrap.
         """
         for model_id, rm in list(self.running.items()):
+            base_url = f"http://localhost:{rm.spec.port}"
+            alive = False
             try:
-                os.kill(rm.pid, 0)  # 0 = existence check, no signal sent
-            except ProcessLookupError:
-                log.warning("DETECTED dead process: %s (pid=%d) -- cleaning up",
-                            model_id, rm.pid)
+                async with httpx.AsyncClient(timeout=5.0) as c:
+                    r = await c.get(f"{base_url}/health")
+                    alive = (r.status_code == 200)
+            except Exception:
+                alive = False
+
+            if not alive:
+                log.warning("DETECTED dead/unresponsive: %s (port=%d) -- cleaning up",
+                            model_id, rm.spec.port)
                 try:
                     await self._router_delete(f"/router/{model_id}")
                 except Exception:
                     pass
+                # Kill any remaining zombie process
+                try:
+                    os.kill(rm.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
                 self.gpu_pool.release(model_id)
                 del self.running[model_id]
-                log.warning("  Removed dead %s. Free GPUs: %d",
+                log.warning("  Removed %s. Free GPUs: %d",
                             model_id, self.gpu_pool.free_count())
 
     # ── Latency estimation ────────────────────────────────────────────────────
 
     def _estimate_latency_ms(self, model_id: str, output_tokens: int = 300) -> float:
-        """Estimate latency using best available source (3-source priority)."""
         import json
         try:
             rep_path = os.path.expanduser("~/semantic-llm-router/model_reputation.json")
@@ -419,14 +433,11 @@ class DynamicProvisioner:
                     return float(hist)
         except Exception:
             pass
-
         spec = MODEL_CATALOG.get(model_id)
         if spec and spec.expected_tokens_per_sec > 0:
             return output_tokens / spec.expected_tokens_per_sec * 1000
-
         gpus = spec.gpus_needed if spec else 1
-        tps  = ESTIMATED_TOKENS_PER_SEC.get(gpus, 1000.0)
-        return output_tokens / tps * 1000
+        return output_tokens / ESTIMATED_TOKENS_PER_SEC.get(gpus, 1000.0) * 1000
 
     # ── TTCA measurement and gate ─────────────────────────────────────────────
 
@@ -437,9 +448,8 @@ class DynamicProvisioner:
         samples    = rm.latency_samples
         total_lat  = sum(lat for lat, _ in samples)
         resolved_1 = sum(1 for _, att in samples if att == 1)
-        avg_lat    = total_lat / len(samples)
         res_rate   = resolved_1 / len(samples)
-        return float("inf") if res_rate < 0.01 else avg_lat / res_rate
+        return float("inf") if res_rate < 0.01 else (total_lat / len(samples)) / res_rate
 
     def _estimate_ttca_with_candidate(
         self, current_models: list[tuple[float, float]],
@@ -503,7 +513,7 @@ class DynamicProvisioner:
                 "efficiency_tokens_per_joule": spec.efficiency_tokens_per_joule,
                 "skip_calibration": True,
             })
-            log.info("  Refreshed router priors for %s", model_id)
+            log.info("  Refreshed priors for %s", model_id)
         except Exception as e:
             log.warning("  Failed: %s", e)
 
@@ -546,7 +556,7 @@ class DynamicProvisioner:
                 if (a := self._get_prior(mid, domain, complexity, all_priors))
                 and a >= MIN_ACCEPTABLE_ACCURACY and domain in rm2.spec.domains
             ]
-            cand_lat = self._estimate_latency_ms(best_spec.model_id)
+            cand_lat       = self._estimate_latency_ms(best_spec.model_id)
             current_e_ttca = next(
                 (t for mid in self.running
                  if (t := self._compute_effective_ttca(mid, all_priors)) is not None), None
@@ -559,7 +569,7 @@ class DynamicProvisioner:
 
         if better_running:
             best_spec, best_acc = better_running[0]
-            log.warning("  [Case 2 refresh] %s acc=%.3f already running for %s:%s",
+            log.warning("  [Case 2 refresh] %s acc=%.3f for %s:%s",
                         best_spec.model_id, best_acc, domain, complexity)
             await self._refresh_router_priors(best_spec.model_id, all_priors)
             return True
@@ -615,12 +625,8 @@ class DynamicProvisioner:
         log.warning("  Scale-out: no options (GPUs full)")
         return False
 
-    # ── Main policy loop ──────────────────────────────────────────────────────
-
     async def evaluate_and_act(self) -> None:
-        # Check for externally-killed processes first
-        # Without this, bootstrap never fires after pkill/OOM because
-        # self.running still contains the dead model entry.
+        # HTTP health check for dead/crashed models -- must run before anything else
         await self._check_dead_processes()
 
         reputation = await self._get_router_reputation()
