@@ -42,11 +42,16 @@ async def send_request(client: httpx.AsyncClient, req_id: int) -> dict:
             f"{ROUTER_URL}/v1/chat/completions",
             json={
                 "model": "router",
+                # Use a factual:hard question — qwen-7b covers factual domain.
+                # Explicitly set domain/complexity to avoid misclassification
+                # (e.g. "machine learning" gets classified as code/math, not factual).
                 "messages": [{"role": "user",
-                               "content": "Explain machine learning in detail with examples."}],
+                               "content": "Explain the causes and long-term consequences of World War II in detail."}],
                 "max_tokens": MAX_TOKENS,
                 "extra_body": {"router": {"user_id": f"tester-{req_id % 5}",
-                                          "mode": "accuracy"}},
+                                          "mode": "accuracy",
+                                          "domain": "factual",
+                                          "complexity": "hard"}},
             },
         )
         wall_ms = int((time.monotonic() - t0) * 1000)
@@ -69,22 +74,23 @@ async def send_request(client: httpx.AsyncClient, req_id: int) -> dict:
 async def flood_phase() -> None:
     print(f"\n{'='*60}")
     print(f"  PHASE 1: FLOOD  ({TOTAL} requests, concurrency={CONCURRENCY})")
-    print(f"  Max tokens: {MAX_TOKENS} per request (longer = more GPU time)")
+    print(f"  Domain: factual:hard (qwen-7b's domain)")
+    print(f"  Max tokens: {MAX_TOKENS} per request")
     print(f"  Goal: queue > 10 -> provisioner spins up a new model")
     print(f"{'='*60}")
 
     models_before = await get_models()
     print(f"  Models before: {models_before}")
 
-    # Check queue depth before flood
-    try:
-        async with httpx.AsyncClient(timeout=3.0) as c:
-            r = await c.get("http://localhost:8000/metrics")
-            for line in r.text.splitlines():
-                if "num_requests_waiting" in line and not line.startswith("#"):
-                    print(f"  Queue depth before: {line.split()[-1]}")
-    except Exception:
-        pass
+    # Verify a single request works before flooding
+    print(f"  Testing single request...")
+    async with httpx.AsyncClient(timeout=60.0) as c:
+        test = await send_request(c, -1)
+    if not test["ok"]:
+        print(f"  ERROR: single request failed with {test.get('error')}")
+        print(f"  Fix the router/model before running flood.")
+        return
+    print(f"  Single request OK -> model={test['model']} latency={test['latency_ms']}ms")
 
     print(f"\n  Sending {TOTAL} requests...\n")
 
@@ -104,7 +110,6 @@ async def flood_phase() -> None:
                 elapsed = time.monotonic() - t0
                 models  = await get_models()
                 ok      = sum(1 for x in results if x["ok"])
-                # Also check queue depth
                 q = "?"
                 try:
                     async with httpx.AsyncClient(timeout=2.0) as c2:
@@ -148,10 +153,9 @@ async def flood_phase() -> None:
     if gone:
         print(f"\n  SCALE-DOWN: {gone} spun down!")
     if not new and not gone:
-        print(f"\n  No model changes detected during flood.")
-        print(f"  The queue may not have built up to > 10.")
-        print(f"  Try: python provisioner/test_autoscale.py --concurrency 120 --total 800")
-        print(f"  Watch queue: watch -n2 'curl -s http://localhost:8000/metrics | grep waiting'")
+        print(f"\n  No model changes yet.")
+        print(f"  New model may still be starting up (2-5 min).")
+        print(f"  Check: tail -f ~/vllm_logs/provisioner.log")
 
     if failed:
         errs: dict[str, int] = {}
@@ -192,8 +196,7 @@ async def idle_phase() -> None:
     if len(models_after) < len(models_before):
         print(f"  SCALE-DOWN: {set(models_before) - set(models_after)} spun down!")
     else:
-        print(f"  Models unchanged.")
-        print(f"  The provisioner's IDLE_WINDOW_S=300 requires 5 min of no traffic.")
+        print(f"  Models unchanged (IDLE_WINDOW_S=300, need 5 min of no traffic).")
 
 
 async def main(phase: str) -> None:
@@ -227,12 +230,9 @@ if __name__ == "__main__":
     parser.add_argument("--router-url",  default=ROUTER_URL)
     parser.add_argument("--phase",       default="both",
                         choices=["both", "flood", "idle", "monitor"])
-    parser.add_argument("--concurrency", type=int, default=CONCURRENCY,
-                        help="Concurrent requests (default 80)")
-    parser.add_argument("--total",       type=int, default=TOTAL,
-                        help="Total requests to send (default 500)")
-    parser.add_argument("--max-tokens",  type=int, default=MAX_TOKENS,
-                        help="Max tokens per response (default 800, longer=more queue)")
+    parser.add_argument("--concurrency", type=int, default=CONCURRENCY)
+    parser.add_argument("--total",       type=int, default=TOTAL)
+    parser.add_argument("--max-tokens",  type=int, default=MAX_TOKENS)
     args = parser.parse_args()
 
     ROUTER_URL  = args.router_url
