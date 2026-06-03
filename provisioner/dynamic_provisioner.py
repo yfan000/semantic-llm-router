@@ -14,18 +14,26 @@ Spin-down triggers:
   - Model idle (< MIN_REQUESTS_TO_STAY) in last IDLE_WINDOW_S seconds
   - All domains covered by a better model already running
 
+Static mode (--static):
+  - All initial models spin up at startup
+  - No further spin-up or spin-down decisions
+  - Poll loop only checks for dead processes and restarts them
+  - Router handles all routing decisions
+
 GPU pool: tracks which GPUs are free on this node.
 
 Usage:
-    # Start with a minimal set (or none) and let provisioner add more
-    python provisioner/dynamic_provisioner.py \
-        --router-url http://localhost:8080 \
-        --poll-interval 30
+    # Dynamic auto-scaling (default)
+    python provisioner/dynamic_provisioner.py \\
+        --router-url http://localhost:8080 \\
+        --initial-models qwen-7b
 
-    # Or start with initial models already running
-    python provisioner/dynamic_provisioner.py \
-        --router-url http://localhost:8080 \
-        --initial-models qwen-7b,qwen-14b
+    # Static: all models fixed, routing only
+    python provisioner/dynamic_provisioner.py \\
+        --router-url http://localhost:8080 \\
+        --router-mode ttca \\
+        --static \\
+        --initial-models qwen-7b,qwen-14b,deepseek-r1-7b,coder-32b,deepseek-v2-lite
 """
 from __future__ import annotations
 
@@ -508,14 +516,9 @@ class DynamicProvisioner:
 
             reqs_in_window = rm.requests_in_window(IDLE_WINDOW_S)
             if reqs_in_window < MIN_REQUESTS_TO_STAY:
-                # A base model must not be spun down while its replica is still
-                # active. The replica (scale-out helper) always spins down first
-                # when load drops, then the base model can be reconsidered.
                 if f"{model_id}-replica" in self.running:
                     log.debug("Skipping idle check for %s: replica still active", model_id)
                 else:
-                    # Exclude own replicas from domain-coverage so a replica can
-                    # never be the sole reason a base model is considered covered.
                     covered = all(
                         any(oid != model_id
                             and not oid.startswith(f"{model_id}-")
@@ -589,7 +592,8 @@ class DynamicProvisioner:
 
     def _get_prior(self, model_id: str, domain: str, complexity: str,
                    all_priors: dict) -> float | None:
-        priors = all_priors.get(model_id, {})
+        priors = all_priors.get(model_id, {})\
+
         return priors.get(f"{domain}:{complexity}") or priors.get(domain)
 
     def _candidates_not_running(self) -> list[ModelSpec]:
@@ -830,11 +834,17 @@ class DynamicProvisioner:
         log.warning("  Scale-out: no options (GPUs full)")
         return False
 
-    async def run(self, initial_models: list[str] | None = None) -> None:
+    async def run(
+        self,
+        initial_models: list[str] | None = None,
+        static: bool = False,
+    ) -> None:
         log.info("Dynamic Provisioner starting")
         log.info("GPU pool: %s", self.gpu_pool)
         log.info("Router:   %s", self.router_url)
         log.info("Poll interval: %ds", int(self.poll_interval))
+        if static:
+            log.info("Mode: STATIC — auto-scaling disabled, models fixed after startup")
 
         for model_id in (initial_models or []):
             if model_id in MODEL_CATALOG:
@@ -849,9 +859,13 @@ class DynamicProvisioner:
 
         while True:
             try:
-                log.info("--- Evaluating metrics (%d models running, %d GPUs free) ---",
+                log.info("--- Poll: %d models running, %d GPUs free ---",
                          len(self.running), self.gpu_pool.free_count())
-                await self.evaluate_and_act()
+                if static:
+                    # Static mode: only check for dead processes, no scale decisions.
+                    await self._check_dead_processes()
+                else:
+                    await self.evaluate_and_act()
             except Exception as e:
                 log.error("Provisioner loop error: %s", e)
             await asyncio.sleep(self.poll_interval)
@@ -872,6 +886,9 @@ def main() -> None:
                         choices=["accuracy", "ttca", "cost"])
     parser.add_argument("--initial-models",  default="",
                         help="Comma-separated list of model IDs to start immediately")
+    parser.add_argument("--static", action="store_true",
+                        help="Disable auto-scaling: spin up initial models and only route, "
+                             "no further spin-up or spin-down decisions")
     args = parser.parse_args()
 
     global ROUTER_MODE
@@ -889,7 +906,7 @@ def main() -> None:
 
     async def _run():
         try:
-            await provisioner.run(initial_models=initial)
+            await provisioner.run(initial_models=initial, static=args.static)
         except KeyboardInterrupt:
             pass
         finally:
