@@ -1,8 +1,8 @@
 """
-eval_all_models.py -- Pre-evaluation matrix.
+eval_all_models.py — Pre-evaluation matrix.
 
 Runs every request in the dataset through ALL model backends before testing.
-Produces eval_matrix.csv with one row per (request x model) pair, containing:
+Produces eval_matrix.csv with one row per (request × model), containing:
   - actual wall_ms for each model on each request
   - accuracy score and is_correct flag
 
@@ -35,17 +35,13 @@ import tempfile
 import time
 from collections import defaultdict
 from pathlib import Path
+from statistics import mean, median
 
 import httpx
 
 
 # ---------------------------------------------------------------------------
-# Model backends -- must match what is registered with the router
-# Sophia 4-model setup:
-#   GPU 0       -> Qwen2.5-7B-Instruct          (port 8000)
-#   GPU 1,2     -> Qwen2.5-14B-Instruct         (port 8001)
-#   GPU 3       -> DeepSeek-R1-Distill-Qwen-7B  (port 8002)
-#   GPU 4,5,6,7 -> Qwen2.5-Coder-32B-Instruct  (port 8003)
+# Model backends — must match what is registered with the router
 # ---------------------------------------------------------------------------
 
 BACKENDS: list[dict] = [
@@ -68,6 +64,11 @@ BACKENDS: list[dict] = [
         "model_id":   "coder-32b",
         "model_name": "Qwen/Qwen2.5-Coder-32B-Instruct",
         "base_url":   "http://localhost:8003",
+    },
+    {
+        "model_id":   "deepseek-v2-lite",
+        "model_name": "deepseek-ai/DeepSeek-V2-Lite",
+        "base_url":   "http://localhost:8005",
     },
 ]
 
@@ -101,13 +102,13 @@ def _score_code(response: str, gt: str):
     except SyntaxError:
         return 0.0
     if "assert" not in str(gt) and "==" not in str(gt):
-        return 0.5  # syntax ok but no test to run
+        return 0.5
     with tempfile.NamedTemporaryFile(suffix=".py", mode="w", delete=False) as f:
         f.write(code + "\n" + str(gt))
         fname = f.name
     try:
         r = subprocess.run([sys.executable, fname], timeout=5, capture_output=True)
-        return 1.0 if r.returncode == 0 else 0.0  # all-or-nothing
+        return 1.0 if r.returncode == 0 else 0.0
     except Exception:
         return 0.0
 
@@ -120,7 +121,7 @@ def _score_keyword(response: str, gt: str):
         return None
     hits = sum(1 for w in words if w in response.lower())
     overlap = hits / len(words)
-    return 1.0 if overlap >= 1.0 else overlap  # 100% keyword match required
+    return 1.0 if overlap >= 1.0 else overlap
 
 
 _SCORERS = {
@@ -215,7 +216,7 @@ async def run(dataset_path: str, output: str, concurrency: int) -> None:
 
     print(f"\n  Pre-evaluation: {n_req} requests x {n_mod} models = {n_total} calls")
     print(f"  Models      : {', '.join(b['model_id'] for b in BACKENDS)}")
-    print(f"  Concurrency : {concurrency}  (simultaneous calls across all models)")
+    print(f"  Concurrency : {concurrency}  (total simultaneous calls)")
     print(f"  Output      : {output}\n")
 
     fieldnames = [
@@ -259,9 +260,9 @@ async def run(dataset_path: str, output: str, concurrency: int) -> None:
     ok       = [r for r in rows if str(r.get("status")) == "200"]
     scorable = [r for r in ok   if r.get("is_correct") in ("true", "false")]
 
-    print(f"  Calls      : {n_total}")
-    print(f"  Successful : {len(ok)}")
-    print(f"  Scorable   : {len(scorable)}")
+    print(f"  Calls       : {n_total}")
+    print(f"  Successful  : {len(ok)}")
+    print(f"  Scorable    : {len(scorable)}")
 
     by_model: dict[str, list[bool]] = defaultdict(list)
     for r in scorable:
@@ -295,25 +296,14 @@ async def run(dataset_path: str, output: str, concurrency: int) -> None:
         print()
 
     print(f"\n  Saved: {output}")
-    print(f"\n  Next steps:")
-    print(f"    python tests/extract_priors.py --eval-matrix {output} --output results/priors.json")
-    print(f"    python tests/register_with_priors.py --priors results/priors.json")
-    print(f"    python tests/load_test.py --dataset {dataset_path} --mode accuracy \\")
-    print(f"        --output results/router_accuracy.csv")
-    print(f"    python tests/round_robin_test.py --dataset {dataset_path} \\")
-    print(f"        --output results/rr_baseline.csv")
-    print(f"    python tests/compare_ttca.py \\")
-    print(f"        --router results/router_accuracy.csv \\")
-    print(f"        --baseline results/rr_baseline.csv \\")
-    print(f"        --eval-matrix {output}\n")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset",     required=True, help="Dataset JSON from build_dataset.py")
+    parser.add_argument("--dataset",     required=True)
     parser.add_argument("--output",      default="results/eval_matrix.csv")
     parser.add_argument("--concurrency", type=int, default=10,
-                        help="Max simultaneous calls across all models combined")
+                        help="Max simultaneous calls across all models")
     args = parser.parse_args()
     asyncio.run(run(args.dataset, args.output, args.concurrency))
 

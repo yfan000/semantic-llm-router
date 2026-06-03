@@ -1,5 +1,5 @@
 """
-register_with_priors.py -- Re-register all models with accurate accuracy priors
+register_with_priors.py — Re-register all models with accurate accuracy priors
 extracted from eval_matrix.csv by extract_priors.py.
 
 This replaces the initial static guesses with real observed accuracy,
@@ -26,7 +26,7 @@ import httpx
 
 
 # ---------------------------------------------------------------------------
-# Model definitions -- edit to match your Sophia setup
+# Model definitions — edit to match your Sophia setup
 # ---------------------------------------------------------------------------
 MODELS = [
     {
@@ -76,6 +76,18 @@ MODELS = [
             "reasoning": 0.88,
         },
     },
+    {
+        "model_id":   "deepseek-v2-lite",
+        "model_name": "deepseek-ai/DeepSeek-V2-Lite",
+        "backend":    "vllm",
+        "base_url":   "http://localhost:8005",
+        "domains":    ["factual", "reasoning", "math"],
+        "min_accuracy_capability": {
+            "factual":   0.75,
+            "reasoning": 0.78,
+            "math":      0.80,
+        },
+    },
 ]
 
 
@@ -86,7 +98,6 @@ def register_all(priors_path: str, router_url: str) -> None:
     print(f"\nRegistering {len(MODELS)} models with accurate priors from {priors_path}\n")
 
     with httpx.Client(timeout=30.0) as client:
-        # Deregister existing models first for a clean slate
         for model in MODELS:
             mid = model["model_id"]
             try:
@@ -98,7 +109,6 @@ def register_all(priors_path: str, router_url: str) -> None:
 
         print()
 
-        # Re-register with accurate priors
         for model in MODELS:
             mid    = model["model_id"]
             priors = all_priors.get(mid, {})
@@ -121,12 +131,12 @@ def register_all(priors_path: str, router_url: str) -> None:
 
             if r.status_code == 201:
                 stored = r.json().get("accuracy_priors_stored", {})
-                print(f"  Registered: {mid}")
+                print(f"  ✓ Registered: {mid}")
                 print(f"    Priors stored: {len(stored)} keys")
                 for key, val in sorted(stored.items()):
                     print(f"      {key:<30} {val:.4f}")
             else:
-                print(f"  Failed to register {mid}: {r.status_code} {r.text}")
+                print(f"  ✗ Failed to register {mid}: {r.status_code} {r.text}")
 
             print()
 
@@ -137,10 +147,8 @@ def register_all(priors_path: str, router_url: str) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--priors",     required=True,
-                        help="Path to priors.json from extract_priors.py")
-    parser.add_argument("--router-url", default="http://localhost:8080",
-                        help="Router base URL (default: http://localhost:8080)")
+    parser.add_argument("--priors",     required=True)
+    parser.add_argument("--router-url", default="http://localhost:8080")
     args = parser.parse_args()
     register_all(args.priors, args.router_url)
 
