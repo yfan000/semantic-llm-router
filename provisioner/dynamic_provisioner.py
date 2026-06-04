@@ -142,7 +142,7 @@ MODEL_CATALOG: dict[str, ModelSpec] = {
         min_accuracy_capability={"code": 0.90, "math": 0.88, "reasoning": 0.88},
         efficiency_tokens_per_joule=4.0,
         expected_tokens_per_sec=700.0,    # ~700 tok/s on 2 A100s (bf16, tp=2)
-        max_model_len=4096,               # caps KV cache to fit in 2×40GB
+        max_model_len=4096,               # caps KV cache to fit in 2x40GB
     ),
     "qwen-32b": ModelSpec(
         model_id="qwen-32b", model_name="Qwen/Qwen2.5-32B-Instruct",
@@ -151,25 +151,25 @@ MODEL_CATALOG: dict[str, ModelSpec] = {
         min_accuracy_capability={"_default": 0.85},
         efficiency_tokens_per_joule=4.0,
         expected_tokens_per_sec=650.0,    # ~650 tok/s on 2 A100s (bf16, tp=2)
-        max_model_len=4096,               # caps KV cache to fit in 2×40GB
+        max_model_len=4096,               # caps KV cache to fit in 2x40GB
     ),
     "deepseek-v2-lite": ModelSpec(
         model_id="deepseek-v2-lite", model_name="deepseek-ai/DeepSeek-V2-Lite",
         gpus_needed=1, port=8005,
-        domains=["factual", "reasoning", "math"], accuracy_tier=2,
-        min_accuracy_capability={"factual": 0.75, "reasoning": 0.78, "math": 0.80},
+        domains=["factual", "reasoning"], accuracy_tier=2,
+        min_accuracy_capability={"factual": 0.65, "reasoning": 0.65},
         efficiency_tokens_per_joule=11.0,
-        expected_tokens_per_sec=2000.0,   # MoE: only 2.4B active params → fast
+        expected_tokens_per_sec=2000.0,   # MoE: only 2.4B active params -> fast
         extra_vllm_args=["--trust-remote-code"],
     ),
 }
 
-# UPGRADE_PATH: for accuracy problems — ordered by tier ascending (small → large)
+# UPGRADE_PATH: for accuracy problems — ordered by tier ascending (small -> large)
 # Use when accuracy < threshold: spin up next higher-tier model
 UPGRADE_PATH: dict[str, list[str]] = {
     "factual":   ["qwen-7b", "deepseek-v2-lite", "qwen-14b", "qwen-32b"],
     "reasoning": ["qwen-7b", "deepseek-v2-lite", "qwen-14b", "deepseek-r1-7b", "qwen-32b"],
-    "math":      ["deepseek-v2-lite", "deepseek-r1-7b", "coder-32b"],
+    "math":      ["deepseek-r1-7b", "coder-32b"],
     "code":      ["coder-32b"],
     "creative":  ["qwen-7b", "qwen-14b", "qwen-32b"],
 }
@@ -183,9 +183,9 @@ MIN_ACCEPTABLE_ACCURACY: float = 0.60
 HIGH_ACCURACY_THRESHOLD: float = 0.85
 
 # Router mode: provisioner picks candidates differently per mode.
-#   accuracy → spin up MOST ACCURATE model above floor
-#   ttca     → spin up FASTEST model above floor (lowest lat/acc ratio)
-#   cost     → spin up SMALLEST model (fewest GPUs) above floor
+#   accuracy -> spin up MOST ACCURATE model above floor
+#   ttca     -> spin up FASTEST model above floor (lowest lat/acc ratio)
+#   cost     -> spin up SMALLEST model (fewest GPUs) above floor
 ROUTER_MODE: str = "accuracy"
 
 # Estimated tokens/sec per GPU count — used to estimate latency for
@@ -364,7 +364,9 @@ class DynamicProvisioner:
         if model_id in self.running:
             log.info("spin_up skipped: %s already running", model_id)
             return True
-        if self._in_cooldown():
+        # Bypass cooldown for initial startup so all models spin up sequentially
+        # without blocking each other. Cooldown only applies to reactive scale events.
+        if reason != "initial" and self._in_cooldown():
             log.info("spin_up skipped: in cooldown (%ds remaining)",
                      int(COOLDOWN_S - (time.monotonic() - self._last_action_time)))
             return False
@@ -420,7 +422,7 @@ class DynamicProvisioner:
             except Exception:
                 pass
         else:
-            log.error("  %s failed to start within %ds — spinning down", model_id, STARTUP_WAIT_S)
+            log.error("  %s failed to start within %ds -- spinning down", model_id, STARTUP_WAIT_S)
             await self.spin_down(model_id, reason="startup_timeout")
             return False
 
@@ -592,8 +594,7 @@ class DynamicProvisioner:
 
     def _get_prior(self, model_id: str, domain: str, complexity: str,
                    all_priors: dict) -> float | None:
-        priors = all_priors.get(model_id, {})\
-
+        priors = all_priors.get(model_id, {})
         return priors.get(f"{domain}:{complexity}") or priors.get(domain)
 
     def _candidates_not_running(self) -> list[ModelSpec]:
@@ -650,16 +651,16 @@ class DynamicProvisioner:
         if current_e_ttca is None:
             return True
         if current_e_ttca <= TTCA_TARGET_MS:
-            log.info("  TTCA gate: current E[TTCA]=%.0fms <= target %.0fms — skip spin-up",
+            log.info("  TTCA gate: current E[TTCA]=%.0fms <= target %.0fms -- skip spin-up",
                      current_e_ttca, TTCA_TARGET_MS)
             return False
         new_e_ttca   = self._estimate_ttca_with_candidate(current_models, candidate_lat, candidate_acc)
         improvement  = (current_e_ttca - new_e_ttca) / current_e_ttca
         if improvement < TTCA_MIN_IMPROVEMENT:
-            log.info("  TTCA gate: improvement=%.1f%% < %.0f%% min — marginal gain, skip",
+            log.info("  TTCA gate: improvement=%.1f%% < %.0f%% min -- marginal gain, skip",
                      improvement * 100, TTCA_MIN_IMPROVEMENT * 100)
             return False
-        log.info("  TTCA gate: improvement=%.1f%% (%.0fms → %.0fms) — spin up",
+        log.info("  TTCA gate: improvement=%.1f%% (%.0fms -> %.0fms) -- spin up",
                  improvement * 100, current_e_ttca, new_e_ttca)
         return True
 
@@ -844,7 +845,7 @@ class DynamicProvisioner:
         log.info("Router:   %s", self.router_url)
         log.info("Poll interval: %ds", int(self.poll_interval))
         if static:
-            log.info("Mode: STATIC — auto-scaling disabled, models fixed after startup")
+            log.info("Mode: STATIC -- auto-scaling disabled, models fixed after startup")
 
         for model_id in (initial_models or []):
             if model_id in MODEL_CATALOG:
@@ -852,8 +853,6 @@ class DynamicProvisioner:
             else:
                 log.warning("Unknown initial model: %s", model_id)
 
-        # Reset cooldown after initial models are ready so startup spin-up
-        # does not block reactive scale-out during the first poll window.
         self._last_action_time = 0.0
         log.info("Initial models ready. Cooldown reset -- reactive scaling enabled.")
 
@@ -862,7 +861,6 @@ class DynamicProvisioner:
                 log.info("--- Poll: %d models running, %d GPUs free ---",
                          len(self.running), self.gpu_pool.free_count())
                 if static:
-                    # Static mode: only check for dead processes, no scale decisions.
                     await self._check_dead_processes()
                 else:
                     await self.evaluate_and_act()
@@ -871,7 +869,7 @@ class DynamicProvisioner:
             await asyncio.sleep(self.poll_interval)
 
     async def shutdown(self) -> None:
-        log.info("Shutting down — stopping all models")
+        log.info("Shutting down -- stopping all models")
         for model_id in list(self.running.keys()):
             await self.spin_down(model_id, reason="shutdown")
 
