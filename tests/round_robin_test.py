@@ -187,8 +187,9 @@ async def send_request(
         resp = await client.post(
             f"{backend['base_url']}/v1/chat/completions",
             json={
-                "model":    backend.get("model_name", backend["model_id"]),
-                "messages": [{"role": "user", "content": item["query"]}],
+                "model":      backend.get("model_name", backend["model_id"]),
+                "messages":   [{"role": "user", "content": item["query"]}],
+                "max_tokens": 512,
             },
         )
         wall_ms = int((time.monotonic() - t0) * 1000)
