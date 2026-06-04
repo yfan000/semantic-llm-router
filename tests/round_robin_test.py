@@ -264,7 +264,9 @@ async def run(
     async def bounded(req_id: int, item: dict, backend: dict, writer, f) -> None:
         nonlocal done
         async with sem:
-            async with httpx.AsyncClient(timeout=120.0) as client:
+            # trust_env=False bypasses system proxy settings that can block
+            # cross-node requests (e.g. sophia-gpu-07) on HPC clusters.
+            async with httpx.AsyncClient(timeout=120.0, trust_env=False) as client:
                 r = await send_request(client, req_id, item, backend)
             results.append(r)
             writer.writerow(r)
