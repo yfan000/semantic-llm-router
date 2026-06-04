@@ -6,7 +6,7 @@ Produces a CSV in the same format as load_test.py so compare_results.py
 can compare side by side.
 
 Usage:
-    # Round-robin across all 4 models
+    # Round-robin across all models
     python tests/round_robin_test.py \
         --dataset datasets/hf_1000.json \
         --output results/round_robin.csv \
@@ -52,7 +52,7 @@ LATENCY_SLO_MS: dict[tuple[str, str], int] = {
 }
 
 # ---------------------------------------------------------------------------
-# Backend configuration -- Sophia 4-model setup
+# Backend configuration -- Sophia 6-model setup (2 nodes)
 # ---------------------------------------------------------------------------
 
 BACKENDS = [
@@ -84,6 +84,22 @@ BACKENDS = [
         "model_id":                    "coder-32b",
         "model_name":                  "Qwen/Qwen2.5-Coder-32B-Instruct",
         "base_url":                    "http://localhost:8003",
+        "input_rate_usd_per_token":    0.0000010,
+        "output_rate_usd_per_token":   0.0000020,
+        "efficiency_tokens_per_joule": 4.0,
+    },
+    {
+        "model_id":                    "deepseek-v2-lite",
+        "model_name":                  "deepseek-ai/DeepSeek-V2-Lite",
+        "base_url":                    "http://localhost:8005",
+        "input_rate_usd_per_token":    0.0000003,
+        "output_rate_usd_per_token":   0.0000006,
+        "efficiency_tokens_per_joule": 11.0,
+    },
+    {
+        "model_id":                    "qwen-32b",
+        "model_name":                  "Qwen/Qwen2.5-32B-Instruct",
+        "base_url":                    "http://sophia-gpu-07:8004",
         "input_rate_usd_per_token":    0.0000010,
         "output_rate_usd_per_token":   0.0000020,
         "efficiency_tokens_per_joule": 4.0,
