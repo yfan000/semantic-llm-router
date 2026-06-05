@@ -83,9 +83,9 @@ wait_models() {
     echo "WARNING: Only $N/$EXPECTED models after 60 min -- continuing anyway"
 }
 
-# -- [1/8] Router -------------------------------------------------------------
+# -- [1/10] Router ------------------------------------------------------------
 echo ""
-echo "[1/8] Starting router on $NODE1..."
+echo "[1/10] Starting router on $NODE1..."
 nohup uvicorn semantic_router.main:app \
     --host 0.0.0.0 --port "$ROUTER_PORT" \
     > "$LOG_DIR/router.log" 2>&1 &
@@ -93,9 +93,9 @@ echo "  PID: $!  log: $LOG_DIR/router.log"
 sleep 5
 wait_router
 
-# -- [2/8] Node 1 provisioner -------------------------------------------------
+# -- [2/10] Node 1 provisioner ------------------------------------------------
 echo ""
-echo "[2/8] Starting provisioner on $NODE1 (5 models)..."
+echo "[2/10] Starting provisioner on $NODE1 (5 models)..."
 nohup python provisioner/dynamic_provisioner.py \
     --router-url   "$ROUTER_URL" \
     --node-host    "$NODE1" \
@@ -106,9 +106,9 @@ nohup python provisioner/dynamic_provisioner.py \
     > "$LOG_DIR/provisioner_node1.log" 2>&1 &
 echo "  PID: $!  log: $LOG_DIR/provisioner_node1.log"
 
-# -- [3/8] Node 2 provisioner (llama4-scout) ----------------------------------
+# -- [3/10] Node 2 provisioner (llama4-scout, 8 GPUs) ------------------------
 echo ""
-echo "[3/8] Starting provisioner on $NODE2 (llama4-scout, 8 GPUs)..."
+echo "[3/10] Starting provisioner on $NODE2 (llama4-scout, 8 GPUs)..."
 # shellcheck disable=SC2029
 ssh "$NODE2" "cd ~/semantic-llm-router && \
     export HF_HOME=/eagle/UIC-HPC/yuping/hf_cache && \
@@ -122,53 +122,63 @@ ssh "$NODE2" "cd ~/semantic-llm-router && \
         > '$LOG_DIR/provisioner_node2.log' 2>&1 & echo PID:\$!"
 echo "  log: $LOG_DIR/provisioner_node2.log (on $NODE2)"
 
-# -- [4/8] Wait for all 6 models + register ----------------------------------
+# -- [4/10] Wait for all 6 models + seed with placeholder priors -------------
 echo ""
-echo "[4/8] Waiting for all 6 models..."
+echo "[4/10] Waiting for all 6 models..."
 wait_models 6
 
-echo "  Registering node-1 models with priors..."
+echo "  Seeding models with placeholder priors (will be replaced after eval)..."
 python tests/register_with_priors.py \
     --priors     "$PRIORS_FILE" \
     --router-url "$ROUTER_URL" \
     --node2-host "$NODE2"
 
-echo "  Registering llama4-scout (node 2) with estimated priors..."
-curl --noproxy '*' -sf -X POST "$ROUTER_URL/router/register" \
-  -H "Content-Type: application/json" \
-  -d "{
-    \"model_id\": \"llama4-scout\",
-    \"model_name\": \"meta-llama/Llama-4-Scout-17B-16E-Instruct\",
-    \"backend\": \"vllm\",
-    \"base_url\": \"http://$NODE2:8005\",
-    \"domains\": [\"factual\",\"reasoning\",\"creative\",\"math\",\"code\"],
-    \"min_accuracy_capability\": {\"_default\": 0.88},
-    \"accuracy_priors\": {
-      \"factual:easy\": 0.97, \"factual:medium\": 0.96, \"factual:hard\": 0.94,
-      \"reasoning:easy\": 0.98, \"reasoning:hard\": 0.96,
-      \"math:easy\": 0.95, \"math:medium\": 0.93, \"math:hard\": 0.88,
-      \"code:easy\": 0.96, \"code:medium\": 0.93, \"code:hard\": 0.88,
-      \"creative:easy\": 0.95, \"creative:medium\": 0.93, \"creative:hard\": 0.91
-    },
-    \"skip_calibration\": true
-  }" > /dev/null
-
-echo "  Final model list:"
+echo "  Model list:"
 curl --noproxy '*' -sf "$ROUTER_URL/v1/models" \
     | python3 -c "import sys,json; [print(f'    {m[\"id\"]}') for m in json.load(sys.stdin)['data']]"
 
-# -- [5/8] Eval matrix -------------------------------------------------------
+# -- [5/10] Eval matrix: send all queries to all 6 models --------------------
+# This step collects ground truth correctness for every (query, model) pair.
+# Ground truth comes from datasets/hf_1000.json (HuggingFace benchmarks).
 echo ""
-echo "[5/8] Building eval matrix (6 models x 1000 queries, ~30-45 min)..."
+echo "[5/10] Building eval matrix (6 models x 1000 queries, ~30-45 min)..."
+echo "  Ground truth is in $DATASET — no manual labelling needed."
 python tests/eval_all_models.py \
     --dataset     "$DATASET" \
     --output      "$RESULTS_DIR/eval_matrix.csv" \
     --concurrency "$EVAL_CONCURRENCY" \
     --node2-host  "$NODE2"
 
-# -- [6/8] TTCA load test ----------------------------------------------------
+# -- [6/10] Extract real accuracy priors from eval matrix --------------------
 echo ""
-echo "[6/8] TTCA router load test (${N_REQUESTS} requests)..."
+echo "[6/10] Extracting real accuracy priors from eval results..."
+python tests/extract_priors.py \
+    --eval-matrix "$RESULTS_DIR/eval_matrix.csv" \
+    --output      "$RESULTS_DIR/priors_new.json"
+
+echo "  Measured accuracy per model:"
+python3 -c "
+import json
+p = json.load(open('$RESULTS_DIR/priors_new.json'))
+for model, priors in sorted(p.items()):
+    if not priors: continue
+    keys = sorted(priors.keys())
+    avg  = sum(priors.values()) / len(priors)
+    print(f'    {model:<24} {len(priors):2} keys  avg={avg:.3f}')
+"
+
+# -- [7/10] Re-register all models with real measured priors -----------------
+echo ""
+echo "[7/10] Re-registering all models with real accuracy priors..."
+python tests/register_with_priors.py \
+    --priors     "$RESULTS_DIR/priors_new.json" \
+    --router-url "$ROUTER_URL" \
+    --node2-host "$NODE2"
+echo "  Router now uses measured accuracy — routing decisions are calibrated."
+
+# -- [8/10] TTCA load test ----------------------------------------------------
+echo ""
+echo "[8/10] TTCA router load test (${N_REQUESTS} requests, real priors active)..."
 python tests/load_test.py \
     --dataset     "$DATASET" \
     --router      "$ROUTER_URL" \
@@ -177,9 +187,9 @@ python tests/load_test.py \
     --concurrency "$CONCURRENCY" \
     --output      "$RESULTS_DIR/router_ttca.csv"
 
-# -- [7/8] Accuracy load test ------------------------------------------------
+# -- [9/10] Accuracy load test ------------------------------------------------
 echo ""
-echo "[7/8] Accuracy router load test (${N_REQUESTS} requests)..."
+echo "[9/10] Accuracy router load test (${N_REQUESTS} requests)..."
 python tests/load_test.py \
     --dataset     "$DATASET" \
     --router      "$ROUTER_URL" \
@@ -188,9 +198,9 @@ python tests/load_test.py \
     --concurrency "$CONCURRENCY" \
     --output      "$RESULTS_DIR/router_accuracy.csv"
 
-# -- [8/8] Round-robin baseline + compare ------------------------------------
+# -- [10/10] Round-robin baseline + comparisons -------------------------------
 echo ""
-echo "[8/8] Round-robin baseline (${N_REQUESTS} requests)..."
+echo "[10/10] Round-robin baseline (${N_REQUESTS} requests)..."
 python tests/round_robin_test.py \
     --dataset     "$DATASET" \
     --output      "$RESULTS_DIR/rr_baseline.csv" \
@@ -221,16 +231,17 @@ python tests/compare_ttca.py \
     --eval-matrix "$RESULTS_DIR/eval_matrix.csv" \
     | tee -a "$RESULTS_DIR/compare_ttca_vs_accuracy.txt"
 
-# -- Done --------------------------------------------------------------------
+# -- Done ---------------------------------------------------------------------
 echo ""
 echo "=================================================================="
 echo "  Experiment complete!  $(date)"
 echo "  Results in: $RESULTS_DIR/"
-echo "    eval_matrix.csv            (ground truth for scoring)"
-echo "    router_ttca.csv            (TTCA router results)"
-echo "    router_accuracy.csv        (accuracy router results)"
-echo "    rr_baseline.csv            (round-robin baseline)"
-echo "    compare_ttca_vs_rr.txt     (TTCA router vs baseline)"
-echo "    compare_accuracy_vs_rr.txt (accuracy router vs baseline)"
+echo "    eval_matrix.csv              (ground truth correctness)"
+echo "    priors_new.json              (real measured accuracy priors)"
+echo "    router_ttca.csv              (TTCA router results)"
+echo "    router_accuracy.csv          (accuracy router results)"
+echo "    rr_baseline.csv              (round-robin baseline)"
+echo "    compare_ttca_vs_rr.txt       (TTCA router vs baseline)"
+echo "    compare_accuracy_vs_rr.txt   (accuracy router vs baseline)"
 echo "    compare_ttca_vs_accuracy.txt (TTCA vs accuracy)"
 echo "=================================================================="
