@@ -29,8 +29,8 @@ Usage:
 
     # Multi-node: node 2 registers models with its own hostname
     python provisioner/dynamic_provisioner.py \
-        --router-url http://sophia-gpu-05:8080 \
-        --node-host sophia-gpu-06 \
+        --router-url http://sophia-gpu-04:8080 \
+        --node-host sophia-gpu-09 \
         --static \
         --initial-models qwen-32b
 """
@@ -70,7 +70,7 @@ RUNNING_THRESHOLD     = 20      # vLLM running requests before scale-up
 KV_CACHE_THRESHOLD    = 0.70    # KV cache usage (0-1) before scale-up
 LATENCY_SLO_MULTIPLIER = 2.0   # spin up if P90 > this * SLO
 ACCURACY_THRESHOLD    = 0.65   # spin up better model if accuracy below this
-STARTUP_WAIT_S        = 300     # max seconds to wait for a model to be ready
+STARTUP_WAIT_S        = 600     # max seconds to wait for a model to be ready (32B needs ~5-8 min)
 COOLDOWN_S            = 120     # seconds between spin-up/down actions (avoid thrashing)
 
 HF_HOME = "/eagle/UIC-HPC/yuping/hf_cache"
@@ -272,25 +272,28 @@ class DynamicProvisioner:
             ),
         }
 
+    # trust_env=False on all httpx clients bypasses system proxy settings
+    # on Sophia HPC that cause 502 Bad Gateway for cross-node requests.
+
     async def _router_get(self, path: str) -> dict:
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        async with httpx.AsyncClient(timeout=10.0, trust_env=False) as client:
             r = await client.get(f"{self.router_url}{path}")
             r.raise_for_status()
             return r.json()
 
     async def _router_post(self, path: str, body: dict) -> dict:
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        async with httpx.AsyncClient(timeout=10.0, trust_env=False) as client:
             r = await client.post(f"{self.router_url}{path}", json=body)
             r.raise_for_status()
             return r.json()
 
     async def _router_delete(self, path: str) -> None:
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        async with httpx.AsyncClient(timeout=10.0, trust_env=False) as client:
             await client.delete(f"{self.router_url}{path}")
 
     async def _vllm_overloaded(self, base_url: str) -> tuple[bool, str]:
         try:
-            async with httpx.AsyncClient(timeout=3.0) as client:
+            async with httpx.AsyncClient(timeout=3.0, trust_env=False) as client:
                 r = await client.get(f"{base_url}/metrics")
             metrics: dict[str, float] = {}
             for line in r.text.splitlines():
@@ -401,7 +404,7 @@ class DynamicProvisioner:
         while time.monotonic() < deadline:
             await asyncio.sleep(10)
             try:
-                async with httpx.AsyncClient(timeout=3.0) as client:
+                async with httpx.AsyncClient(timeout=3.0, trust_env=False) as client:
                     r = await client.get(f"{local_url}/health")
                     if r.status_code == 200:
                         log.info("  %s is ready!", model_id)
@@ -471,7 +474,7 @@ class DynamicProvisioner:
             local_url = f"http://localhost:{rm.spec.port}"
             alive = False
             try:
-                async with httpx.AsyncClient(timeout=5.0) as c:
+                async with httpx.AsyncClient(timeout=5.0, trust_env=False) as c:
                     r = await c.get(f"{local_url}/health")
                     alive = (r.status_code == 200)
             except Exception:
@@ -809,7 +812,7 @@ def main() -> None:
     parser.add_argument("--node-host", default="localhost",
                         help="Hostname/IP of this node for router registration. "
                              "Set to the node's real hostname for multi-node deployments "
-                             "(e.g. sophia-gpu-06). Defaults to localhost (single-node).")
+                             "(e.g. sophia-gpu-09). Defaults to localhost (single-node).")
     args = parser.parse_args()
 
     global ROUTER_MODE
