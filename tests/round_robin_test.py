@@ -1,23 +1,14 @@
 """
 round_robin_test.py — Baseline load test using round-robin model selection.
 
-Sends requests alternately to two vLLM backends, bypassing the semantic router.
-Produces a CSV in the same format as load_test.py so compare_results.py
-can compare them side by side.
-
 Usage:
-    python tests/round_robin_test.py \
-        --requests 1000 \
-        --concurrency 50 \
-        --output results/round_robin.csv
-
-    # Use same dataset as the router test for a fair comparison
+    # 5 node-1 models only
     python tests/round_robin_test.py \
         --dataset datasets/hf_1000.json \
-        --concurrency 50 \
-        --output results/round_robin.csv
+        --output results/round_robin.csv \
+        --concurrency 50
 
-    # Include qwen-32b on node 2 (hostname changes each PBS job)
+    # All 6 models (include llama4-scout on node 2)
     python tests/round_robin_test.py \
         --dataset datasets/hf_1000.json \
         --node2-host sophia-gpu-09 \
@@ -56,8 +47,8 @@ LATENCY_SLO_MS: dict[tuple[str, str], int] = {
 }
 
 # ---------------------------------------------------------------------------
-# Backend configuration -- Sophia 5-model base setup (node 1 only)
-# qwen-32b added dynamically via --node2-host so hostname never needs editing
+# Node 1 backends (always included).
+# llama4-scout added dynamically via --node2-host.
 # ---------------------------------------------------------------------------
 
 BACKENDS = [
@@ -70,17 +61,9 @@ BACKENDS = [
         "efficiency_tokens_per_joule": 13.0,
     },
     {
-        "model_id":                    "qwen-14b",
-        "model_name":                  "Qwen/Qwen2.5-14B-Instruct",
-        "base_url":                    "http://localhost:8001",
-        "input_rate_usd_per_token":    0.0000005,
-        "output_rate_usd_per_token":   0.0000010,
-        "efficiency_tokens_per_joule": 8.0,
-    },
-    {
         "model_id":                    "deepseek-r1-7b",
         "model_name":                  "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B",
-        "base_url":                    "http://localhost:8002",
+        "base_url":                    "http://localhost:8001",
         "input_rate_usd_per_token":    0.0000003,
         "output_rate_usd_per_token":   0.0000006,
         "efficiency_tokens_per_joule": 13.0,
@@ -88,23 +71,30 @@ BACKENDS = [
     {
         "model_id":                    "coder-32b",
         "model_name":                  "Qwen/Qwen2.5-Coder-32B-Instruct",
-        "base_url":                    "http://localhost:8003",
+        "base_url":                    "http://localhost:8002",
         "input_rate_usd_per_token":    0.0000010,
         "output_rate_usd_per_token":   0.0000020,
         "efficiency_tokens_per_joule": 4.0,
     },
     {
-        "model_id":                    "deepseek-v2-lite",
-        "model_name":                  "deepseek-ai/DeepSeek-V2-Lite",
-        "base_url":                    "http://localhost:8005",
-        "input_rate_usd_per_token":    0.0000003,
-        "output_rate_usd_per_token":   0.0000006,
-        "efficiency_tokens_per_joule": 11.0,
+        "model_id":                    "gemma-3-27b",
+        "model_name":                  "google/gemma-3-27b-it",
+        "base_url":                    "http://localhost:8003",
+        "input_rate_usd_per_token":    0.0000008,
+        "output_rate_usd_per_token":   0.0000016,
+        "efficiency_tokens_per_joule": 5.0,
     },
-    # qwen-32b is added dynamically via --node2-host (hostname changes each PBS job)
+    {
+        "model_id":                    "deepseek-r1-14b",
+        "model_name":                  "deepseek-ai/DeepSeek-R1-Distill-Qwen-14B",
+        "base_url":                    "http://localhost:8004",
+        "input_rate_usd_per_token":    0.0000005,
+        "output_rate_usd_per_token":   0.0000010,
+        "efficiency_tokens_per_joule": 6.0,
+    },
+    # llama4-scout added dynamically via --node2-host (lives on node 2, port 8005)
 ]
 
-# Set by --model flag; None means round-robin over all backends
 _single_model: str | None = None
 
 
@@ -136,12 +126,7 @@ def build_request_list(n: int, dataset_path: str | None) -> list[dict]:
     return pool[:n]
 
 
-async def send_request(
-    client: httpx.AsyncClient,
-    req_id: int,
-    item: dict,
-    backend: dict,
-) -> dict:
+async def send_request(client: httpx.AsyncClient, req_id: int, item: dict, backend: dict) -> dict:
     input_tokens = sum(len(m.split()) * 1.3 for m in [item["query"]])
     OUTPUT_TOKENS = {
         ("factual","easy"):80,   ("factual","medium"):200,   ("factual","hard"):350,
@@ -222,21 +207,14 @@ async def send_request(
     return result
 
 
-async def run(
-    n_requests: int,
-    concurrency: int,
-    output: str,
-    dataset_path: str | None,
-    single_model: str | None = None,
-) -> None:
+async def run(n_requests: int, concurrency: int, output: str, dataset_path: str | None, single_model: str | None = None) -> None:
     items = build_request_list(n_requests, dataset_path)
     os.makedirs(os.path.dirname(output) if os.path.dirname(output) else ".", exist_ok=True)
 
     if single_model is not None:
         backend_map = {b["model_id"]: b for b in BACKENDS}
         if single_model not in backend_map:
-            valid = ", ".join(backend_map.keys())
-            raise ValueError(f"Unknown model '{single_model}'. Valid: {valid}")
+            raise ValueError(f"Unknown model '{single_model}'. Valid: {', '.join(backend_map)}")
         chosen      = backend_map[single_model]
         assignments = [chosen] * n_requests
         print(f"\n  [Single-Model] {n_requests} requests -> {single_model}, concurrency={concurrency}")
@@ -307,21 +285,20 @@ def main() -> None:
     parser.add_argument("--output",      default="")
     parser.add_argument("--dataset",     default=None)
     parser.add_argument("--node2-host",  default=None,
-                        help="Hostname of node 2 running qwen-32b (e.g. sophia-gpu-09). "
-                             "If set, qwen-32b is added to the round-robin pool.")
+                        help="Hostname of node 2 running llama4-scout (e.g. sophia-gpu-09). "
+                             "If set, llama4-scout is added to the round-robin pool.")
     parser.add_argument("--model",       default=None,
                         help="Send ALL requests to this single model (default: round-robin)")
     args = parser.parse_args()
 
-    # Dynamically add qwen-32b if node2-host is given
     if args.node2_host:
         BACKENDS.append({
-            "model_id":                    "qwen-32b",
-            "model_name":                  "Qwen/Qwen2.5-32B-Instruct",
-            "base_url":                    f"http://{args.node2_host}:8004",
+            "model_id":                    "llama4-scout",
+            "model_name":                  "meta-llama/Llama-4-Scout-17B-16E-Instruct",
+            "base_url":                    f"http://{args.node2_host}:8005",
             "input_rate_usd_per_token":    0.0000010,
             "output_rate_usd_per_token":   0.0000020,
-            "efficiency_tokens_per_joule": 4.0,
+            "efficiency_tokens_per_joule": 3.0,
         })
 
     valid_models = [b["model_id"] for b in BACKENDS]

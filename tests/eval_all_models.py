@@ -6,9 +6,6 @@ Produces eval_matrix.csv with one row per (request x model), containing:
   - actual wall_ms for each model on each request
   - accuracy score and is_correct flag
 
-This matrix is then consumed by compare_ttca.py (--eval-matrix flag) for
-exact Time-to-Correct-Answer computation with no median-latency simulation.
-
 Workflow:
     1. python tests/eval_all_models.py --dataset datasets/hf_1000.json
     2. python tests/load_test.py       --dataset datasets/hf_1000.json ...
@@ -16,13 +13,13 @@ Workflow:
     4. python tests/compare_ttca.py --router ... --baseline ... --eval-matrix results/eval_matrix.csv
 
 Usage:
-    # 5 models (node 1 only)
+    # 5 node-1 models only
     python tests/eval_all_models.py \\
         --dataset     datasets/hf_1000.json \\
         --output      results/eval_matrix.csv \\
         --concurrency 30
 
-    # 6 models (include qwen-32b on node 2)
+    # All 6 models (include llama4-scout on node 2)
     python tests/eval_all_models.py \\
         --dataset     datasets/hf_1000.json \\
         --output      results/eval_matrix.csv \\
@@ -49,9 +46,8 @@ import httpx
 
 
 # ---------------------------------------------------------------------------
-# Model backends — node 1 models are always included.
-# qwen-32b is added dynamically via --node2-host so the hostname never
-# needs to be hardcoded (it changes with every PBS job allocation).
+# Model backends — node 1 models always included.
+# llama4-scout added dynamically via --node2-host.
 # ---------------------------------------------------------------------------
 
 BACKENDS: list[dict] = [
@@ -61,26 +57,26 @@ BACKENDS: list[dict] = [
         "base_url":   "http://localhost:8000",
     },
     {
-        "model_id":   "qwen-14b",
-        "model_name": "Qwen/Qwen2.5-14B-Instruct",
-        "base_url":   "http://localhost:8001",
-    },
-    {
         "model_id":   "deepseek-r1-7b",
         "model_name": "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B",
-        "base_url":   "http://localhost:8002",
+        "base_url":   "http://localhost:8001",
     },
     {
         "model_id":   "coder-32b",
         "model_name": "Qwen/Qwen2.5-Coder-32B-Instruct",
+        "base_url":   "http://localhost:8002",
+    },
+    {
+        "model_id":   "gemma-3-27b",
+        "model_name": "google/gemma-3-27b-it",
         "base_url":   "http://localhost:8003",
     },
     {
-        "model_id":   "deepseek-v2-lite",
-        "model_name": "deepseek-ai/DeepSeek-V2-Lite",
-        "base_url":   "http://localhost:8005",
+        "model_id":   "deepseek-r1-14b",
+        "model_name": "deepseek-ai/DeepSeek-R1-Distill-Qwen-14B",
+        "base_url":   "http://localhost:8004",
     },
-    # qwen-32b added dynamically via --node2-host
+    # llama4-scout added dynamically via --node2-host (lives on node 2, port 8005)
 ]
 
 CORRECT_THRESHOLD = 0.7
@@ -151,10 +147,6 @@ def score_response(domain: str, response: str, gt: str):
     return scorer(response, gt) if scorer else None
 
 
-# ---------------------------------------------------------------------------
-# Call one model for one request
-# ---------------------------------------------------------------------------
-
 async def call_model(
     client: httpx.AsyncClient,
     req_id: int,
@@ -210,10 +202,6 @@ async def call_model(
 
     return result
 
-
-# ---------------------------------------------------------------------------
-# Runner
-# ---------------------------------------------------------------------------
 
 async def run(dataset_path: str, output: str, concurrency: int) -> None:
     with open(dataset_path) as f:
@@ -316,15 +304,15 @@ def main() -> None:
     parser.add_argument("--concurrency", type=int, default=10,
                         help="Max simultaneous calls across all models")
     parser.add_argument("--node2-host",  default=None,
-                        help="Hostname of node 2 running qwen-32b (e.g. sophia-gpu-09). "
-                             "If set, qwen-32b is added to the eval.")
+                        help="Hostname of node 2 running llama4-scout (e.g. sophia-gpu-09). "
+                             "If set, llama4-scout is added to the eval.")
     args = parser.parse_args()
 
     if args.node2_host:
         BACKENDS.append({
-            "model_id":   "qwen-32b",
-            "model_name": "Qwen/Qwen2.5-32B-Instruct",
-            "base_url":   f"http://{args.node2_host}:8004",
+            "model_id":   "llama4-scout",
+            "model_name": "meta-llama/Llama-4-Scout-17B-16E-Instruct",
+            "base_url":   f"http://{args.node2_host}:8005",
         })
 
     asyncio.run(run(args.dataset, args.output, args.concurrency))
