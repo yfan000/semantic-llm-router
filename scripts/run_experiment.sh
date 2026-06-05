@@ -1,5 +1,5 @@
 #!/bin/bash
-# run_experiment.sh -- Full two-node experiment on Sophia ALCF.
+# run_experiment.sh — Full two-node experiment on Sophia ALCF.
 #
 # Reads NODE1 and NODE2 from $PBS_NODEFILE automatically, starts all
 # services, runs all load tests and baselines, then generates comparison
@@ -45,8 +45,8 @@ ROUTER_URL="http://${NODE1}:${ROUTER_PORT}"
 
 echo "=================================================================="
 echo "  Two-Node Experiment  $(date)"
-echo "  NODE1 : $NODE1  (router + qwen-7b/14b/deepseek-r1/coder/dsv2lite)"
-echo "  NODE2 : $NODE2  (qwen-32b)"
+echo "  NODE1 : $NODE1  (qwen-7b / deepseek-r1-7b / coder-32b / gemma-3-27b / deepseek-r1-14b)"
+echo "  NODE2 : $NODE2  (llama4-scout, 8 GPUs)"
 echo "  Router: $ROUTER_URL"
 echo "  Output: $RESULTS_DIR"
 echo "=================================================================="
@@ -102,13 +102,13 @@ nohup python provisioner/dynamic_provisioner.py \
     --router-mode  ttca \
     --static \
     --priors-path  "$PRIORS_FILE" \
-    --initial-models qwen-7b,qwen-14b,deepseek-r1-7b,coder-32b,deepseek-v2-lite \
+    --initial-models qwen-7b,deepseek-r1-7b,coder-32b,gemma-3-27b,deepseek-r1-14b \
     > "$LOG_DIR/provisioner_node1.log" 2>&1 &
 echo "  PID: $!  log: $LOG_DIR/provisioner_node1.log"
 
-# -- [3/8] Node 2 provisioner (qwen-32b) -------------------------------------
+# -- [3/8] Node 2 provisioner (llama4-scout) ----------------------------------
 echo ""
-echo "[3/8] Starting provisioner on $NODE2 (qwen-32b)..."
+echo "[3/8] Starting provisioner on $NODE2 (llama4-scout, 8 GPUs)..."
 # shellcheck disable=SC2029
 ssh "$NODE2" "cd ~/semantic-llm-router && \
     export HF_HOME=/eagle/UIC-HPC/yuping/hf_cache && \
@@ -118,8 +118,8 @@ ssh "$NODE2" "cd ~/semantic-llm-router && \
         --router-mode  ttca \
         --static \
         --priors-path  '$PRIORS_FILE' \
-        --initial-models qwen-32b \
-        > '$LOG_DIR/provisioner_node2.log' 2>&1 & echo Node2 provisioner PID: \$!"
+        --initial-models llama4-scout \
+        > '$LOG_DIR/provisioner_node2.log' 2>&1 & echo PID:\$!"
 echo "  log: $LOG_DIR/provisioner_node2.log (on $NODE2)"
 
 # -- [4/8] Wait for all 6 models + register ----------------------------------
@@ -130,23 +130,25 @@ wait_models 6
 echo "  Registering node-1 models with priors..."
 python tests/register_with_priors.py \
     --priors     "$PRIORS_FILE" \
-    --router-url "$ROUTER_URL"
+    --router-url "$ROUTER_URL" \
+    --node2-host "$NODE2"
 
-echo "  Registering qwen-32b (node 2) with estimated priors..."
+echo "  Registering llama4-scout (node 2) with estimated priors..."
 curl --noproxy '*' -sf -X POST "$ROUTER_URL/router/register" \
   -H "Content-Type: application/json" \
   -d "{
-    \"model_id\": \"qwen-32b\",
-    \"model_name\": \"Qwen/Qwen2.5-32B-Instruct\",
+    \"model_id\": \"llama4-scout\",
+    \"model_name\": \"meta-llama/Llama-4-Scout-17B-16E-Instruct\",
     \"backend\": \"vllm\",
-    \"base_url\": \"http://$NODE2:8004\",
-    \"domains\": [\"factual\",\"reasoning\",\"creative\",\"math\"],
-    \"min_accuracy_capability\": {\"_default\": 0.85},
+    \"base_url\": \"http://$NODE2:8005\",
+    \"domains\": [\"factual\",\"reasoning\",\"creative\",\"math\",\"code\"],
+    \"min_accuracy_capability\": {\"_default\": 0.88},
     \"accuracy_priors\": {
-      \"factual:easy\": 0.96, \"factual:medium\": 0.95, \"factual:hard\": 0.93,
-      \"reasoning:easy\": 0.97, \"reasoning:hard\": 0.96,
-      \"math:easy\": 0.93, \"math:medium\": 0.90, \"math:hard\": 0.82,
-      \"creative:easy\": 0.93, \"creative:medium\": 0.91, \"creative:hard\": 0.89
+      \"factual:easy\": 0.97, \"factual:medium\": 0.96, \"factual:hard\": 0.94,
+      \"reasoning:easy\": 0.98, \"reasoning:hard\": 0.96,
+      \"math:easy\": 0.95, \"math:medium\": 0.93, \"math:hard\": 0.88,
+      \"code:easy\": 0.96, \"code:medium\": 0.93, \"code:hard\": 0.88,
+      \"creative:easy\": 0.95, \"creative:medium\": 0.93, \"creative:hard\": 0.91
     },
     \"skip_calibration\": true
   }" > /dev/null
@@ -196,28 +198,28 @@ python tests/round_robin_test.py \
     --node2-host  "$NODE2"
 
 echo ""
-echo "=== TTCA router vs Round-Robin ==="
+echo "=== TTCA router vs Round-Robin ===" | tee "$RESULTS_DIR/compare_ttca_vs_rr.txt"
 python tests/compare_ttca.py \
     --router      "$RESULTS_DIR/router_ttca.csv" \
     --baseline    "$RESULTS_DIR/rr_baseline.csv" \
     --eval-matrix "$RESULTS_DIR/eval_matrix.csv" \
-    | tee "$RESULTS_DIR/compare_ttca_vs_rr.txt"
+    | tee -a "$RESULTS_DIR/compare_ttca_vs_rr.txt"
 
 echo ""
-echo "=== Accuracy router vs Round-Robin ==="
+echo "=== Accuracy router vs Round-Robin ===" | tee "$RESULTS_DIR/compare_accuracy_vs_rr.txt"
 python tests/compare_ttca.py \
     --router      "$RESULTS_DIR/router_accuracy.csv" \
     --baseline    "$RESULTS_DIR/rr_baseline.csv" \
     --eval-matrix "$RESULTS_DIR/eval_matrix.csv" \
-    | tee "$RESULTS_DIR/compare_accuracy_vs_rr.txt"
+    | tee -a "$RESULTS_DIR/compare_accuracy_vs_rr.txt"
 
 echo ""
-echo "=== TTCA vs Accuracy router ==="
+echo "=== TTCA vs Accuracy router ===" | tee "$RESULTS_DIR/compare_ttca_vs_accuracy.txt"
 python tests/compare_ttca.py \
     --router      "$RESULTS_DIR/router_ttca.csv" \
     --baseline    "$RESULTS_DIR/router_accuracy.csv" \
     --eval-matrix "$RESULTS_DIR/eval_matrix.csv" \
-    | tee "$RESULTS_DIR/compare_ttca_vs_accuracy.txt"
+    | tee -a "$RESULTS_DIR/compare_ttca_vs_accuracy.txt"
 
 # -- Done --------------------------------------------------------------------
 echo ""
