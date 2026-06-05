@@ -1,23 +1,27 @@
 """
-round_robin_test.py — Baseline load test: round-robin or single-model.
+round_robin_test.py — Baseline load test using round-robin model selection.
 
-Sends requests to vLLM backends directly, bypassing the semantic router.
+Sends requests alternately to two vLLM backends, bypassing the semantic router.
 Produces a CSV in the same format as load_test.py so compare_results.py
-can compare side by side.
+can compare them side by side.
 
 Usage:
-    # Round-robin across all models
     python tests/round_robin_test.py \
-        --dataset datasets/hf_1000.json \
-        --output results/round_robin.csv \
-        --concurrency 50
+        --requests 1000 \
+        --concurrency 50 \
+        --output results/round_robin.csv
 
-    # All requests to one specific model
+    # Use same dataset as the router test for a fair comparison
     python tests/round_robin_test.py \
         --dataset datasets/hf_1000.json \
-        --model qwen-7b \
-        --output results/single_qwen7b.csv \
-        --concurrency 50
+        --concurrency 50 \
+        --output results/round_robin.csv
+
+    # Include qwen-32b on node 2 (hostname changes each PBS job)
+    python tests/round_robin_test.py \
+        --dataset datasets/hf_1000.json \
+        --node2-host sophia-gpu-09 \
+        --output results/round_robin.csv
 """
 from __future__ import annotations
 import argparse
@@ -52,7 +56,8 @@ LATENCY_SLO_MS: dict[tuple[str, str], int] = {
 }
 
 # ---------------------------------------------------------------------------
-# Backend configuration -- Sophia 6-model setup (2 nodes)
+# Backend configuration -- Sophia 5-model base setup (node 1 only)
+# qwen-32b added dynamically via --node2-host so hostname never needs editing
 # ---------------------------------------------------------------------------
 
 BACKENDS = [
@@ -96,14 +101,7 @@ BACKENDS = [
         "output_rate_usd_per_token":   0.0000006,
         "efficiency_tokens_per_joule": 11.0,
     },
-    {
-        "model_id":                    "qwen-32b",
-        "model_name":                  "Qwen/Qwen2.5-32B-Instruct",
-        "base_url":                    "http://sophia-gpu-07:8004",
-        "input_rate_usd_per_token":    0.0000010,
-        "output_rate_usd_per_token":   0.0000020,
-        "efficiency_tokens_per_joule": 4.0,
-    },
+    # qwen-32b is added dynamically via --node2-host (hostname changes each PBS job)
 ]
 
 # Set by --model flag; None means round-robin over all backends
@@ -265,8 +263,6 @@ async def run(
     async def bounded(req_id: int, item: dict, backend: dict, writer, f) -> None:
         nonlocal done
         async with sem:
-            # trust_env=False bypasses system proxy settings that can block
-            # cross-node requests (e.g. sophia-gpu-07) on HPC clusters.
             async with httpx.AsyncClient(timeout=120.0, trust_env=False) as client:
                 r = await send_request(client, req_id, item, backend)
             results.append(r)
@@ -305,15 +301,33 @@ async def run(
 
 def main() -> None:
     global _single_model
-    valid_models = [b["model_id"] for b in BACKENDS]
     parser = argparse.ArgumentParser()
     parser.add_argument("--requests",    type=int, default=1000)
     parser.add_argument("--concurrency", type=int, default=50)
     parser.add_argument("--output",      default="")
     parser.add_argument("--dataset",     default=None)
-    parser.add_argument("--model",       default=None, choices=valid_models,
-                        help="Send ALL requests to one model (default: round-robin over all)")
+    parser.add_argument("--node2-host",  default=None,
+                        help="Hostname of node 2 running qwen-32b (e.g. sophia-gpu-09). "
+                             "If set, qwen-32b is added to the round-robin pool.")
+    parser.add_argument("--model",       default=None,
+                        help="Send ALL requests to this single model (default: round-robin)")
     args = parser.parse_args()
+
+    # Dynamically add qwen-32b if node2-host is given
+    if args.node2_host:
+        BACKENDS.append({
+            "model_id":                    "qwen-32b",
+            "model_name":                  "Qwen/Qwen2.5-32B-Instruct",
+            "base_url":                    f"http://{args.node2_host}:8004",
+            "input_rate_usd_per_token":    0.0000010,
+            "output_rate_usd_per_token":   0.0000020,
+            "efficiency_tokens_per_joule": 4.0,
+        })
+
+    valid_models = [b["model_id"] for b in BACKENDS]
+    if args.model and args.model not in valid_models:
+        print(f"Unknown model '{args.model}'. Valid: {', '.join(valid_models)}")
+        return
 
     if args.model:
         _single_model = args.model
@@ -321,10 +335,8 @@ def main() -> None:
 
     if not args.output:
         ts     = datetime.now().strftime("%Y%m%d_%H%M%S")
-        args.output = (
-            f"results/single_{args.model}_{ts}.csv" if args.model
-            else f"results/round_robin_{ts}.csv"
-        )
+        suffix = f"_{args.model}" if args.model else ""
+        args.output = f"results/single{suffix}_{ts}.csv" if args.model else f"results/round_robin_{ts}.csv"
     asyncio.run(run(args.requests, args.concurrency, args.output, args.dataset, args.model))
 
 

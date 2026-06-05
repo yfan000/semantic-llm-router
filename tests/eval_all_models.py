@@ -2,7 +2,7 @@
 eval_all_models.py — Pre-evaluation matrix.
 
 Runs every request in the dataset through ALL model backends before testing.
-Produces eval_matrix.csv with one row per (request × model), containing:
+Produces eval_matrix.csv with one row per (request x model), containing:
   - actual wall_ms for each model on each request
   - accuracy score and is_correct flag
 
@@ -16,10 +16,18 @@ Workflow:
     4. python tests/compare_ttca.py --router ... --baseline ... --eval-matrix results/eval_matrix.csv
 
 Usage:
+    # 5 models (node 1 only)
     python tests/eval_all_models.py \\
         --dataset     datasets/hf_1000.json \\
         --output      results/eval_matrix.csv \\
-        --concurrency 10
+        --concurrency 30
+
+    # 6 models (include qwen-32b on node 2)
+    python tests/eval_all_models.py \\
+        --dataset     datasets/hf_1000.json \\
+        --output      results/eval_matrix.csv \\
+        --concurrency 30 \\
+        --node2-host  sophia-gpu-09
 """
 from __future__ import annotations
 
@@ -41,7 +49,9 @@ import httpx
 
 
 # ---------------------------------------------------------------------------
-# Model backends — must match what is registered with the router
+# Model backends — node 1 models are always included.
+# qwen-32b is added dynamically via --node2-host so the hostname never
+# needs to be hardcoded (it changes with every PBS job allocation).
 # ---------------------------------------------------------------------------
 
 BACKENDS: list[dict] = [
@@ -70,6 +80,7 @@ BACKENDS: list[dict] = [
         "model_name": "deepseek-ai/DeepSeek-V2-Lite",
         "base_url":   "http://localhost:8005",
     },
+    # qwen-32b added dynamically via --node2-host
 ]
 
 CORRECT_THRESHOLD = 0.7
@@ -231,7 +242,7 @@ async def run(dataset_path: str, output: str, concurrency: int) -> None:
     async def bounded(req_id: int, item: dict, backend: dict, writer, f) -> None:
         nonlocal done
         async with sem:
-            async with httpx.AsyncClient() as client:
+            async with httpx.AsyncClient(trust_env=False) as client:
                 r = await call_model(client, req_id, item, backend)
             writer.writerow(r)
             f.flush()
@@ -304,7 +315,18 @@ def main() -> None:
     parser.add_argument("--output",      default="results/eval_matrix.csv")
     parser.add_argument("--concurrency", type=int, default=10,
                         help="Max simultaneous calls across all models")
+    parser.add_argument("--node2-host",  default=None,
+                        help="Hostname of node 2 running qwen-32b (e.g. sophia-gpu-09). "
+                             "If set, qwen-32b is added to the eval.")
     args = parser.parse_args()
+
+    if args.node2_host:
+        BACKENDS.append({
+            "model_id":   "qwen-32b",
+            "model_name": "Qwen/Qwen2.5-32B-Instruct",
+            "base_url":   f"http://{args.node2_host}:8004",
+        })
+
     asyncio.run(run(args.dataset, args.output, args.concurrency))
 
 
