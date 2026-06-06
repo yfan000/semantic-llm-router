@@ -110,9 +110,9 @@ echo "  PID: $!  log: $LOG_DIR/provisioner_node1.log"
 echo ""
 echo "[3/10] Starting provisioner on $NODE2 (llama4-scout, 8 GPUs)..."
 # Three things needed to prevent SSH from blocking:
-#   1. </dev/null on the python command: closes its stdin so it doesn't hold the SSH channel
-#   2. disown $BGPID: removes it from the shell job table so the shell exits cleanly
-#   3. < /dev/null on the ssh call: closes the local SSH stdin immediately
+#   1. </dev/null on the python command: closes its stdin
+#   2. disown $BGPID: removes it from shell job table
+#   3. < /dev/null on the ssh call: closes the local SSH stdin
 # shellcheck disable=SC2029
 ssh "$NODE2" "
     cd ~/semantic-llm-router
@@ -151,7 +151,7 @@ curl --noproxy '*' -sf "$ROUTER_URL/v1/models" \
 # Ground truth is embedded in datasets/hf_1000.json (HuggingFace benchmarks).
 echo ""
 echo "[5/10] Building eval matrix (6 models x 1000 queries, ~30-45 min)..."
-echo "  Ground truth from $DATASET — no manual labelling needed."
+echo "  Ground truth from $DATASET -- no manual labelling needed."
 python tests/eval_all_models.py \
     --dataset     "$DATASET" \
     --output      "$RESULTS_DIR/eval_matrix.csv" \
@@ -182,7 +182,7 @@ python tests/register_with_priors.py \
     --priors     "$RESULTS_DIR/priors_new.json" \
     --router-url "$ROUTER_URL" \
     --node2-host "$NODE2"
-echo "  Router now uses measured accuracy — routing decisions are calibrated."
+echo "  Router now uses measured accuracy -- routing decisions are calibrated."
 
 # -- [8/10] TTCA load test ----------------------------------------------------
 echo ""
@@ -215,6 +215,24 @@ python tests/round_robin_test.py \
     --concurrency "$CONCURRENCY" \
     --node2-host  "$NODE2"
 
+# Per-category breakdown: latency / energy / cost per domain:complexity
+echo ""
+echo "=== Per-category breakdown: TTCA router vs Round-Robin ===" | tee "$RESULTS_DIR/compare_categories_ttca.txt"
+python tests/compare_categories.py \
+    --router   "$RESULTS_DIR/router_ttca.csv" \
+    --baseline "$RESULTS_DIR/rr_baseline.csv" \
+    --output   "$RESULTS_DIR/compare_categories_ttca.csv" \
+    | tee -a "$RESULTS_DIR/compare_categories_ttca.txt"
+
+echo ""
+echo "=== Per-category breakdown: Accuracy router vs Round-Robin ===" | tee "$RESULTS_DIR/compare_categories_accuracy.txt"
+python tests/compare_categories.py \
+    --router   "$RESULTS_DIR/router_accuracy.csv" \
+    --baseline "$RESULTS_DIR/rr_baseline.csv" \
+    --output   "$RESULTS_DIR/compare_categories_accuracy.csv" \
+    | tee -a "$RESULTS_DIR/compare_categories_accuracy.txt"
+
+# TTCA metric comparisons
 echo ""
 echo "=== TTCA router vs Round-Robin ===" | tee "$RESULTS_DIR/compare_ttca_vs_rr.txt"
 python tests/compare_ttca.py \
@@ -244,12 +262,14 @@ echo ""
 echo "=================================================================="
 echo "  Experiment complete!  $(date)"
 echo "  Results in: $RESULTS_DIR/"
-echo "    eval_matrix.csv              (ground truth correctness)"
-echo "    priors_new.json              (real measured accuracy priors)"
-echo "    router_ttca.csv              (TTCA router results)"
-echo "    router_accuracy.csv          (accuracy router results)"
-echo "    rr_baseline.csv              (round-robin baseline)"
-echo "    compare_ttca_vs_rr.txt       (TTCA router vs baseline)"
-echo "    compare_accuracy_vs_rr.txt   (accuracy router vs baseline)"
-echo "    compare_ttca_vs_accuracy.txt (TTCA vs accuracy)"
+echo "    eval_matrix.csv                  (ground truth correctness)"
+echo "    priors_new.json                  (real measured accuracy priors)"
+echo "    router_ttca.csv                  (TTCA router results)"
+echo "    router_accuracy.csv              (accuracy router results)"
+echo "    rr_baseline.csv                  (round-robin baseline)"
+echo "    compare_categories_ttca.csv      (per-category: latency/energy/cost, TTCA router)"
+echo "    compare_categories_accuracy.csv  (per-category: latency/energy/cost, accuracy router)"
+echo "    compare_ttca_vs_rr.txt           (TTCA router vs baseline, TTCA metric)"
+echo "    compare_accuracy_vs_rr.txt       (accuracy router vs baseline)"
+echo "    compare_ttca_vs_accuracy.txt     (TTCA vs accuracy router)"
 echo "=================================================================="
