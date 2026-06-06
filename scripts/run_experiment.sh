@@ -215,21 +215,23 @@ python tests/round_robin_test.py \
     --concurrency "$CONCURRENCY" \
     --node2-host  "$NODE2"
 
-# Per-category breakdown: latency / energy / cost per domain:complexity
+# Per-category breakdown: accuracy / latency / energy / cost
 echo ""
-echo "=== Per-category breakdown: TTCA router vs Round-Robin ===" | tee "$RESULTS_DIR/compare_categories_ttca.txt"
+echo "=== Per-category: TTCA router vs Round-Robin ===" | tee "$RESULTS_DIR/compare_categories_ttca.txt"
 python tests/compare_categories.py \
-    --router   "$RESULTS_DIR/router_ttca.csv" \
-    --baseline "$RESULTS_DIR/rr_baseline.csv" \
-    --output   "$RESULTS_DIR/compare_categories_ttca.csv" \
+    --router      "$RESULTS_DIR/router_ttca.csv" \
+    --baseline    "$RESULTS_DIR/rr_baseline.csv" \
+    --eval-matrix "$RESULTS_DIR/eval_matrix.csv" \
+    --output      "$RESULTS_DIR/compare_categories_ttca.csv" \
     | tee -a "$RESULTS_DIR/compare_categories_ttca.txt"
 
 echo ""
-echo "=== Per-category breakdown: Accuracy router vs Round-Robin ===" | tee "$RESULTS_DIR/compare_categories_accuracy.txt"
+echo "=== Per-category: Accuracy router vs Round-Robin ===" | tee "$RESULTS_DIR/compare_categories_accuracy.txt"
 python tests/compare_categories.py \
-    --router   "$RESULTS_DIR/router_accuracy.csv" \
-    --baseline "$RESULTS_DIR/rr_baseline.csv" \
-    --output   "$RESULTS_DIR/compare_categories_accuracy.csv" \
+    --router      "$RESULTS_DIR/router_accuracy.csv" \
+    --baseline    "$RESULTS_DIR/rr_baseline.csv" \
+    --eval-matrix "$RESULTS_DIR/eval_matrix.csv" \
+    --output      "$RESULTS_DIR/compare_categories_accuracy.csv" \
     | tee -a "$RESULTS_DIR/compare_categories_accuracy.txt"
 
 # TTCA metric comparisons
@@ -267,9 +269,9 @@ echo "    priors_new.json                  (real measured accuracy priors)"
 echo "    router_ttca.csv                  (TTCA router results)"
 echo "    router_accuracy.csv              (accuracy router results)"
 echo "    rr_baseline.csv                  (round-robin baseline)"
-echo "    compare_categories_ttca.csv      (per-category: latency/energy/cost, TTCA router)"
-echo "    compare_categories_accuracy.csv  (per-category: latency/energy/cost, accuracy router)"
-echo "    compare_ttca_vs_rr.txt           (TTCA router vs baseline, TTCA metric)"
-echo "    compare_accuracy_vs_rr.txt       (accuracy router vs baseline)"
+echo "    compare_categories_ttca.csv      (accuracy/latency/energy/cost: TTCA router)"
+echo "    compare_categories_accuracy.csv  (accuracy/latency/energy/cost: accuracy router)"
+echo "    compare_ttca_vs_rr.txt           (TTCA metric: router vs baseline)"
+echo "    compare_accuracy_vs_rr.txt       (accuracy metric: router vs baseline)"
 echo "    compare_ttca_vs_accuracy.txt     (TTCA vs accuracy router)"
 echo "=================================================================="
