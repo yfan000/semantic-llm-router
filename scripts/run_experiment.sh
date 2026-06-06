@@ -109,8 +109,10 @@ echo "  PID: $!  log: $LOG_DIR/provisioner_node1.log"
 # -- [3/10] Node 2 provisioner (llama4-scout, 8 GPUs) ------------------------
 echo ""
 echo "[3/10] Starting provisioner on $NODE2 (llama4-scout, 8 GPUs)..."
+# -n redirects SSH stdin from /dev/null so the session exits immediately
+# after launching the background process instead of blocking forever.
 # shellcheck disable=SC2029
-ssh "$NODE2" "cd ~/semantic-llm-router && \
+ssh -n "$NODE2" "cd ~/semantic-llm-router && \
     export HF_HOME=/eagle/UIC-HPC/yuping/hf_cache && \
     nohup python provisioner/dynamic_provisioner.py \
         --router-url   '$ROUTER_URL' \
@@ -137,12 +139,12 @@ echo "  Model list:"
 curl --noproxy '*' -sf "$ROUTER_URL/v1/models" \
     | python3 -c "import sys,json; [print(f'    {m[\"id\"]}') for m in json.load(sys.stdin)['data']]"
 
-# -- [5/10] Eval matrix: send all queries to all 6 models --------------------
-# This step collects ground truth correctness for every (query, model) pair.
-# Ground truth comes from datasets/hf_1000.json (HuggingFace benchmarks).
+# -- [5/10] Eval matrix -------------------------------------------------------
+# Sends every query to every model and scores responses against ground truth.
+# Ground truth is embedded in datasets/hf_1000.json (HuggingFace benchmarks).
 echo ""
 echo "[5/10] Building eval matrix (6 models x 1000 queries, ~30-45 min)..."
-echo "  Ground truth is in $DATASET — no manual labelling needed."
+echo "  Ground truth from $DATASET — no manual labelling needed."
 python tests/eval_all_models.py \
     --dataset     "$DATASET" \
     --output      "$RESULTS_DIR/eval_matrix.csv" \
@@ -162,8 +164,7 @@ import json
 p = json.load(open('$RESULTS_DIR/priors_new.json'))
 for model, priors in sorted(p.items()):
     if not priors: continue
-    keys = sorted(priors.keys())
-    avg  = sum(priors.values()) / len(priors)
+    avg = sum(priors.values()) / len(priors)
     print(f'    {model:<24} {len(priors):2} keys  avg={avg:.3f}')
 "
 
