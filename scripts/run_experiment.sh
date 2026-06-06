@@ -109,19 +109,26 @@ echo "  PID: $!  log: $LOG_DIR/provisioner_node1.log"
 # -- [3/10] Node 2 provisioner (llama4-scout, 8 GPUs) ------------------------
 echo ""
 echo "[3/10] Starting provisioner on $NODE2 (llama4-scout, 8 GPUs)..."
-# -n redirects SSH stdin from /dev/null so the session exits immediately
-# after launching the background process instead of blocking forever.
+# Three things needed to prevent SSH from blocking:
+#   1. </dev/null on the python command: closes its stdin so it doesn't hold the SSH channel
+#   2. disown $BGPID: removes it from the shell job table so the shell exits cleanly
+#   3. < /dev/null on the ssh call: closes the local SSH stdin immediately
 # shellcheck disable=SC2029
-ssh -n "$NODE2" "cd ~/semantic-llm-router && \
-    export HF_HOME=/eagle/UIC-HPC/yuping/hf_cache && \
-    nohup python provisioner/dynamic_provisioner.py \
+ssh "$NODE2" "
+    cd ~/semantic-llm-router
+    export HF_HOME=/eagle/UIC-HPC/yuping/hf_cache
+    python provisioner/dynamic_provisioner.py \
         --router-url   '$ROUTER_URL' \
         --node-host    '$NODE2' \
         --router-mode  ttca \
         --static \
         --priors-path  '$PRIORS_FILE' \
         --initial-models llama4-scout \
-        > '$LOG_DIR/provisioner_node2.log' 2>&1 & echo PID:\$!"
+        </dev/null >>'$LOG_DIR/provisioner_node2.log' 2>&1 &
+    BGPID=\$!
+    disown \$BGPID
+    echo PID:\$BGPID
+" < /dev/null
 echo "  log: $LOG_DIR/provisioner_node2.log (on $NODE2)"
 
 # -- [4/10] Wait for all 6 models + seed with placeholder priors -------------
@@ -140,7 +147,7 @@ curl --noproxy '*' -sf "$ROUTER_URL/v1/models" \
     | python3 -c "import sys,json; [print(f'    {m[\"id\"]}') for m in json.load(sys.stdin)['data']]"
 
 # -- [5/10] Eval matrix -------------------------------------------------------
-# Sends every query to every model and scores responses against ground truth.
+# Sends every query to every model and scores against ground truth.
 # Ground truth is embedded in datasets/hf_1000.json (HuggingFace benchmarks).
 echo ""
 echo "[5/10] Building eval matrix (6 models x 1000 queries, ~30-45 min)..."
