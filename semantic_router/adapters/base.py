@@ -15,6 +15,7 @@ class ModelAdapter(ABC):
         output_rate_usd_per_token: float,
         accuracy_priors: dict[str, float] | None = None,
         model_name: str = "",
+        reputation=None,  # ReputationTracker | None
     ) -> None:
         self.model_id = model_id
         # model_name is sent to the vLLM /v1/chat/completions endpoint.
@@ -27,9 +28,12 @@ class ModelAdapter(ABC):
         self.input_rate = input_rate_usd_per_token
         self.output_rate = output_rate_usd_per_token
         self.accuracy_priors: dict[str, float] = accuracy_priors or {}
+        # Live reference to the reputation tracker so bids can use observed
+        # per-model per-category output token counts instead of the static table.
+        self._reputation = reputation
 
         # Router-side in-flight counter.
-        # Tracks requests dispatched but not yet completed — updated
+        # Tracks requests dispatched but not yet completed -- updated
         # immediately at dispatch time, before vLLM's Prometheus metrics
         # catch up. Prevents thundering-herd overbidding when many
         # concurrent requests all see the same stale low-load snapshot.
@@ -54,6 +58,19 @@ class ModelAdapter(ABC):
         return self.accuracy_priors.get(f"{domain}:{complexity}", DEFAULT_ACCURACY_PRIOR)
 
     def _estimate_output_tokens(self, domain: str, complexity: str) -> int:
+        # Use observed per-model per-category token counts when available.
+        # These are updated in real time by dispatcher.py after every response,
+        # so reasoning models (deepseek-r1-*) will quickly learn their true
+        # output lengths (3-5x longer than instruction models for the same prompt).
+        if self._reputation is not None:
+            observed = self._reputation.get_avg_output_tokens(
+                self.model_id, domain, complexity
+            )
+            if observed is not None:
+                return int(observed)
+
+        # Fallback: static table seeded from benchmark medians.
+        # Used on cold start before any requests have been observed.
         TABLE: dict[tuple[str, str], int] = {
             ("factual",   "easy"):   80,
             ("factual",   "medium"): 200,

@@ -1,8 +1,9 @@
 from __future__ import annotations
+import asyncio
 import time
 import logging
 from semantic_router.adapters.base import ModelAdapter
-from semantic_router.schemas import BidResponse
+from semantic_router.schemas import BidResponse, UserPreference
 from semantic_router.reputation_tracker import ReputationTracker
 from semantic_router.user_registry import UserRegistry
 from semantic_router.accuracy_sampler import AccuracySampler, SampleItem
@@ -22,21 +23,43 @@ async def dispatch(
     sampler: AccuracySampler,
     extra_kwargs: dict | None = None,
 ) -> tuple[dict, dict]:
+    """
+    Run inference on the winning model and trigger the post-completion feedback loop.
+
+    Returns (openai_response_dict, router_metadata_dict).
+    """
     t_start = time.monotonic()
     response = await adapter.complete(messages, **(extra_kwargs or {}))
     actual_latency_ms = int((time.monotonic() - t_start) * 1000)
 
+    # Count actual tokens from the response usage field
     usage = response.get("usage", {})
     actual_input_tokens  = usage.get("prompt_tokens", 0)
     actual_output_tokens = usage.get("completion_tokens", 0)
     actual_tokens = actual_input_tokens + actual_output_tokens
+
     actual_energy_j = actual_output_tokens / max(adapter.efficiency_tokens_per_joule, 1e-9)
 
+    # Feedback loop (non-blocking where possible)
     reputation.record_latency(
         winning_bid.model_id,
         winning_bid.estimated_latency_ms,
         actual_latency_ms,
     )
+    # Per-category latency -- more accurate for TTCA than the global EMA because
+    # latency varies significantly by domain:complexity (e.g. code:hard is 5x slower
+    # than factual:easy for the same model).
+    reputation.record_latency_per_cat(
+        winning_bid.model_id, domain, complexity, actual_latency_ms
+    )
+    # Per-category output token count -- corrects the static global table that
+    # incorrectly assigns the same output length to all models.  Reasoning models
+    # (deepseek-r1-*) generate 3-5x more tokens than instruction models for the
+    # same prompt, so their bid latency estimates must reflect that.
+    if actual_output_tokens > 0:
+        reputation.record_output_tokens(
+            winning_bid.model_id, domain, complexity, actual_output_tokens
+        )
 
     if user_id:
         try:
@@ -44,6 +67,7 @@ async def dispatch(
         except Exception as e:
             log.warning("Budget deduction failed for %s: %s", user_id, e)
 
+    # Extract query text for judge
     query = " ".join(m.get("content", "") for m in messages if m.get("role") == "user")
     response_text = ""
     try:
@@ -60,15 +84,15 @@ async def dispatch(
     ))
 
     metadata = {
-        "X-Router-Model":             winning_bid.model_id,
-        "X-Router-Charged-USD":       f"{winning_bid.estimated_cost_usd:.6f}",
-        "X-Router-Energy-J":          f"{actual_energy_j:.3f}",
-        "X-Router-Bid-Latency-Ms":    str(winning_bid.estimated_latency_ms),
+        "X-Router-Model":            winning_bid.model_id,
+        "X-Router-Charged-USD":      f"{winning_bid.estimated_cost_usd:.6f}",
+        "X-Router-Energy-J":         f"{actual_energy_j:.3f}",
+        "X-Router-Bid-Latency-Ms":   str(winning_bid.estimated_latency_ms),
         "X-Router-Actual-Latency-Ms": str(actual_latency_ms),
-        "X-Router-Load":              f"{winning_bid.current_load:.2f}",
-        # Bid accuracy — if always 0.700, accuracy_priors were not set at registration
-        "X-Router-Bid-Accuracy":      f"{winning_bid.estimated_accuracy:.3f}",
-        "X-Router-Domain":            domain,
-        "X-Router-Complexity":        complexity,
+        "X-Router-Load":             f"{winning_bid.current_load:.2f}",
+        # Bid accuracy -- if always 0.70, accuracy_priors were not set at registration
+        "X-Router-Bid-Accuracy":     f"{winning_bid.estimated_accuracy:.3f}",
+        "X-Router-Domain":           domain,
+        "X-Router-Complexity":       complexity,
     }
     return response, metadata

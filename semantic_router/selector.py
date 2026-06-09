@@ -44,7 +44,6 @@ def select(
         )
 
     # Stage 2 -- 4D weighted score (lower = better)
-    # bid.estimated_accuracy comes from adapter.accuracy_priors (leaderboard values)
     def effective_cost(bid: BidResponse) -> float:
         return bid.estimated_cost_usd * reputation.get_penalty_multiplier(bid.model_id)
 
@@ -110,7 +109,6 @@ def rank_bids(
         and (pref.min_accuracy is None or b.estimated_accuracy >= pref.min_accuracy)
     ]
     if not candidates:
-        # Fall back to all bids sorted by latency when SLO is violated
         candidates = sorted(bids, key=lambda b: b.estimated_latency_ms)
 
     # TTCA mode: sort by latency/accuracy (expected time to correct answer).
@@ -119,20 +117,30 @@ def rank_bids(
     # accuracy (L/p=2105) because trying fast-first reduces expected total time.
     #
     # Latency source (in priority order):
-    #   1. EMA of actual measured latency from dispatcher (most accurate)
-    #   2. Formula estimate from bid (output_tokens/throughput) -- used on cold start
+    #   1. Per-category EMA: actual latency for THIS domain:complexity (most accurate)
+    #      -- critical because reasoning models are 5x slower on math:hard vs factual:easy
+    #   2. Global EMA: actual latency averaged over all categories
+    #   3. Bid estimate: output_tokens/throughput formula (cold start only)
     if pref.mode == RouterMode.TTCA:
         def ttca_score(bid: BidResponse) -> float:
             acc = max(bid.estimated_accuracy, 0.01)
-            measured = reputation.get_avg_latency_ms(bid.model_id)
-            lat = measured if measured is not None else bid.estimated_latency_ms
+            per_cat = reputation.get_avg_latency_ms_per_cat(bid.model_id, domain, complexity)
+            global_  = reputation.get_avg_latency_ms(bid.model_id)
+            lat = per_cat if per_cat is not None else (
+                global_ if global_ is not None else bid.estimated_latency_ms
+            )
             return lat / acc
 
         ranked = sorted(candidates, key=ttca_score)
         for bid in ranked:
-            measured = reputation.get_avg_latency_ms(bid.model_id)
-            lat = measured if measured is not None else bid.estimated_latency_ms
-            src = "measured" if measured is not None else "estimated"
+            per_cat = reputation.get_avg_latency_ms_per_cat(bid.model_id, domain, complexity)
+            global_  = reputation.get_avg_latency_ms(bid.model_id)
+            lat = per_cat if per_cat is not None else (
+                global_ if global_ is not None else bid.estimated_latency_ms
+            )
+            src = "per-cat" if per_cat is not None else (
+                "global" if global_ is not None else "estimated"
+            )
             log.info(
                 "  TTCA %-22s lat=%.0fms(%s) acc=%.3f -> lat/acc=%.1f",
                 bid.model_id, lat, src,

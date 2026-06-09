@@ -24,7 +24,7 @@ from semantic_router.user_registry import UserRegistry
 
 log = logging.getLogger(__name__)
 
-# -- Singletons ---------------------------------------------------------------
+# ── Singletons ────────────────────────────────────────────────────────────────────────────────
 
 analyzer   = SemanticAnalyzer()
 registry   = ModelRegistry()
@@ -46,7 +46,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Semantic LLM Router", lifespan=lifespan)
 
 
-# -- Inference endpoint -------------------------------------------------------
+# ── Inference endpoint ────────────────────────────────────────────────────────────
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request) -> JSONResponse:
@@ -58,37 +58,29 @@ async def chat_completions(request: Request) -> JSONResponse:
     sla = RequestSLA(**router_params) if router_params else RequestSLA()
     user_id = sla.user_id
 
-    # Resolve user preference (mode -> preset -> per-request overrides)
     pref = user_reg.resolve_preference(user_id, sla)
 
-    # Semantic classification -- runs encode() in thread pool to avoid blocking event loop.
-    # If domain/complexity are provided in router params, use them and skip classifier
-    # (avoids misclassification of structured benchmark queries like MMLU/GSM8K).
     meta = await analyzer.analyze_async(messages)
     if sla.domain:
         meta.domain = sla.domain
     if sla.complexity:
         meta.complexity = sla.complexity
 
-    # Apply per-domain/complexity SLO if the user hasn't set an explicit latency ceiling
     if pref.max_latency_ms is None:
         slo_ms = LATENCY_SLO_MS.get((meta.domain, meta.complexity))
         if slo_ms is not None:
             pref.max_latency_ms = slo_ms
             log.info("SLO applied: %s:%s -> %d ms", meta.domain, meta.complexity, slo_ms)
 
-    # Budget pre-check (rough estimate: 300 tokens output, 50 J)
     estimated_tokens = 300
     if user_id:
-        estimated_energy_j = 300.0 / 2.0  # conservative: assume 2 tok/J
+        estimated_energy_j = 300.0 / 2.0
         user_reg.check_budget(user_id, estimated_tokens, estimated_energy_j)
 
-    # Get eligible model backends
     adapters = registry.get_eligible(meta.domain, pref.min_accuracy, reputation)
     if not adapters:
         raise HTTPException(status_code=503, detail="No models registered for this domain.")
 
-    # Broadcast bids
     bid_request = BidRequest(
         messages=messages,
         complexity=meta.complexity,
@@ -98,34 +90,21 @@ async def chat_completions(request: Request) -> JSONResponse:
     )
     bids = await collect_bids(adapters, bid_request)
 
-    # Rank all bids best-first -- used for inference-time retry
     ranked_bids = rank_bids(bids, pref, reputation, meta.domain, meta.complexity)
     if not ranked_bids:
         raise HTTPException(status_code=503, detail="No models available to handle request.")
 
-    # Exclude "stream" so it is never forwarded to vLLM -- the router's
-    # adapter.complete() calls resp.json() which fails on SSE responses.
     passthrough = {
         k: v for k, v in body.items()
         if k not in ("model", "messages", "extra_body", "stream")
     }
 
-    # Offline ground-truth lookup -- enables quality-based retry
-    # when the request matches a known benchmark query.
     query_text = " ".join(m.get("content", "") for m in messages if m.get("role") == "user")
     benchmark_item = benchmark.lookup(query_text)
     ground_truth   = benchmark_item.get("ground_truth") if benchmark_item else None
 
-    # Dispatch with inference-time retry: try each model in score order.
-    # Two retry triggers:
-    #   1. Infrastructure failure (crash, timeout, HTTP error)
-    #   2. Wrong answer -- only when ground_truth is known from benchmark dataset
-    #
-    # Important: quality-based retries save the best available response so far.
-    # If ALL models answer incorrectly we still return the first response rather
-    # than failing the request with 503 -- a wrong answer is better than no answer.
     last_error: Exception | None = None
-    best_response: tuple | None = None  # (response_dict, router_headers) of first successful dispatch
+    best_response: tuple | None = None
     for attempt, winning_bid in enumerate(ranked_bids):
         winning_adapter = registry.get_adapter(winning_bid.model_id)
         if winning_adapter is None:
@@ -149,7 +128,6 @@ async def chat_completions(request: Request) -> JSONResponse:
                 extra_kwargs=passthrough,
             )
 
-            # Quality check -- only when we have offline ground truth
             if ground_truth is not None:
                 response_text = ""
                 try:
@@ -165,10 +143,9 @@ async def chat_completions(request: Request) -> JSONResponse:
                     )
                     router_headers["X-Router-GT-Correct"] = "false"
                     last_error = ValueError(f"{winning_bid.model_id} answered incorrectly")
-                    # Save first wrong response as fallback -- returned if all models fail
                     if best_response is None:
                         best_response = (response_dict, router_headers)
-                    continue  # try next model
+                    continue
                 if correct is True:
                     router_headers["X-Router-GT-Correct"] = "true"
             else:
@@ -188,7 +165,6 @@ async def chat_completions(request: Request) -> JSONResponse:
             return JSONResponse(content=response_dict, headers=router_headers)
 
         except ValueError:
-            # Wrong-answer retry -- already logged above, just move on
             continue
         except Exception as e:
             last_error = e
@@ -198,9 +174,6 @@ async def chat_completions(request: Request) -> JSONResponse:
             )
             continue
 
-    # All models exhausted.
-    # If we have a quality-retry fallback (wrong answer but model responded),
-    # return it rather than 503 -- a wrong answer is better than no answer.
     if best_response is not None:
         response_dict, router_headers = best_response
         router_headers["X-Router-GT-Correct"]      = "false"
@@ -217,13 +190,12 @@ async def chat_completions(request: Request) -> JSONResponse:
     )
 
 
-# -- Model fleet management ---------------------------------------------------
+# ── Model fleet management ──────────────────────────────────────────────────────────
 
 class RegisterRequest(BaseModel):
-    model_id: str          # router alias shown in headers and /v1/models
-    model_name: str = ""   # actual HuggingFace name sent to vLLM backend
-                           # (e.g. "Qwen/Qwen2.5-7B-Instruct"); defaults to model_id
-    backend: str           # "vllm" | "dynamo" | "ray"
+    model_id: str
+    model_name: str = ""
+    backend: str
     base_url: str
     domains: list[str]
     min_accuracy_capability: dict[str, float] = {}
@@ -249,7 +221,6 @@ async def register_model(req: RegisterRequest) -> dict:
     else:
         raise HTTPException(status_code=400, detail=f"Unknown backend: {req.backend}")
 
-    # Run calibration if no per-domain floors were provided
     capability = req.min_accuracy_capability
     if not capability and not req.skip_calibration:
         log.info("No min_accuracy_capability provided -- running calibration for %s", req.model_id)
@@ -260,19 +231,14 @@ async def register_model(req: RegisterRequest) -> dict:
             log.warning("Calibration failed for %s: %s -- using default 0.5", req.model_id, e)
             capability = {"_default": 0.5}
 
-    # If caller provided partial dict, fill missing domains with "_default" fallback
     if capability and "_default" not in capability:
         capability["_default"] = min(capability.values())
 
-    # Build accuracy_priors: prefer explicitly provided values, fall back to
-    # min_accuracy_capability so the model never bids DEFAULT_ACCURACY_PRIOR (0.70)
-    # for domains that have leaderboard data. This is the critical path:
-    # if accuracy_priors stays empty, both models bid 0.70 and cost always decides.
     accuracy_priors = dict(req.accuracy_priors)
     if capability:
         for key, score in capability.items():
             if ":" in key and key not in accuracy_priors:
-                accuracy_priors[key] = score   # fill gaps from capability dict
+                accuracy_priors[key] = score
 
     adapter = adapter_cls(
         model_id=req.model_id,
@@ -283,6 +249,7 @@ async def register_model(req: RegisterRequest) -> dict:
         input_rate_usd_per_token=req.input_rate_usd_per_token,
         output_rate_usd_per_token=req.output_rate_usd_per_token,
         accuracy_priors=accuracy_priors,
+        reputation=reputation,   # enables per-model per-category output token lookup
     )
     registry.register(ModelConfig(
         adapter=adapter,
@@ -347,7 +314,7 @@ async def health() -> dict:
     return {"status": "ok", "registered_models": len(registry.list_all())}
 
 
-# -- User management ----------------------------------------------------------
+# ── User management ───────────────────────────────────────────────────────────────────
 
 @app.post("/users/{user_id}/preference", status_code=201)
 async def set_preference(user_id: str, pref: UserPreference) -> dict:

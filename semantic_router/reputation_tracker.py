@@ -13,10 +13,6 @@ from semantic_router.config import (
 class ReputationTracker:
     def __init__(self, path: str = MODEL_REPUTATION_PATH) -> None:
         self._path = path
-        # {model_id: {"latency_reliability": float, "sample_count": int,
-        #              "accuracy_priors": {"domain:complexity": float},
-        #              "accuracy_bid_reliability": {"domain:complexity": float},
-        #              "avg_latency_ms": float | None}}
         self._data: dict[str, dict] = {}
         self._load()
 
@@ -39,16 +35,26 @@ class ReputationTracker:
                 "sample_count": 0,
                 "accuracy_priors": {},
                 # Bid reliability per "domain:complexity" -- EMA of judge/bid ratio
-                # 1.0 = honest bidder, <1.0 = consistently overbids accuracy
                 "accuracy_bid_reliability": {},
-                # EMA of actual measured latency (ms) -- used by TTCA scoring
-                # to replace the formula estimate with real observations.
-                # None until first request completes.
+                # Global EMA of actual measured latency (ms)
                 "avg_latency_ms": None,
+                # Per-category EMA of latency -- more accurate for TTCA scoring
+                # because latency varies significantly by domain:complexity.
+                "avg_latency_ms_per_cat": {},
+                # Per-category EMA of actual completion token count.
+                # Reasoning models (deepseek-r1-*) generate 3-5x more tokens than
+                # instruction models for the same prompt, so the static global
+                # table underestimates their bid latency. This corrects that.
+                "avg_output_tokens": {},
             }
+        else:
+            # Backfill new fields for models loaded from older JSON snapshots.
+            rep = self._data[model_id]
+            rep.setdefault("avg_latency_ms_per_cat", {})
+            rep.setdefault("avg_output_tokens", {})
         return self._data[model_id]
 
-    # -- Latency reliability -------------------------------------------------
+    # -- Latency reliability --------------------------------------------------
 
     def record_latency(
         self, model_id: str, bid_latency_ms: int, actual_latency_ms: int
@@ -60,8 +66,6 @@ class ReputationTracker:
             (1 - LATENCY_EMA_ALPHA) * rep["latency_reliability"]
             + LATENCY_EMA_ALPHA * ratio
         )
-        # Track EMA of actual latency for TTCA scoring.
-        # First sample initialises directly; subsequent samples use EMA.
         old = rep.get("avg_latency_ms")
         rep["avg_latency_ms"] = (
             float(actual_latency_ms) if old is None
@@ -71,13 +75,53 @@ class ReputationTracker:
         self._save()
 
     def get_avg_latency_ms(self, model_id: str) -> float | None:
-        """Return EMA of actual measured latency, or None if no data yet."""
+        """Return global EMA of actual measured latency, or None if no data yet."""
         return self._data.get(model_id, {}).get("avg_latency_ms")
+
+    def record_latency_per_cat(
+        self, model_id: str, domain: str, complexity: str, actual_latency_ms: int
+    ) -> None:
+        """Record per-category latency EMA (more accurate for TTCA than global EMA)."""
+        rep = self._ensure(model_id)
+        key = f"{domain}:{complexity}"
+        old = rep["avg_latency_ms_per_cat"].get(key)
+        rep["avg_latency_ms_per_cat"][key] = (
+            float(actual_latency_ms) if old is None
+            else (1 - LATENCY_EMA_ALPHA) * old + LATENCY_EMA_ALPHA * actual_latency_ms
+        )
+        self._save()
+
+    def get_avg_latency_ms_per_cat(
+        self, model_id: str, domain: str, complexity: str
+    ) -> float | None:
+        """Return per-category latency EMA, or None if no data yet for this category."""
+        key = f"{domain}:{complexity}"
+        return self._data.get(model_id, {}).get("avg_latency_ms_per_cat", {}).get(key)
+
+    def record_output_tokens(
+        self, model_id: str, domain: str, complexity: str, tokens: int
+    ) -> None:
+        """Record actual completion token count for a (model, domain:complexity) pair."""
+        rep = self._ensure(model_id)
+        key = f"{domain}:{complexity}"
+        old = rep["avg_output_tokens"].get(key)
+        rep["avg_output_tokens"][key] = (
+            float(tokens) if old is None
+            else (1 - LATENCY_EMA_ALPHA) * old + LATENCY_EMA_ALPHA * tokens
+        )
+        self._save()
+
+    def get_avg_output_tokens(
+        self, model_id: str, domain: str, complexity: str
+    ) -> float | None:
+        """Return observed avg output token count, or None if no data yet."""
+        key = f"{domain}:{complexity}"
+        return self._data.get(model_id, {}).get("avg_output_tokens", {}).get(key)
 
     def get_penalty_multiplier(self, model_id: str) -> float:
         rep = self._data.get(model_id, {})
         reliability = rep.get("latency_reliability", 1.0)
-        return 1.0 / max(reliability, 0.1)  # cap at 10x penalty
+        return 1.0 / max(reliability, 0.1)
 
     def get_latency_reliability(self, model_id: str) -> float:
         return self._data.get(model_id, {}).get("latency_reliability", 1.0)
@@ -108,13 +152,6 @@ class ReputationTracker:
         bid_accuracy: float,
         judge_score: float,
     ) -> None:
-        """
-        Record how well the model's accuracy bid matched the judge's score.
-        ratio = min(judge_score / bid_accuracy, 1.0)
-          - 1.0: delivered what was promised (or better)
-          - <1.0: overbid -- claimed higher accuracy than was judged
-        Uses a grace ratio so small discrepancies don't penalise.
-        """
         rep = self._ensure(model_id)
         key = f"{domain}:{complexity}"
         ratio = min(judge_score / max(bid_accuracy, 1e-6), 1.0)
@@ -126,23 +163,12 @@ class ReputationTracker:
         self._save()
 
     def get_accuracy_discount(self, model_id: str, domain: str, complexity: str) -> float:
-        """
-        Return a discount factor [0.1, 1.0] to apply to bid.estimated_accuracy in
-        the selector. Honest bidders get 1.0 (no discount). Chronic overbidders
-        get < 1.0, making their accuracy appear lower in the scoring formula.
-        """
         rep = self._data.get(model_id, {})
         key = f"{domain}:{complexity}"
         reliability = rep.get("accuracy_bid_reliability", {}).get(key, 1.0)
-        return max(reliability, 0.1)  # cap at 90% discount
+        return max(reliability, 0.1)
 
     def get_domain_floor(self, model_id: str, domain: str) -> float | None:
-        """
-        Return the minimum accuracy prior across all complexity levels for a domain.
-        This is the live production floor -- replaces the static calibration value
-        once enough production samples exist (EMA needs ~20 samples to stabilize).
-        Returns None if no production data exists yet for this domain.
-        """
         rep = self._data.get(model_id, {})
         priors = rep.get("accuracy_priors", {})
         domain_scores = [v for k, v in priors.items() if k.startswith(f"{domain}:")]
