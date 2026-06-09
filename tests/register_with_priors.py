@@ -25,6 +25,8 @@ import httpx
 
 # ---------------------------------------------------------------------------
 # Node 1 models (always registered)
+# decode_tokens_per_sec: measured decode throughput on Sophia A100-SXM4-40GB
+# prefill_tokens_per_sec: defaults to 5x decode in RegisterRequest (auto)
 # ---------------------------------------------------------------------------
 MODELS = [
     {
@@ -38,6 +40,7 @@ MODELS = [
             "creative":  0.72,
             "reasoning": 0.70,
         },
+        "decode_tokens_per_sec": 2800,
     },
     {
         "model_id":   "deepseek-r1-7b",
@@ -50,6 +53,7 @@ MODELS = [
             "reasoning": 0.80,
             "code":      0.75,
         },
+        "decode_tokens_per_sec": 1200,
     },
     {
         "model_id":   "coder-32b",
@@ -62,6 +66,7 @@ MODELS = [
             "math":      0.88,
             "reasoning": 0.88,
         },
+        "decode_tokens_per_sec": 700,
     },
     {
         "model_id":   "gemma-3-27b",
@@ -70,6 +75,7 @@ MODELS = [
         "base_url":   "http://localhost:8003",
         "domains":    ["factual", "reasoning", "creative", "math", "code"],
         "min_accuracy_capability": {"_default": 0.83},
+        "decode_tokens_per_sec": 1000,
     },
     {
         "model_id":   "deepseek-r1-14b",
@@ -82,6 +88,7 @@ MODELS = [
             "reasoning": 0.88,
             "code":      0.82,
         },
+        "decode_tokens_per_sec": 900,
     },
     # llama4-scout lives on node 2 -- base_url set dynamically via --node2-host
 ]
@@ -94,6 +101,7 @@ NODE2_MODELS = [
         "base_url":   "",   # filled at runtime from --node2-host
         "domains":    ["factual", "reasoning", "creative", "math", "code"],
         "min_accuracy_capability": {"_default": 0.88},
+        "decode_tokens_per_sec": 500,
     },
 ]
 

@@ -193,8 +193,8 @@ async def chat_completions(request: Request) -> JSONResponse:
 # ── Model fleet management ──────────────────────────────────────────────────────────
 
 class RegisterRequest(BaseModel):
-    model_id: str
-    model_name: str = ""
+    model_id: str          # router alias shown in headers and /v1/models
+    model_name: str = ""   # actual HuggingFace name sent to vLLM backend
     backend: str
     base_url: str
     domains: list[str]
@@ -205,6 +205,12 @@ class RegisterRequest(BaseModel):
     output_rate_usd_per_token: float = 2e-6
     accuracy_priors: dict[str, float] = {}
     skip_calibration: bool = False
+    # Throughput for decomposed latency formula (decode + prefill + queue).
+    # decode_tokens_per_sec: how fast the model generates output tokens (tok/s).
+    # prefill_tokens_per_sec: how fast it processes input prompt (typically 5-10x decode).
+    # 0 means auto: prefill defaults to 5x decode.
+    decode_tokens_per_sec: float = 1000.0
+    prefill_tokens_per_sec: float = 0.0
 
 
 @app.post("/router/register", status_code=201)
@@ -249,7 +255,11 @@ async def register_model(req: RegisterRequest) -> dict:
         input_rate_usd_per_token=req.input_rate_usd_per_token,
         output_rate_usd_per_token=req.output_rate_usd_per_token,
         accuracy_priors=accuracy_priors,
-        reputation=reputation,   # enables per-model per-category output token lookup
+        reputation=reputation,
+        decode_tokens_per_sec=req.decode_tokens_per_sec,
+        prefill_tokens_per_sec=(req.prefill_tokens_per_sec
+                                 if req.prefill_tokens_per_sec > 0
+                                 else req.decode_tokens_per_sec * 5),
     )
     registry.register(ModelConfig(
         adapter=adapter,
@@ -290,11 +300,6 @@ async def model_reputation(model_id: str) -> dict:
 
 @app.get("/router/{model_id}/details")
 async def model_details(model_id: str) -> dict:
-    """
-    Show stored accuracy_priors for a model -- use this to verify that
-    registration passed accuracy_priors correctly.
-    If all values show 0.70 (DEFAULT_ACCURACY_PRIOR), the priors were not set.
-    """
     adapter = registry.get_adapter(model_id)
     if not adapter:
         raise HTTPException(status_code=404, detail=f"Model '{model_id}' not registered.")
