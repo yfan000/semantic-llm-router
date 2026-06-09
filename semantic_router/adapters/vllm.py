@@ -7,7 +7,7 @@ from semantic_router.schemas import BidRequest, BidResponse
 
 
 _METRICS_CACHE: dict[str, tuple[float, dict]] = {}   # base_url -> (timestamp, metrics)
-_METRICS_LOCKS: dict[str, asyncio.Lock] = {}          # one lock per base_url
+_METRICS_LOCKS: dict[str, asyncio.Lock] = {}          # one lock per base_url -- prevents stampede
 _CACHE_TTL = 1.0
 
 
@@ -25,10 +25,17 @@ def _load_multiplier(load: float) -> float:
 
 
 class VLLMAdapter(ModelAdapter):
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        # Cached raw metric values from the last get_load() call.
+        # Used by bid() to compute decomposed latency without a second scrape.
+        self._last_waiting: float = 0.0
+        self._last_running: float = 1.0
+
     async def _scrape_metrics(self) -> dict[str, float]:
         now = time.monotonic()
 
-        # Fast path: cache hit (no lock needed)
+        # Fast path: cache hit -- no lock needed
         cached = _METRICS_CACHE.get(self.base_url)
         if cached and now - cached[0] < _CACHE_TTL:
             return cached[1]
@@ -68,23 +75,56 @@ class VLLMAdapter(ModelAdapter):
             m = await self._scrape_metrics()
             cache_pressure = m.get("vllm:gpu_cache_usage_perc", 0.0)
             waiting        = m.get("vllm:num_requests_waiting", 0.0)
+            running        = m.get("vllm:num_requests_running",  1.0)
+            # Cache raw values for bid() decomposed latency -- avoids a second scrape.
+            self._last_waiting = waiting
+            self._last_running  = max(running, 1.0)
             vllm_queue     = min(waiting / max(self.max_concurrent_requests, 1), 1.0)
             combined_queue = max(vllm_queue, self.router_queue_pressure)
             return max(cache_pressure, combined_queue)
         except Exception:
+            self._last_waiting = 0.0
+            self._last_running  = 1.0
             return max(0.3, self.router_queue_pressure)
 
     async def bid(self, request: BidRequest) -> BidResponse:
-        load = await self.get_load()
+        load = await self.get_load()   # also populates _last_waiting / _last_running
         mult = _load_multiplier(load)
-        inp  = sum(len(m.get("content", "").split()) * 1.3 for m in request.messages)
-        out  = self._estimate_output_tokens(request.domain, request.complexity)
-        cost = (inp * self.input_rate + out * self.output_rate) * mult
-        effective_tok_per_s = max(1000.0 * (1.0 - load * 0.8), 1.0)
+
+        # Input token count (word-split approximation)
+        prompt_tokens = sum(len(m.get("content", "").split()) * 1.3
+                            for m in request.messages)
+
+        # Output token count -- per-model per-category observed average when available,
+        # falls back to static domain:complexity table (see base._estimate_output_tokens)
+        out = self._estimate_output_tokens(request.domain, request.complexity)
+
+        cost = (prompt_tokens * self.input_rate + out * self.output_rate) * mult
+
+        # -- Decomposed latency -----------------------------------------------
+        waiting = self._last_waiting
+        running  = self._last_running   # already clamped to >= 1.0 in get_load()
+
+        # Queue time: each waiting request must complete roughly one full decode
+        # cycle before this request can start.
+        queue_ms = waiting * (out / self.decode_tokens_per_sec * 1000)
+
+        # Prefill time: GPU processes all input tokens in parallel (compute-bound,
+        # much faster per token than decode).
+        prefill_ms = prompt_tokens / self.prefill_tokens_per_sec * 1000
+
+        # Decode time: output tokens generated one-by-one (memory-bandwidth-bound).
+        # Divide throughput by the number of concurrently running requests because
+        # continuous batching shares GPU bandwidth -- each request gets 1/N of capacity.
+        effective_decode_tps = self.decode_tokens_per_sec / running
+        decode_ms = out / effective_decode_tps * 1000
+
+        estimated_latency_ms = int(queue_ms + prefill_ms + decode_ms)
+
         return BidResponse(
             model_id=self.model_id,
             estimated_cost_usd=cost,
-            estimated_latency_ms=int(out / effective_tok_per_s * 1000),
+            estimated_latency_ms=estimated_latency_ms,
             estimated_accuracy=self.get_accuracy_prior(request.domain, request.complexity),
             estimated_energy_j=out / self.efficiency_tokens_per_joule,
             efficiency_tokens_per_joule=self.efficiency_tokens_per_joule,

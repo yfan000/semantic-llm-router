@@ -15,7 +15,9 @@ class ModelAdapter(ABC):
         output_rate_usd_per_token: float,
         accuracy_priors: dict[str, float] | None = None,
         model_name: str = "",
-        reputation=None,  # ReputationTracker | None
+        reputation=None,              # ReputationTracker | None
+        decode_tokens_per_sec: float = 1000.0,
+        prefill_tokens_per_sec: float = 5000.0,
     ) -> None:
         self.model_id = model_id
         # model_name is sent to the vLLM /v1/chat/completions endpoint.
@@ -31,6 +33,11 @@ class ModelAdapter(ABC):
         # Live reference to the reputation tracker so bids can use observed
         # per-model per-category output token counts instead of the static table.
         self._reputation = reputation
+        # Per-model throughput used in decomposed latency formula.
+        # decode_tokens_per_sec: how fast the model generates tokens (varies by size).
+        # prefill_tokens_per_sec: how fast it processes the input prompt (typically 5-10x decode).
+        self.decode_tokens_per_sec = max(decode_tokens_per_sec, 1.0)
+        self.prefill_tokens_per_sec = max(prefill_tokens_per_sec, 1.0)
 
         # Router-side in-flight counter.
         # Tracks requests dispatched but not yet completed -- updated
