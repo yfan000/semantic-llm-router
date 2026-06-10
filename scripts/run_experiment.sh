@@ -3,7 +3,7 @@
 #
 # Reads NODE1 and NODE2 from $PBS_NODEFILE automatically, starts all
 # services, runs all load tests and baselines, then generates comparison
-# reports. Results are saved to results/experiment_<timestamp>_alpha<N>/.
+# reports. Results are saved to results/experiment_<timestamp>_alpha<N>_<mode>/.
 #
 # Usage (inside a PBS interactive job):
 #   qsub -I -l select=2:ngpus=8:ncpus=64 -l walltime=08:00:00 \
@@ -12,9 +12,9 @@
 #   bash scripts/run_experiment.sh
 #
 # Optional env overrides:
-#   TTCA_ALPHA=0.5 bash scripts/run_experiment.sh   # tune accuracy/latency trade-off
-#   TTCA_ALPHA=2.0 bash scripts/run_experiment.sh   # penalize latency quadratically
-#   ROUTER_PORT=8080 N_REQUESTS=1000 CONCURRENCY=50 bash scripts/run_experiment.sh
+#   TTCA_ALPHA=0.5 bash scripts/run_experiment.sh         # accuracy-dominant
+#   EXPERIMENT_MODE=dynamic bash scripts/run_experiment.sh # cold-model spin-up
+#   EXPERIMENT_MODE=dynamic TTCA_ALPHA=0.5 bash scripts/run_experiment.sh
 
 set -euo pipefail
 
@@ -28,11 +28,16 @@ EVAL_CONCURRENCY=${EVAL_CONCURRENCY:-30}
 # TTCA scoring exponent: score = accuracy / latency^TTCA_ALPHA  (higher = better)
 # 0.0 = pure accuracy  |  1.0 = classic TTCA  |  2.0 = quadratic latency penalty
 TTCA_ALPHA=${TTCA_ALPHA:-1.0}
+# Provisioner mode:
+#   static  — all models pre-loaded at startup, no auto-scaling (default, reproducible)
+#   dynamic — start with 2 fast models; provisioner scales up based on router demand
+#             (tests the new cold-model proactive spin-up feature)
+EXPERIMENT_MODE=${EXPERIMENT_MODE:-static}
 LOG_DIR="$HOME/vllm_logs"
 mkdir -p "$LOG_DIR"
 
 TS=$(date +%Y%m%d_%H%M%S)
-RESULTS_DIR="results/experiment_${TS}_alpha${TTCA_ALPHA}"
+RESULTS_DIR="results/experiment_${TS}_alpha${TTCA_ALPHA}_${EXPERIMENT_MODE}"
 mkdir -p "$RESULTS_DIR"
 
 # -- Discover nodes from PBS --------------------------------------------------
@@ -54,6 +59,7 @@ echo "  NODE1     : $NODE1  (qwen-7b / deepseek-r1-7b / coder-32b / gemma-3-27b 
 echo "  NODE2     : $NODE2  (llama4-scout, 8 GPUs)"
 echo "  Router    : $ROUTER_URL"
 echo "  TTCA_ALPHA: $TTCA_ALPHA  (score = accuracy / latency^alpha)"
+echo "  MODE      : $EXPERIMENT_MODE  (static=all-preloaded | dynamic=cold-spinup)"
 echo "  Output    : $RESULTS_DIR"
 echo "=================================================================="
 
@@ -106,14 +112,23 @@ wait_router
 
 # -- [2/10] Node 1 provisioner ------------------------------------------------
 echo ""
-echo "[2/10] Starting provisioner on $NODE1 (5 models)..."
+if [ "$EXPERIMENT_MODE" = "dynamic" ]; then
+    echo "[2/10] Starting provisioner on $NODE1 (dynamic — 2 seed models, cold-spinup enabled)..."
+    PROV_FLAGS="--router-mode ttca"
+    PROV_INITIAL="qwen-7b,deepseek-r1-7b"
+    echo "  Seed models  : $PROV_INITIAL"
+    echo "  Cold models  : coder-32b, gemma-3-27b, deepseek-r1-14b (spun up on demand)"
+else
+    echo "[2/10] Starting provisioner on $NODE1 (static — all 5 models pre-loaded)..."
+    PROV_FLAGS="--router-mode ttca --static"
+    PROV_INITIAL="qwen-7b,deepseek-r1-7b,coder-32b,gemma-3-27b,deepseek-r1-14b"
+fi
 nohup python provisioner/dynamic_provisioner.py \
     --router-url   "$ROUTER_URL" \
     --node-host    "$NODE1" \
-    --router-mode  ttca \
-    --static \
+    $PROV_FLAGS \
     --priors-path  "$PRIORS_FILE" \
-    --initial-models qwen-7b,deepseek-r1-7b,coder-32b,gemma-3-27b,deepseek-r1-14b \
+    --initial-models "$PROV_INITIAL" \
     > "$LOG_DIR/provisioner_node1.log" 2>&1 &
 echo "  PID: $!  log: $LOG_DIR/provisioner_node1.log"
 
@@ -142,10 +157,15 @@ ssh "$NODE2" "
 " < /dev/null
 echo "  log: $LOG_DIR/provisioner_node2.log (on $NODE2)"
 
-# -- [4/10] Wait for all 6 models + seed with placeholder priors -------------
+# -- [4/10] Wait for models + seed priors -------------------------------------
 echo ""
-echo "[4/10] Waiting for all 6 models..."
-wait_models 6
+if [ "$EXPERIMENT_MODE" = "dynamic" ]; then
+    echo "[4/10] Waiting for seed models (dynamic: 2 node-1 + llama4-scout on node2)..."
+    wait_models 3   # qwen-7b + deepseek-r1-7b + llama4-scout
+else
+    echo "[4/10] Waiting for all 6 models (static mode)..."
+    wait_models 6
+fi
 
 echo "  Seeding models with placeholder priors (will be replaced after eval)..."
 python tests/register_with_priors.py \
@@ -158,8 +178,6 @@ curl --noproxy '*' -sf "$ROUTER_URL/v1/models" \
     | python3 -c "import sys,json; [print(f'    {m[\"id\"]}') for m in json.load(sys.stdin)['data']]"
 
 # -- [5/10] Eval matrix -------------------------------------------------------
-# Sends every query to every model and scores against ground truth.
-# Ground truth is embedded in datasets/hf_1000.json (HuggingFace benchmarks).
 echo ""
 echo "[5/10] Building eval matrix (6 models x 1000 queries, ~30-45 min)..."
 echo "  Ground truth from $DATASET -- no manual labelling needed."
@@ -169,7 +187,7 @@ python tests/eval_all_models.py \
     --concurrency "$EVAL_CONCURRENCY" \
     --node2-host  "$NODE2"
 
-# -- [6/10] Extract real accuracy priors from eval matrix --------------------
+# -- [6/10] Extract real accuracy priors -------------------------------------
 echo ""
 echo "[6/10] Extracting real accuracy priors from eval results..."
 python tests/extract_priors.py \
@@ -186,7 +204,7 @@ for model, priors in sorted(p.items()):
     print(f'    {model:<24} {len(priors):2} keys  avg={avg:.3f}')
 "
 
-# -- [7/10] Re-register all models with real measured priors -----------------
+# -- [7/10] Re-register with real priors -------------------------------------
 echo ""
 echo "[7/10] Re-registering all models with real accuracy priors..."
 python tests/register_with_priors.py \
@@ -195,9 +213,9 @@ python tests/register_with_priors.py \
     --node2-host "$NODE2"
 echo "  Router now uses measured accuracy -- routing decisions are calibrated."
 
-# -- [8/10] TTCA load test (uses TTCA_ALPHA=$TTCA_ALPHA) ----------------------
+# -- [8/10] TTCA load test ----------------------------------------------------
 echo ""
-echo "[8/10] TTCA router load test (${N_REQUESTS} requests, alpha=${TTCA_ALPHA})..."
+echo "[8/10] TTCA router load test (${N_REQUESTS} requests, alpha=${TTCA_ALPHA}, mode=${EXPERIMENT_MODE})..."
 python tests/load_test.py \
     --dataset     "$DATASET" \
     --router      "$ROUTER_URL" \
@@ -272,15 +290,14 @@ python tests/compare_ttca.py \
 echo ""
 echo "=================================================================="
 echo "  Experiment complete!  $(date)"
-echo "  TTCA_ALPHA used: $TTCA_ALPHA"
+echo "  MODE: $EXPERIMENT_MODE   TTCA_ALPHA: $TTCA_ALPHA"
 echo "  Results in: $RESULTS_DIR/"
 echo "    eval_matrix.csv                  (ground truth correctness)"
 echo "    priors_new.json                  (real measured accuracy priors)"
 echo "    router_ttca.csv                  (TTCA router, alpha=$TTCA_ALPHA)"
 echo "    router_accuracy.csv              (accuracy router results)"
 echo "    rr_baseline.csv                  (round-robin baseline)"
-echo "    compare_categories_ttca.csv      (accuracy/latency/energy/cost: TTCA)"
-echo "    compare_categories_accuracy.csv  (accuracy/latency/energy/cost: accuracy)"
+echo "    compare_categories_ttca.csv      (per-category: accuracy/latency/energy/cost)"
 echo "    compare_ttca_vs_rr.txt           (TTCA metric: router vs baseline)"
 echo "    compare_accuracy_vs_rr.txt       (accuracy metric: router vs baseline)"
 echo "    compare_ttca_vs_accuracy.txt     (TTCA vs accuracy router)"
