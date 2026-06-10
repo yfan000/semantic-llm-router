@@ -3,7 +3,7 @@
 #
 # Reads NODE1 and NODE2 from $PBS_NODEFILE automatically, starts all
 # services, runs all load tests and baselines, then generates comparison
-# reports. Results are saved to results/experiment_<timestamp>/.
+# reports. Results are saved to results/experiment_<timestamp>_alpha<N>/.
 #
 # Usage (inside a PBS interactive job):
 #   qsub -I -l select=2:ngpus=8:ncpus=64 -l walltime=08:00:00 \
@@ -12,6 +12,8 @@
 #   bash scripts/run_experiment.sh
 #
 # Optional env overrides:
+#   TTCA_ALPHA=0.5 bash scripts/run_experiment.sh   # tune accuracy/latency trade-off
+#   TTCA_ALPHA=2.0 bash scripts/run_experiment.sh   # penalize latency quadratically
 #   ROUTER_PORT=8080 N_REQUESTS=1000 CONCURRENCY=50 bash scripts/run_experiment.sh
 
 set -euo pipefail
@@ -23,11 +25,14 @@ DATASET=${DATASET:-"datasets/hf_1000.json"}
 N_REQUESTS=${N_REQUESTS:-1000}
 CONCURRENCY=${CONCURRENCY:-50}
 EVAL_CONCURRENCY=${EVAL_CONCURRENCY:-30}
+# TTCA scoring exponent: score = accuracy / latency^TTCA_ALPHA  (higher = better)
+# 0.0 = pure accuracy  |  1.0 = classic TTCA  |  2.0 = quadratic latency penalty
+TTCA_ALPHA=${TTCA_ALPHA:-1.0}
 LOG_DIR="$HOME/vllm_logs"
 mkdir -p "$LOG_DIR"
 
 TS=$(date +%Y%m%d_%H%M%S)
-RESULTS_DIR="results/experiment_${TS}"
+RESULTS_DIR="results/experiment_${TS}_alpha${TTCA_ALPHA}"
 mkdir -p "$RESULTS_DIR"
 
 # -- Discover nodes from PBS --------------------------------------------------
@@ -45,11 +50,17 @@ ROUTER_URL="http://${NODE1}:${ROUTER_PORT}"
 
 echo "=================================================================="
 echo "  Two-Node Experiment  $(date)"
-echo "  NODE1 : $NODE1  (qwen-7b / deepseek-r1-7b / coder-32b / gemma-3-27b / deepseek-r1-14b)"
-echo "  NODE2 : $NODE2  (llama4-scout, 8 GPUs)"
-echo "  Router: $ROUTER_URL"
-echo "  Output: $RESULTS_DIR"
+echo "  NODE1     : $NODE1  (qwen-7b / deepseek-r1-7b / coder-32b / gemma-3-27b / deepseek-r1-14b)"
+echo "  NODE2     : $NODE2  (llama4-scout, 8 GPUs)"
+echo "  Router    : $ROUTER_URL"
+echo "  TTCA_ALPHA: $TTCA_ALPHA  (score = accuracy / latency^alpha)"
+echo "  Output    : $RESULTS_DIR"
 echo "=================================================================="
+
+# Patch TTCA_ALPHA into config.py so the router uses the requested value.
+echo "  Setting TTCA_ALPHA=$TTCA_ALPHA in semantic_router/config.py..."
+sed -i "s/^TTCA_ALPHA: float = .*/TTCA_ALPHA: float = ${TTCA_ALPHA}/" semantic_router/config.py
+grep "TTCA_ALPHA" semantic_router/config.py
 
 # -- Helper: wait for router --------------------------------------------------
 wait_router() {
@@ -184,9 +195,9 @@ python tests/register_with_priors.py \
     --node2-host "$NODE2"
 echo "  Router now uses measured accuracy -- routing decisions are calibrated."
 
-# -- [8/10] TTCA load test ----------------------------------------------------
+# -- [8/10] TTCA load test (uses TTCA_ALPHA=$TTCA_ALPHA) ----------------------
 echo ""
-echo "[8/10] TTCA router load test (${N_REQUESTS} requests, real priors active)..."
+echo "[8/10] TTCA router load test (${N_REQUESTS} requests, alpha=${TTCA_ALPHA})..."
 python tests/load_test.py \
     --dataset     "$DATASET" \
     --router      "$ROUTER_URL" \
@@ -261,14 +272,15 @@ python tests/compare_ttca.py \
 echo ""
 echo "=================================================================="
 echo "  Experiment complete!  $(date)"
+echo "  TTCA_ALPHA used: $TTCA_ALPHA"
 echo "  Results in: $RESULTS_DIR/"
 echo "    eval_matrix.csv                  (ground truth correctness)"
 echo "    priors_new.json                  (real measured accuracy priors)"
-echo "    router_ttca.csv                  (TTCA router results)"
+echo "    router_ttca.csv                  (TTCA router, alpha=$TTCA_ALPHA)"
 echo "    router_accuracy.csv              (accuracy router results)"
 echo "    rr_baseline.csv                  (round-robin baseline)"
-echo "    compare_categories_ttca.csv      (accuracy/latency/energy/cost: TTCA router)"
-echo "    compare_categories_accuracy.csv  (accuracy/latency/energy/cost: accuracy router)"
+echo "    compare_categories_ttca.csv      (accuracy/latency/energy/cost: TTCA)"
+echo "    compare_categories_accuracy.csv  (accuracy/latency/energy/cost: accuracy)"
 echo "    compare_ttca_vs_rr.txt           (TTCA metric: router vs baseline)"
 echo "    compare_accuracy_vs_rr.txt       (accuracy metric: router vs baseline)"
 echo "    compare_ttca_vs_accuracy.txt     (TTCA vs accuracy router)"
