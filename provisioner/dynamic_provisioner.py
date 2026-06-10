@@ -1071,10 +1071,17 @@ class DynamicProvisioner:
         self._last_action_time = 0.0
         log.info("Initial models ready. Cooldown reset -- reactive scaling enabled.")
 
+        # Register all cold (non-running) models with the router so it can
+        # score them in the TTCA amortized spin-up formula.
+        await self._cold_register_all()
+
         while True:
             try:
                 log.info("--- Poll: %d models running, %d GPUs free ---",
                          len(self.running), self.gpu_pool.free_count())
+                # Always drain the router spin-up queue first (router-triggered spin-ups
+                # take priority over the provisioner's own reactive decisions).
+                await self._process_spin_up_queue()
                 if static:
                     # Static mode: only check for dead processes, no scale decisions.
                     await self._check_dead_processes()
@@ -1083,6 +1090,48 @@ class DynamicProvisioner:
             except Exception as e:
                 log.error("Provisioner loop error: %s", e)
             await asyncio.sleep(self.poll_interval)
+
+    async def _cold_register_all(self) -> None:
+        """Register all MODEL_CATALOG entries that are not currently running with the
+        router as 'cold' models.  The router uses these specs to score cold models
+        alongside running ones and request proactive spin-up when worthwhile."""
+        priors = self._load_priors()
+        for model_id, spec in MODEL_CATALOG.items():
+            if model_id in self.running or model_id.endswith("-replica"):
+                continue
+            payload = {
+                "model_id":            model_id,
+                "domains":             spec.domains,
+                "accuracy_priors":     priors.get(model_id, {}),
+                "estimated_latency_ms": self._estimate_latency_ms(model_id),
+                # Use half of STARTUP_WAIT_S as the expected spin-up time (optimistic).
+                "estimated_spin_up_ms": STARTUP_WAIT_S * 500,
+            }
+            try:
+                await self._router_post("/router/cold-register", payload)
+                log.info("Cold-registered %s with router", model_id)
+            except Exception as e:
+                log.warning("Failed to cold-register %s: %s", model_id, e)
+
+    async def _process_spin_up_queue(self) -> None:
+        """Drain the router's spin-up queue and spin up each requested model.
+        The router enqueues model IDs when their amortized TTCA score beats the
+        running fleet — this allows the router to proactively trigger spin-ups
+        based on live traffic patterns rather than waiting for the provisioner's
+        reactive poll cycle."""
+        try:
+            resp = await self._router_get("/router/spin-up-queue")
+            for model_id in resp.get("spin_up", []):
+                if model_id in self.running:
+                    log.debug("Spin-up queue: %s already running", model_id)
+                    continue
+                if model_id not in MODEL_CATALOG:
+                    log.warning("Spin-up queue: unknown model %s — skipping", model_id)
+                    continue
+                log.info("Router requested spin-up of %s — processing", model_id)
+                await self.spin_up(model_id, reason="router_requested")
+        except Exception as e:
+            log.debug("Could not poll spin-up queue: %s", e)
 
     async def shutdown(self) -> None:
         log.info("Shutting down — stopping all models")
