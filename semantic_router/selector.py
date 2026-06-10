@@ -3,6 +3,7 @@ import logging
 from fastapi import HTTPException
 from semantic_router.schemas import BidResponse, UserPreference, RouterMode
 from semantic_router.reputation_tracker import ReputationTracker
+from semantic_router.config import TTCA_ALPHA
 
 log = logging.getLogger(__name__)
 
@@ -35,7 +36,6 @@ def select(
         and (pref.min_accuracy is None or b.estimated_accuracy >= pref.min_accuracy)
     ]
     if not candidates:
-        # SLO/accuracy violated by all models -- fall back to fastest available
         fastest = sorted(bids, key=lambda b: b.estimated_latency_ms)
         candidates = fastest[:1]
         log.warning(
@@ -62,12 +62,9 @@ def select(
         )
         scores[bid.model_id] = s
         log.info(
-            "  %-22s acc=%.3f cost=%.6f lat=%dms energy=%.2fJ "
-            "cost_norm=%.3f lat_norm=%.3f energy_norm=%.3f -> score=%.4f",
+            "  %-22s acc=%.3f cost=%.6f lat=%dms energy=%.2fJ -> score=%.4f",
             bid.model_id, bid.estimated_accuracy, bid.estimated_cost_usd,
-            bid.estimated_latency_ms, bid.estimated_energy_j,
-            ec / max_cost, bid.estimated_latency_ms / max_lat,
-            bid.estimated_energy_j / max_energy, s,
+            bid.estimated_latency_ms, bid.estimated_energy_j, s,
         )
 
     winner = min(candidates, key=lambda b: scores[b.model_id])
@@ -84,17 +81,9 @@ def rank_bids(
 ) -> list[BidResponse]:
     """Return all bids sorted best-first by weighted score.
 
-    Used by the inference retry loop -- if the top model fails during
-    dispatch, the caller tries the next-best model in this ranked list.
-    Unlike select(), this never raises: an empty list is returned when
-    there are no bids.
-
-    TTCA mode uses latency/accuracy directly (not a weighted sum) because
-    E[time to correct answer] = latency / accuracy. This correctly prefers
-    fast models even at lower accuracy when retry is available:
-      E[TTCA small-first] = p*L_s + (1-p)*(L_s+L_l)  (typically lower)
-      E[TTCA large-first] = p*L_l + (1-p)*(L_l+L_s)  (typically higher)
-    Optimal ordering: sort by L/p ascending.
+    TTCA mode scores = accuracy / latency^TTCA_ALPHA  (higher = better).
+    TTCA_ALPHA controls the latency penalty:
+      0.0 = pure accuracy  |  1.0 = classic TTCA  |  2.0 = quadratic latency penalty
     """
     if not bids:
         return []
@@ -111,14 +100,10 @@ def rank_bids(
     if not candidates:
         candidates = sorted(bids, key=lambda b: b.estimated_latency_ms)
 
-    # TTCA mode: sort by latency/accuracy (expected time to correct answer).
-    # This is mathematically optimal when retry-on-wrong-answer is enabled.
-    # A fast model with 50% accuracy (L/p=1000) beats a slow model with 95%
-    # accuracy (L/p=2105) because trying fast-first reduces expected total time.
+    # TTCA mode: score = accuracy / latency^alpha  (higher = better, sorted descending)
     #
     # Latency source (in priority order):
     #   1. Per-category EMA: actual latency for THIS domain:complexity (most accurate)
-    #      -- critical because reasoning models are 5x slower on math:hard vs factual:easy
     #   2. Global EMA: actual latency averaged over all categories
     #   3. Bid estimate: output_tokens/throughput formula (cold start only)
     if pref.mode == RouterMode.TTCA:
@@ -129,22 +114,25 @@ def rank_bids(
             lat = per_cat if per_cat is not None else (
                 global_ if global_ is not None else bid.estimated_latency_ms
             )
-            return lat / acc
+            lat = max(lat, 1.0)   # guard against zero/negative
+            return acc / (lat ** TTCA_ALPHA)   # higher = better
 
-        ranked = sorted(candidates, key=ttca_score)
+        ranked = sorted(candidates, key=ttca_score, reverse=True)   # highest score first
         for bid in ranked:
             per_cat = reputation.get_avg_latency_ms_per_cat(bid.model_id, domain, complexity)
             global_  = reputation.get_avg_latency_ms(bid.model_id)
             lat = per_cat if per_cat is not None else (
                 global_ if global_ is not None else bid.estimated_latency_ms
             )
+            lat = max(lat, 1.0)
             src = "per-cat" if per_cat is not None else (
                 "global" if global_ is not None else "estimated"
             )
+            score = bid.estimated_accuracy / (lat ** TTCA_ALPHA)
             log.info(
-                "  TTCA %-22s lat=%.0fms(%s) acc=%.3f -> lat/acc=%.1f",
+                "  TTCA %-22s lat=%dms(%s) acc=%.3f α=%.1f → acc/lat^α=%.4f",
                 bid.model_id, lat, src,
-                bid.estimated_accuracy, lat / max(bid.estimated_accuracy, 0.01),
+                bid.estimated_accuracy, TTCA_ALPHA, score,
             )
         return ranked
 

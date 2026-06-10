@@ -13,7 +13,7 @@ MODE_PRESETS: dict[RouterMode, dict] = {
         accuracy_weight=0.20, cost_weight=0.55,
         latency_weight=0.15, energy_weight=0.10,
     ),
-    # TTCA mode uses latency/accuracy scoring in selector.py (not a weighted preset)
+    # TTCA mode uses accuracy/latency^alpha scoring in selector.py (not a weighted preset)
     # -- no entry needed here since rank_bids() handles it directly.
 }
 
@@ -21,7 +21,7 @@ DEFAULT_PREFERENCE = UserPreference()  # equal weights, no hard constraints
 
 # Bidding
 BID_TIMEOUT_MS: int = 500
-SAMPLE_RATE: float = 0.20          # fraction of requests sent to accuracy judge (increased from 0.05 for faster prior updates)
+SAMPLE_RATE: float = 0.20          # fraction of requests sent to accuracy judge
 JUDGE_BATCH_SIZE: int = 10         # max items per judge batch
 JUDGE_BATCH_WINDOW_S: float = 2.0  # seconds to wait before flushing a partial batch
 JUDGE_QUEUE_MAX: int = 1000        # drop samples when queue is full
@@ -29,9 +29,12 @@ JUDGE_QUEUE_MAX: int = 1000        # drop samples when queue is full
 # Latency reputation
 LATENCY_EMA_ALPHA: float = 0.05
 LATENCY_GRACE_RATIO: float = 1.10      # up to 10% overrun treated as accurate
+# TTCA scoring exponent on latency.  score = accuracy / latency^TTCA_ALPHA  (higher = better)
+# 1.0 = classic lat/acc inverted; 0.0 = pure accuracy; 2.0 = quadratic latency penalty.
+TTCA_ALPHA: float = 1.0
 
 # Accuracy prior (judge-scored, updates eligibility floor)
-ACCURACY_EMA_ALPHA: float = 0.10  # increased from 0.05 for faster adaptation to observed accuracy
+ACCURACY_EMA_ALPHA: float = 0.10
 DEFAULT_ACCURACY_PRIOR: float = 0.70
 
 # Accuracy bid reliability (penalises models that overbid estimated_accuracy)
@@ -49,24 +52,20 @@ JUDGE_ENDPOINTS: dict[str, tuple[str, str]] = {}
 BENCHMARK_PATH: str | None = "datasets/hf_1000.json"
 
 # Per-request latency SLO (ms) by domain x complexity.
-# Applied automatically after semantic classification if the user has not
-# set max_latency_ms explicitly. Override per-request via extra_body.router.max_latency_ms.
-# Tighter SLOs for easy tasks force fast models (7B) to be selected,
-# reducing TTCA by avoiding large model overhead on simple requests.
 LATENCY_SLO_MS: dict[tuple[str, str], int] = {
     ("factual",   "easy"):   1000,
     ("factual",   "medium"): 2000,
     ("factual",   "hard"):   4000,
-    ("math",      "easy"):   1000,  # tightened from 1500 -- force fast model
+    ("math",      "easy"):   1000,
     ("math",      "medium"): 3000,
     ("math",      "hard"):   6000,
-    ("code",      "easy"):   1500,  # tightened from 2000 -- force fast model
+    ("code",      "easy"):   1500,
     ("code",      "medium"): 4000,
     ("code",      "hard"):   8000,
-    ("reasoning", "easy"):   1000,  # tightened from 1500 -- force fast model
+    ("reasoning", "easy"):   1000,
     ("reasoning", "medium"): 3000,
     ("reasoning", "hard"):   6000,
-    ("creative",  "easy"):   1500,  # tightened from 2000 -- force fast model
+    ("creative",  "easy"):   1500,
     ("creative",  "medium"): 5000,
     ("creative",  "hard"):   8000,
 }
