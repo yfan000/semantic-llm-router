@@ -105,9 +105,18 @@ class VLLMAdapter(ModelAdapter):
         waiting = self._last_waiting
         running  = self._last_running   # already clamped to >= 1.0 in get_load()
 
-        # Queue time: each waiting request must complete roughly one full decode
-        # cycle before this request can start.
-        queue_ms = waiting * (out / self.decode_tokens_per_sec * 1000)
+        # Queue time: num_waiting / requests_per_second
+        # requests_per_second = num_running / avg_latency_s  (continuous batching
+        # completes num_running requests roughly every avg_latency interval)
+        # → queue_ms = num_waiting × avg_latency_ms / num_running
+        #
+        # Using avg_latency_ms (EMA of actual response time) avoids assuming all
+        # waiting requests have the same token count as the current request.
+        # Falls back to formula estimate on cold start (no history yet).
+        avg_lat = (self._reputation.get_avg_latency_ms(self.model_id)
+                   if self._reputation is not None else None)
+        per_req_ms = avg_lat if avg_lat is not None else (out / self.decode_tokens_per_sec * 1000)
+        queue_ms = waiting * per_req_ms / running
 
         # Prefill time: GPU processes all input tokens in parallel (compute-bound,
         # much faster per token than decode).
