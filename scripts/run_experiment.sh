@@ -215,7 +215,6 @@ python tests/round_robin_test.py \
     --concurrency "$CONCURRENCY" \
     --node2-host  "$NODE2"
 
-# Per-category breakdown: accuracy / latency / energy / cost
 echo ""
 echo "=== Per-category: TTCA router vs Round-Robin ===" | tee "$RESULTS_DIR/compare_categories_ttca.txt"
 python tests/compare_categories.py \
@@ -234,7 +233,6 @@ python tests/compare_categories.py \
     --output      "$RESULTS_DIR/compare_categories_accuracy.csv" \
     | tee -a "$RESULTS_DIR/compare_categories_accuracy.txt"
 
-# TTCA metric comparisons
 echo ""
 echo "=== TTCA router vs Round-Robin ===" | tee "$RESULTS_DIR/compare_ttca_vs_rr.txt"
 python tests/compare_ttca.py \
