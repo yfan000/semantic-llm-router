@@ -1,18 +1,8 @@
-"""
-round_robin_test.py — Baseline load test using round-robin model selection.
+"""round_robin_test.py -- Baseline load test using round-robin model selection.
 
 Usage:
-    # 5 node-1 models only
-    python tests/round_robin_test.py \
-        --dataset datasets/hf_1000.json \
-        --output results/round_robin.csv \
-        --concurrency 50
-
-    # All 6 models (include llama4-scout on node 2)
-    python tests/round_robin_test.py \
-        --dataset datasets/hf_1000.json \
-        --node2-host sophia-gpu-09 \
-        --output results/round_robin.csv
+    python tests/round_robin_test.py --dataset datasets/hf_1000.json \\
+        --concurrency 50 --output results/round_robin.csv
 """
 from __future__ import annotations
 import argparse
@@ -29,70 +19,19 @@ from statistics import mean
 import httpx
 
 LATENCY_SLO_MS: dict[tuple[str, str], int] = {
-    ("factual",   "easy"):   1000,
-    ("factual",   "medium"): 2000,
-    ("factual",   "hard"):   4000,
-    ("math",      "easy"):   1000,
-    ("math",      "medium"): 3000,
-    ("math",      "hard"):   6000,
-    ("code",      "easy"):   1500,
-    ("code",      "medium"): 4000,
-    ("code",      "hard"):   8000,
-    ("reasoning", "easy"):   1000,
-    ("reasoning", "medium"): 3000,
-    ("reasoning", "hard"):   6000,
-    ("creative",  "easy"):   1500,
-    ("creative",  "medium"): 5000,
-    ("creative",  "hard"):   8000,
+    ("factual",   "easy"):   1000, ("factual",   "medium"): 2000, ("factual",   "hard"):   4000,
+    ("math",      "easy"):   1500, ("math",      "medium"): 3000, ("math",      "hard"):   6000,
+    ("code",      "easy"):   2000, ("code",      "medium"): 4000, ("code",      "hard"):   8000,
+    ("reasoning", "easy"):   1500, ("reasoning", "medium"): 3000, ("reasoning", "hard"):   6000,
+    ("creative",  "easy"):   2000, ("creative",  "medium"): 5000, ("creative",  "hard"):   8000,
 }
 
-# ---------------------------------------------------------------------------
-# Node 1 backends (always included).
-# llama4-scout added dynamically via --node2-host.
-# ---------------------------------------------------------------------------
-
 BACKENDS = [
-    {
-        "model_id":                    "qwen-7b",
-        "model_name":                  "Qwen/Qwen2.5-7B-Instruct",
-        "base_url":                    "http://localhost:8000",
-        "input_rate_usd_per_token":    0.0000003,
-        "output_rate_usd_per_token":   0.0000006,
-        "efficiency_tokens_per_joule": 13.0,
-    },
-    {
-        "model_id":                    "deepseek-r1-7b",
-        "model_name":                  "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B",
-        "base_url":                    "http://localhost:8001",
-        "input_rate_usd_per_token":    0.0000003,
-        "output_rate_usd_per_token":   0.0000006,
-        "efficiency_tokens_per_joule": 13.0,
-    },
-    {
-        "model_id":                    "coder-32b",
-        "model_name":                  "Qwen/Qwen2.5-Coder-32B-Instruct",
-        "base_url":                    "http://localhost:8002",
-        "input_rate_usd_per_token":    0.0000010,
-        "output_rate_usd_per_token":   0.0000020,
-        "efficiency_tokens_per_joule": 4.0,
-    },
-    {
-        "model_id":                    "gemma-3-27b",
-        "model_name":                  "google/gemma-3-27b-it",
-        "base_url":                    "http://localhost:8003",
-        "input_rate_usd_per_token":    0.0000008,
-        "output_rate_usd_per_token":   0.0000016,
-        "efficiency_tokens_per_joule": 5.0,
-    },
-    {
-        "model_id":                    "deepseek-r1-14b",
-        "model_name":                  "deepseek-ai/DeepSeek-R1-Distill-Qwen-14B",
-        "base_url":                    "http://localhost:8004",
-        "input_rate_usd_per_token":    0.0000005,
-        "output_rate_usd_per_token":   0.0000010,
-        "efficiency_tokens_per_joule": 6.0,
-    },
-    # llama4-scout added dynamically via --node2-host (lives on node 2, port 8005)
+    {"model_id": "qwen-7b",         "model_name": "Qwen/Qwen2.5-7B-Instruct",                  "base_url": "http://localhost:8000", "input_rate_usd_per_token": 0.0000003, "output_rate_usd_per_token": 0.0000006, "efficiency_tokens_per_joule": 13.0},
+    {"model_id": "deepseek-r1-7b",  "model_name": "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B",   "base_url": "http://localhost:8001", "input_rate_usd_per_token": 0.0000003, "output_rate_usd_per_token": 0.0000006, "efficiency_tokens_per_joule": 13.0},
+    {"model_id": "qwen3-coder-30b", "model_name": "Qwen/Qwen3-Coder-30B-A3B",                  "base_url": "http://localhost:8002", "input_rate_usd_per_token": 0.0000007, "output_rate_usd_per_token": 0.0000014, "efficiency_tokens_per_joule": 12.0},
+    {"model_id": "gemma-3-27b",     "model_name": "google/gemma-3-27b-it",                      "base_url": "http://localhost:8003", "input_rate_usd_per_token": 0.0000008, "output_rate_usd_per_token": 0.0000016, "efficiency_tokens_per_joule": 5.0},
+    {"model_id": "deepseek-r1-14b", "model_name": "deepseek-ai/DeepSeek-R1-Distill-Qwen-14B",  "base_url": "http://localhost:8004", "input_rate_usd_per_token": 0.0000005, "output_rate_usd_per_token": 0.0000010, "efficiency_tokens_per_joule": 6.0},
 ]
 
 _single_model: str | None = None
@@ -105,43 +44,30 @@ def build_request_list(n: int, dataset_path: str | None) -> list[dict]:
         if n > len(items):
             items += random.choices(items, k=n - len(items))
         return items[:n]
-
-    pool = [{"domain": d, "complexity": c, "query": q} for d, c, q in [
-        ("factual",   "easy",   "What is the capital of France?"),
-        ("factual",   "medium", "Explain the difference between DNA and RNA."),
-        ("factual",   "hard",   "Explain the geopolitical implications of the Bretton Woods collapse."),
-        ("math",      "easy",   "What is 15% of 240?"),
-        ("math",      "medium", "Solve the quadratic equation x^2 - 5x + 6 = 0."),
-        ("math",      "hard",   "Prove that there are infinitely many prime numbers."),
-        ("code",      "easy",   "Write a Python function to reverse a string."),
-        ("code",      "medium", "Implement a binary search algorithm in Python."),
-        ("code",      "hard",   "Implement a thread-safe singleton pattern in Python."),
-        ("reasoning", "easy",   "All mammals are warm-blooded. Whales are mammals. Are whales warm-blooded?"),
-        ("reasoning", "medium", "Compare SQL and NoSQL databases for a high-traffic web app."),
-        ("reasoning", "hard",   "Analyse the game-theoretic implications of the prisoner's dilemma for climate agreements."),
-    ]]
-    random.shuffle(pool)
-    if n > len(pool):
-        pool += random.choices(pool, k=n - len(pool))
+    pool = [{"domain": "factual", "complexity": "easy", "query": "What is the capital of France?"}] * n
     return pool[:n]
 
 
-async def send_request(client: httpx.AsyncClient, req_id: int, item: dict, backend: dict) -> dict:
-    input_tokens = sum(len(m.split()) * 1.3 for m in [item["query"]])
+async def send_request(
+    client: httpx.AsyncClient,
+    req_id: int,
+    item: dict,
+    backend: dict,
+) -> dict:
+    input_tokens = len(item["query"].split()) * 1.3
     OUTPUT_TOKENS = {
-        ("factual","easy"):80,   ("factual","medium"):200,   ("factual","hard"):350,
-        ("math","easy"):120,     ("math","medium"):280,       ("math","hard"):450,
-        ("code","easy"):150,     ("code","medium"):350,       ("code","hard"):650,
-        ("creative","easy"):250, ("creative","medium"):500,   ("creative","hard"):800,
-        ("reasoning","easy"):180,("reasoning","medium"):380,  ("reasoning","hard"):600,
+        ("factual","easy"):80, ("factual","medium"):200, ("factual","hard"):350,
+        ("math","easy"):120,   ("math","medium"):280,    ("math","hard"):450,
+        ("code","easy"):150,   ("code","medium"):350,    ("code","hard"):650,
+        ("creative","easy"):250,("creative","medium"):500,("creative","hard"):800,
+        ("reasoning","easy"):180,("reasoning","medium"):380,("reasoning","hard"):600,
     }
-    output_est    = OUTPUT_TOKENS.get((item["domain"], item["complexity"]), 300)
+    output_est = OUTPUT_TOKENS.get((item["domain"], item["complexity"]), 300)
     estimated_cost = (
-        input_tokens * backend["input_rate_usd_per_token"]
-        + output_est * backend["output_rate_usd_per_token"]
+        input_tokens  * backend["input_rate_usd_per_token"]
+        + output_est  * backend["output_rate_usd_per_token"]
     )
     slo_ms = LATENCY_SLO_MS.get((item["domain"], item["complexity"]), None)
-
     result = {
         "req_id":            req_id,
         "domain":            item["domain"],
@@ -164,7 +90,6 @@ async def send_request(client: httpx.AsyncClient, req_id: int, item: dict, backe
         "response_text":     "",
         "error":             "",
     }
-
     t0 = time.monotonic()
     try:
         resp = await client.post(
@@ -182,15 +107,14 @@ async def send_request(client: httpx.AsyncClient, req_id: int, item: dict, backe
         result["status"]            = resp.status_code
         if slo_ms is not None:
             result["slo_violated"] = "true" if wall_ms > slo_ms else "false"
-
         if resp.status_code == 200:
-            body       = resp.json()
+            body = resp.json()
             out_tokens = body.get("usage", {}).get("completion_tokens", output_est)
             result["output_tokens"] = out_tokens
-            result["energy_j"]      = f"{out_tokens / backend['efficiency_tokens_per_joule']:.3f}"
+            result["energy_j"] = f"{out_tokens / backend['efficiency_tokens_per_joule']:.3f}"
             actual_cost = (
-                input_tokens * backend["input_rate_usd_per_token"]
-                + out_tokens * backend["output_rate_usd_per_token"]
+                input_tokens  * backend["input_rate_usd_per_token"]
+                + out_tokens  * backend["output_rate_usd_per_token"]
             )
             result["charged_usd"] = f"{actual_cost:.8f}"
             choices = body.get("choices", [])
@@ -198,33 +122,34 @@ async def send_request(client: httpx.AsyncClient, req_id: int, item: dict, backe
                 result["response_text"] = choices[0].get("message", {}).get("content", "")
         else:
             result["error"] = str(resp.status_code)
-
     except Exception as e:
         result["wall_ms"] = int((time.monotonic() - t0) * 1000)
         result["status"]  = "error"
         result["error"]   = str(e)
-
     return result
 
 
-async def run(n_requests: int, concurrency: int, output: str, dataset_path: str | None, single_model: str | None = None) -> None:
+async def run(
+    n_requests: int,
+    concurrency: int,
+    output: str,
+    dataset_path: str | None,
+    single_model: str | None = None,
+) -> None:
     items = build_request_list(n_requests, dataset_path)
     os.makedirs(os.path.dirname(output) if os.path.dirname(output) else ".", exist_ok=True)
 
     if single_model is not None:
         backend_map = {b["model_id"]: b for b in BACKENDS}
         if single_model not in backend_map:
-            raise ValueError(f"Unknown model '{single_model}'. Valid: {', '.join(backend_map)}")
-        chosen      = backend_map[single_model]
+            raise ValueError(f"Unknown model '{single_model}'")
+        chosen = backend_map[single_model]
         assignments = [chosen] * n_requests
         print(f"\n  [Single-Model] {n_requests} requests -> {single_model}, concurrency={concurrency}")
     else:
-        rr          = itertools.cycle(BACKENDS)
+        rr = itertools.cycle(BACKENDS)
         assignments = [next(rr) for _ in range(n_requests)]
         print(f"\n  [Round-Robin] {n_requests} requests, concurrency={concurrency}")
-        print(f"  Backends: {' | '.join(b['model_id'] for b in BACKENDS)}")
-
-    print(f"  Output: {output}\n")
 
     fieldnames = [
         "req_id", "domain", "complexity", "query", "ground_truth", "mode", "status",
@@ -234,9 +159,10 @@ async def run(n_requests: int, concurrency: int, output: str, dataset_path: str 
     ]
 
     results: list[dict] = []
-    sem     = asyncio.Semaphore(concurrency)
-    done    = 0
+    sem = asyncio.Semaphore(concurrency)
+    done = 0
     t0_wall = time.monotonic()
+    print(f"  Output: {output}\n")
 
     async def bounded(req_id: int, item: dict, backend: dict, writer, f) -> None:
         nonlocal done
@@ -261,16 +187,14 @@ async def run(n_requests: int, concurrency: int, output: str, dataset_path: str 
         ])
 
     elapsed = time.monotonic() - t0_wall
-    ok      = [r for r in results if r["status"] == 200]
+    ok = [r for r in results if r["status"] == 200]
     print(f"\r  [{'='*40}] {n_requests}/{n_requests}  ({elapsed:.1f}s, {n_requests/elapsed:.1f} req/s)\n")
-
     print(f"  Successful : {len(ok)}/{n_requests}")
     mc: dict[str, int] = {}
     for r in ok:
         mc[r["model_winner"]] = mc.get(r["model_winner"], 0) + 1
     for m, c in sorted(mc.items(), key=lambda x: -x[1]):
-        print(f"  {m:<22} {c} requests ({100*c//max(len(ok),1)}%)")
-
+        print(f"  {m:<22} {c} requests ({100*c//len(ok)}%)")
     costs = [float(r["charged_usd"]) for r in ok if r["charged_usd"]]
     if costs:
         print(f"  Total cost : ${sum(costs):.6f}  avg=${mean(costs):.8f}")
@@ -284,31 +208,24 @@ def main() -> None:
     parser.add_argument("--concurrency", type=int, default=50)
     parser.add_argument("--output",      default="")
     parser.add_argument("--dataset",     default=None)
-    parser.add_argument("--node2-host",  default=None,
-                        help="Hostname of node 2 running llama4-scout (e.g. sophia-gpu-09). "
-                             "If set, llama4-scout is added to the round-robin pool.")
-    parser.add_argument("--model",       default=None,
-                        help="Send ALL requests to this single model (default: round-robin)")
+    parser.add_argument("--node2-host",  default=None)
+    parser.add_argument("--model",       default=None)
     args = parser.parse_args()
 
     if args.node2_host:
         BACKENDS.append({
-            "model_id":                    "llama4-scout",
-            "model_name":                  "meta-llama/Llama-4-Scout-17B-16E-Instruct",
-            "base_url":                    f"http://{args.node2_host}:8005",
-            "input_rate_usd_per_token":    0.0000010,
-            "output_rate_usd_per_token":   0.0000020,
+            "model_id": "llama4-scout", "model_name": "meta-llama/Llama-4-Scout-17B-16E-Instruct",
+            "base_url": f"http://{args.node2_host}:8005",
+            "input_rate_usd_per_token": 0.0000010, "output_rate_usd_per_token": 0.0000020,
             "efficiency_tokens_per_joule": 3.0,
         })
 
-    valid_models = [b["model_id"] for b in BACKENDS]
-    if args.model and args.model not in valid_models:
-        print(f"Unknown model '{args.model}'. Valid: {', '.join(valid_models)}")
+    if args.model and args.model not in [b["model_id"] for b in BACKENDS]:
+        print(f"Unknown model '{args.model}'.")
         return
 
     if args.model:
         _single_model = args.model
-        print(f"  [Model] All {args.requests} requests -> {args.model}")
 
     if not args.output:
         ts     = datetime.now().strftime("%Y%m%d_%H%M%S")
