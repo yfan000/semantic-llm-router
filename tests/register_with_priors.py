@@ -1,9 +1,21 @@
-"""register_with_priors.py -- Re-register all models with accurate accuracy priors.
+"""
+register_with_priors.py — Re-register all models with accurate accuracy priors
+extracted from eval_matrix.csv by extract_priors.py.
+
+This replaces the initial static guesses with real observed accuracy,
+eliminating the warm-up period where the router makes poor routing decisions.
 
 Workflow:
-    1. python tests/eval_all_models.py --dataset datasets/hf_1000.json
-    2. python tests/extract_priors.py  --eval-matrix results/eval_matrix.csv
+    1. python tests/eval_all_models.py --dataset datasets/hf_1000.json \\
+           --output results/eval_matrix.csv
+    2. python tests/extract_priors.py  --eval-matrix results/eval_matrix.csv \\
+           --output results/priors.json
     3. python tests/register_with_priors.py --priors results/priors.json
+
+Usage:
+    python tests/register_with_priors.py \\
+        --priors      results/priors.json \\
+        --router-url  http://localhost:8080
 """
 from __future__ import annotations
 
@@ -13,6 +25,9 @@ import json
 import httpx
 
 
+# ---------------------------------------------------------------------------
+# Model definitions — edit to match your Sophia setup
+# ---------------------------------------------------------------------------
 MODELS = [
     {
         "model_id":   "qwen-7b",
@@ -42,7 +57,7 @@ MODELS = [
     },
     {
         "model_id":   "qwen3-coder-30b",
-        "model_name": "Qwen/Qwen3-Coder-30B-A3B",
+        "model_name": "Qwen/Qwen3-Coder-30B-A3B-Instruct",
         "backend":    "vllm",
         "base_url":   "http://localhost:8002",
         "domains":    ["code", "math", "reasoning"],
@@ -75,6 +90,7 @@ MODELS = [
         },
         "decode_tokens_per_sec": 900,
     },
+    # llama4-scout lives on node 2 — base_url set dynamically via --node2-host in run_experiment.sh
 ]
 
 NODE2_MODELS = [
@@ -82,7 +98,7 @@ NODE2_MODELS = [
         "model_id":   "llama4-scout",
         "model_name": "meta-llama/Llama-4-Scout-17B-16E-Instruct",
         "backend":    "vllm",
-        "base_url":   "",
+        "base_url":   "",   # filled at runtime from --node2-host
         "domains":    ["factual", "reasoning", "creative", "math", "code"],
         "min_accuracy_capability": {"_default": 0.88},
         "decode_tokens_per_sec": 500,
@@ -97,6 +113,7 @@ def register_all(priors_path: str, router_url: str) -> None:
     print(f"\nRegistering {len(MODELS)} models with accurate priors from {priors_path}\n")
 
     with httpx.Client(timeout=30.0) as client:
+        # Deregister existing models first for a clean slate
         for model in MODELS:
             mid = model["model_id"]
             try:
@@ -108,12 +125,14 @@ def register_all(priors_path: str, router_url: str) -> None:
 
         print()
 
+        # Re-register with accurate priors
         for model in MODELS:
             mid    = model["model_id"]
             priors = all_priors.get(mid, {})
 
             if not priors:
                 print(f"  WARNING: No priors found for '{mid}' in {priors_path}")
+                print(f"           Registering with static min_accuracy_capability only.")
 
             payload = {
                 **model,
@@ -129,24 +148,28 @@ def register_all(priors_path: str, router_url: str) -> None:
 
             if r.status_code == 201:
                 stored = r.json().get("accuracy_priors_stored", {})
-                print(f"  Registered: {mid}")
+                print(f"  ✓ Registered: {mid}")
                 print(f"    Priors stored: {len(stored)} keys")
                 for key, val in sorted(stored.items()):
                     print(f"      {key:<30} {val:.4f}")
             else:
-                print(f"  Failed to register {mid}: {r.status_code} {r.text}")
+                print(f"  ✗ Failed to register {mid}: {r.status_code} {r.text}")
 
             print()
 
     print("Done. Verify with:")
     print(f"  curl --noproxy '*' {router_url}/v1/models | python -m json.tool")
+    print(f"  curl --noproxy '*' {router_url}/router/health")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--priors",     required=True)
-    parser.add_argument("--router-url", default="http://localhost:8080")
-    parser.add_argument("--node2-host", default=None)
+    parser.add_argument("--priors",     required=True,
+                        help="Path to priors.json from extract_priors.py")
+    parser.add_argument("--router-url", default="http://localhost:8080",
+                        help="Router base URL (default: http://localhost:8080)")
+    parser.add_argument("--node2-host", default=None,
+                        help="Hostname of node 2 for llama4-scout registration (e.g. sophia-gpu-09)")
     args = parser.parse_args()
 
     if args.node2_host:

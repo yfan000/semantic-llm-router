@@ -1,10 +1,19 @@
-"""baseline_complexity_tier.py -- Complexity-tier routing baseline.
+"""
+baseline_complexity_tier.py — Complexity-tier routing baseline.
 
-Routes each query to a fixed model by (domain, complexity).
+Routes each query to a fixed model determined by (domain, complexity).
+Captures the idea of RouterDC / difficulty-calibrated routing without any
+learned classifier: easy→cheap-fast, hard→accurate-expensive.
+
+Produces a CSV in the same format as load_test.py so compare_categories.py
+can compare it against TTCA/round-robin/vllm-sr results.
 
 Usage:
     python tests/baseline_complexity_tier.py \\
-        --dataset datasets/hf_1500.json --output results/baseline_tier.csv
+        --dataset   datasets/hf_1500.json \\
+        --output    results/baseline_tier.csv \\
+        --concurrency 50 \\
+        --node2-host sophia-gpu-09
 """
 from __future__ import annotations
 import argparse
@@ -17,6 +26,16 @@ from datetime import datetime
 from statistics import mean
 
 import httpx
+
+# ---------------------------------------------------------------------------
+# Tier routing table — (domain, complexity) → model_id
+#
+# Design rationale:
+#   easy   → qwen-7b       (fastest, cheapest; high accuracy on simple tasks)
+#   medium → domain-specific mid-tier (reasoning models for math/code/reasoning,
+#                                      general model for factual)
+#   hard   → deepseek-r1-14b or llama4-scout (highest accuracy)
+# ---------------------------------------------------------------------------
 
 TIER_MAP: dict[tuple[str, str], str] = {
     ("factual",   "easy"):   "qwen-7b",
@@ -33,15 +52,46 @@ TIER_MAP: dict[tuple[str, str], str] = {
     ("reasoning", "hard"):   "deepseek-r1-14b",
 }
 
+# Default tiers for any domain not in the table above
 _COMPLEXITY_DEFAULT = {"easy": "qwen-7b", "medium": "deepseek-r1-7b", "hard": "deepseek-r1-14b"}
 
 BACKENDS: dict[str, dict] = {
-    "qwen-7b":         {"model_name": "Qwen/Qwen2.5-7B-Instruct",                  "base_url": "http://localhost:8000", "input_rate": 0.0000003, "output_rate": 0.0000006, "eff_tok_per_j": 13.0},
-    "deepseek-r1-7b": {"model_name": "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B",   "base_url": "http://localhost:8001", "input_rate": 0.0000003, "output_rate": 0.0000006, "eff_tok_per_j": 13.0},
-    "qwen3-coder-30b":{"model_name": "Qwen/Qwen3-Coder-30B-A3B",                  "base_url": "http://localhost:8002", "input_rate": 0.0000007, "output_rate": 0.0000014, "eff_tok_per_j": 12.0},
-    "gemma-3-27b":    {"model_name": "google/gemma-3-27b-it",                      "base_url": "http://localhost:8003", "input_rate": 0.0000008, "output_rate": 0.0000016, "eff_tok_per_j": 5.0},
-    "deepseek-r1-14b":{"model_name": "deepseek-ai/DeepSeek-R1-Distill-Qwen-14B",  "base_url": "http://localhost:8004", "input_rate": 0.0000005, "output_rate": 0.0000010, "eff_tok_per_j": 6.0},
-    "llama4-scout":   {"model_name": "meta-llama/Llama-4-Scout-17B-16E-Instruct",  "base_url": "",                     "input_rate": 0.0000010, "output_rate": 0.0000020, "eff_tok_per_j": 3.0},
+    "qwen-7b": {
+        "model_name": "Qwen/Qwen2.5-7B-Instruct",
+        "base_url":   "http://localhost:8000",
+        "input_rate":  0.0000003, "output_rate": 0.0000006,
+        "eff_tok_per_j": 13.0,
+    },
+    "deepseek-r1-7b": {
+        "model_name": "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B",
+        "base_url":   "http://localhost:8001",
+        "input_rate":  0.0000003, "output_rate": 0.0000006,
+        "eff_tok_per_j": 13.0,
+    },
+    "qwen3-coder-30b": {
+        "model_name": "Qwen/Qwen3-Coder-30B-A3B-Instruct",
+        "base_url":   "http://localhost:8002",
+        "input_rate":  0.0000007, "output_rate": 0.0000014,
+        "eff_tok_per_j": 12.0,
+    },
+    "gemma-3-27b": {
+        "model_name": "google/gemma-3-27b-it",
+        "base_url":   "http://localhost:8003",
+        "input_rate":  0.0000008, "output_rate": 0.0000016,
+        "eff_tok_per_j": 5.0,
+    },
+    "deepseek-r1-14b": {
+        "model_name": "deepseek-ai/DeepSeek-R1-Distill-Qwen-14B",
+        "base_url":   "http://localhost:8004",
+        "input_rate":  0.0000005, "output_rate": 0.0000010,
+        "eff_tok_per_j": 6.0,
+    },
+    "llama4-scout": {
+        "model_name": "meta-llama/Llama-4-Scout-17B-16E-Instruct",
+        "base_url":   "",  # filled in via --node2-host
+        "input_rate":  0.0000010, "output_rate": 0.0000020,
+        "eff_tok_per_j": 3.0,
+    },
 }
 
 OUTPUT_TOKENS: dict[tuple[str, str], int] = {
@@ -60,7 +110,8 @@ FIELDNAMES = [
 
 
 def pick_model(domain: str, complexity: str) -> str:
-    return TIER_MAP.get((domain, complexity), _COMPLEXITY_DEFAULT.get(complexity, "qwen-7b"))
+    return TIER_MAP.get((domain, complexity),
+                        _COMPLEXITY_DEFAULT.get(complexity, "qwen-7b"))
 
 
 async def send_one(client: httpx.AsyncClient, req_id: int, item: dict) -> dict:
@@ -68,33 +119,55 @@ async def send_one(client: httpx.AsyncClient, req_id: int, item: dict) -> dict:
     complexity = item["complexity"]
     model_id   = pick_model(domain, complexity)
     backend    = BACKENDS[model_id]
+
     input_tokens = len(item["query"].split()) * 1.3
     out_est      = OUTPUT_TOKENS.get((domain, complexity), 300)
     cost_est     = input_tokens * backend["input_rate"] + out_est * backend["output_rate"]
+
     result = {
-        "req_id": req_id, "domain": domain, "complexity": complexity,
-        "query": item["query"][:100], "ground_truth": str(item.get("ground_truth", "")),
-        "mode": "complexity_tier", "status": "", "model_winner": model_id,
-        "bid_latency_ms": "", "actual_latency_ms": "", "ttft_ms": "",
-        "output_tokens": "", "charged_usd": f"{cost_est:.8f}",
-        "energy_j": "", "load": "", "wall_ms": "",
-        "slo_ms": "", "slo_violated": "", "response_text": "", "error": "",
+        "req_id":            req_id,
+        "domain":            domain,
+        "complexity":        complexity,
+        "query":             item["query"][:100],
+        "ground_truth":      str(item.get("ground_truth", "")),
+        "mode":              "complexity_tier",
+        "status":            "",
+        "model_winner":      model_id,
+        "bid_latency_ms":    "",
+        "actual_latency_ms": "",
+        "ttft_ms":           "",
+        "output_tokens":     "",
+        "charged_usd":       f"{cost_est:.8f}",
+        "energy_j":          "",
+        "load":              "",
+        "wall_ms":           "",
+        "slo_ms":            "",
+        "slo_violated":      "",
+        "response_text":     "",
+        "error":             "",
     }
+
     t0 = time.monotonic()
     try:
         resp = await client.post(
             f"{backend['base_url']}/v1/chat/completions",
-            json={"model": backend["model_name"], "messages": [{"role": "user", "content": item["query"]}], "max_tokens": 512},
+            json={
+                "model":      backend["model_name"],
+                "messages":   [{"role": "user", "content": item["query"]}],
+                "max_tokens": 512,
+            },
         )
         wall_ms = int((time.monotonic() - t0) * 1000)
         result["wall_ms"] = result["actual_latency_ms"] = result["ttft_ms"] = wall_ms
         result["status"]  = resp.status_code
+
         if resp.status_code == 200:
             body       = resp.json()
             out_tokens = body.get("usage", {}).get("completion_tokens", out_est)
             result["output_tokens"] = out_tokens
             result["energy_j"]      = f"{out_tokens / backend['eff_tok_per_j']:.3f}"
-            actual_cost = input_tokens * backend["input_rate"] + out_tokens * backend["output_rate"]
+            actual_cost = (input_tokens * backend["input_rate"]
+                           + out_tokens  * backend["output_rate"])
             result["charged_usd"]    = f"{actual_cost:.8f}"
             choices = body.get("choices", [])
             if choices:
@@ -105,6 +178,7 @@ async def send_one(client: httpx.AsyncClient, req_id: int, item: dict) -> dict:
         result["wall_ms"] = int((time.monotonic() - t0) * 1000)
         result["status"]  = "error"
         result["error"]   = str(e)[:200]
+
     return result
 
 
@@ -112,12 +186,16 @@ async def run(dataset_path: str, output: str, concurrency: int) -> None:
     with open(dataset_path) as f:
         items = json.load(f)
     n = len(items)
+
     os.makedirs(os.path.dirname(output) if os.path.dirname(output) else ".", exist_ok=True)
     print(f"\n  [Complexity-Tier] {n} requests, concurrency={concurrency}")
     print(f"  Output: {output}\n")
+
+    # Show routing table
     for (d, c), m in sorted(TIER_MAP.items()):
-        print(f"    {d:<12} {c:<8} -> {m}")
+        print(f"    {d:<12} {c:<8} → {m}")
     print()
+
     sem  = asyncio.Semaphore(concurrency)
     done = 0
     t0   = time.monotonic()
@@ -133,15 +211,20 @@ async def run(dataset_path: str, output: str, concurrency: int) -> None:
             if done % max(n // 20, 1) == 0:
                 elapsed = time.monotonic() - t0
                 bar = "=" * int(done / n * 40)
-                print(f"\r  [{bar:<40}] {done}/{n}  {done/elapsed:.1f} req/s", end="", flush=True)
+                print(f"\r  [{bar:<40}] {done}/{n}  {done/elapsed:.1f} req/s",
+                      end="", flush=True)
 
+    results = []
     with open(output, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=FIELDNAMES, extrasaction="ignore")
         writer.writeheader()
-        await asyncio.gather(*[bounded(i, items[i], writer, f) for i in range(n)])
+        tasks = [bounded(i, items[i], writer, f) for i in range(n)]
+        await asyncio.gather(*tasks)
 
     elapsed = time.monotonic() - t0
     print(f"\r  [{'='*40}] {n}/{n}  ({elapsed:.1f}s, {n/elapsed:.1f} req/s)\n")
+
+    # Quick summary
     with open(output, newline="") as f:
         rows = list(csv.DictReader(f))
     ok = [r for r in rows if str(r["status"]) == "200"]
@@ -162,17 +245,22 @@ def main() -> None:
     parser.add_argument("--dataset",     required=True)
     parser.add_argument("--output",      default="")
     parser.add_argument("--concurrency", type=int, default=50)
-    parser.add_argument("--node2-host",  default=None)
+    parser.add_argument("--node2-host",  default=None,
+                        help="Hostname of node 2 for llama4-scout (e.g. sophia-gpu-09)")
     args = parser.parse_args()
+
     if args.node2_host:
         BACKENDS["llama4-scout"]["base_url"] = f"http://{args.node2_host}:8005"
     else:
+        # If no node2-host, fallback hard-tier to deepseek-r1-14b instead of llama4-scout
         for key in list(TIER_MAP):
             if TIER_MAP[key] == "llama4-scout":
                 TIER_MAP[key] = "deepseek-r1-14b"
+
     if not args.output:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         args.output = f"results/baseline_tier_{ts}.csv"
+
     asyncio.run(run(args.dataset, args.output, args.concurrency))
 
 
