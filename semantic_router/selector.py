@@ -3,7 +3,7 @@ import logging
 from fastapi import HTTPException
 from semantic_router.schemas import BidResponse, UserPreference, RouterMode
 from semantic_router.reputation_tracker import ReputationTracker
-from semantic_router.config import TTCA_ALPHA
+from semantic_router.config import TTCA_ALPHA, TTCA_COST_BETA
 
 log = logging.getLogger(__name__)
 
@@ -29,7 +29,6 @@ def select(
     log.info("SELECT domain=%s complexity=%s n_bids=%d acc_weight=%.2f cost_weight=%.2f",
              domain, complexity, len(bids), pref.accuracy_weight, pref.cost_weight)
 
-    # Stage 1 -- hard filter on latency SLO and accuracy floor
     candidates = [
         b for b in bids
         if (pref.max_latency_ms is None or b.estimated_latency_ms <= pref.max_latency_ms)
@@ -43,7 +42,6 @@ def select(
             pref.max_latency_ms, candidates[0].model_id, candidates[0].estimated_latency_ms,
         )
 
-    # Stage 2 -- 4D weighted score (lower = better)
     def effective_cost(bid: BidResponse) -> float:
         return bid.estimated_cost_usd * reputation.get_penalty_multiplier(bid.model_id)
 
@@ -62,7 +60,7 @@ def select(
         )
         scores[bid.model_id] = s
         log.info(
-            "  %-22s acc=%.3f cost=%.6f lat=%dms energy=%.2fJ -> score=%.4f",
+            "  %-22s acc=%.3f cost=%.6f lat=%dms energy=%.2fJ score=%.4f",
             bid.model_id, bid.estimated_accuracy, bid.estimated_cost_usd,
             bid.estimated_latency_ms, bid.estimated_energy_j, s,
         )
@@ -81,9 +79,8 @@ def rank_bids(
 ) -> list[BidResponse]:
     """Return all bids sorted best-first by weighted score.
 
-    TTCA mode scores = accuracy / latency^TTCA_ALPHA  (higher = better).
-    TTCA_ALPHA controls the latency penalty:
-      0.0 = pure accuracy  |  1.0 = classic TTCA  |  2.0 = quadratic latency penalty
+    TTCA mode: score = acc / (lat^alpha x cost^beta)  -- higher is better.
+    beta=0 (default) reduces to classic TTCA acc/lat^alpha.
     """
     if not bids:
         return []
@@ -91,7 +88,6 @@ def rank_bids(
     def effective_cost(bid: BidResponse) -> float:
         return bid.estimated_cost_usd * reputation.get_penalty_multiplier(bid.model_id)
 
-    # Apply hard filters -- SLO and accuracy floor
     candidates = [
         b for b in bids
         if (pref.max_latency_ms is None or b.estimated_latency_ms <= pref.max_latency_ms)
@@ -100,12 +96,6 @@ def rank_bids(
     if not candidates:
         candidates = sorted(bids, key=lambda b: b.estimated_latency_ms)
 
-    # TTCA mode: score = accuracy / latency^alpha  (higher = better, sorted descending)
-    #
-    # Latency source (in priority order):
-    #   1. Per-category EMA: actual latency for THIS domain:complexity (most accurate)
-    #   2. Global EMA: actual latency averaged over all categories
-    #   3. Bid estimate: output_tokens/throughput formula (cold start only)
     if pref.mode == RouterMode.TTCA:
         def ttca_score(bid: BidResponse) -> float:
             acc = max(bid.estimated_accuracy, 0.01)
@@ -114,10 +104,11 @@ def rank_bids(
             lat = per_cat if per_cat is not None else (
                 global_ if global_ is not None else bid.estimated_latency_ms
             )
-            lat = max(lat, 1.0)   # guard against zero/negative
-            return acc / (lat ** TTCA_ALPHA)   # higher = better
+            lat = max(lat, 1.0)
+            cost = max(bid.estimated_cost_usd, 1e-9)
+            return acc / ((lat ** TTCA_ALPHA) * (cost ** TTCA_COST_BETA))
 
-        ranked = sorted(candidates, key=ttca_score, reverse=True)   # highest score first
+        ranked = sorted(candidates, key=ttca_score, reverse=True)
         for bid in ranked:
             per_cat = reputation.get_avg_latency_ms_per_cat(bid.model_id, domain, complexity)
             global_  = reputation.get_avg_latency_ms(bid.model_id)
@@ -128,15 +119,16 @@ def rank_bids(
             src = "per-cat" if per_cat is not None else (
                 "global" if global_ is not None else "estimated"
             )
-            score = bid.estimated_accuracy / (lat ** TTCA_ALPHA)
+            cost = max(bid.estimated_cost_usd, 1e-9)
+            score = bid.estimated_accuracy / ((lat ** TTCA_ALPHA) * (cost ** TTCA_COST_BETA))
             log.info(
-                "  TTCA %-22s lat=%dms(%s) acc=%.3f α=%.1f → acc/lat^α=%.4f",
+                "  TTCA %-22s lat=%dms(%s) acc=%.3f cost=%.6f alpha=%.1f beta=%.1f score=%.4f",
                 bid.model_id, lat, src,
-                bid.estimated_accuracy, TTCA_ALPHA, score,
+                bid.estimated_accuracy, bid.estimated_cost_usd,
+                TTCA_ALPHA, TTCA_COST_BETA, score,
             )
         return ranked
 
-    # All other modes: 4D weighted score (lower = better)
     max_cost   = max(effective_cost(b) for b in candidates) or 1.0
     max_lat    = max(b.estimated_latency_ms for b in candidates) or 1.0
     max_energy = max(b.estimated_energy_j   for b in candidates) or 1.0
