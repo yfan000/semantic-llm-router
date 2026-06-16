@@ -1,23 +1,19 @@
-"""
-build_dataset.py -- Download real benchmark queries from HuggingFace and
-build a balanced 1000-request test set for the semantic LLM router.
+"""build_dataset.py
+
+Download real benchmark queries from HuggingFace and build a balanced
+1500-request test set for the semantic LLM router.
 
 Sources:
-  Factual  : MMLU (57 subjects, graded by difficulty)
-  Math     : GSM8K (grade-school, medium) + MATH benchmark (competition, hard)
-  Code     : HumanEval (easy/medium) + BigCodeBench (medium/hard) + APPS (hard)
-  Reasoning: LogiQA (medium) + HellaSwag (easy) + ARC (easy/hard)
-
-Install dependencies:
-    pip install datasets tqdm
+  Factual  : MMLU
+  Math     : GSM8K + MATH benchmark
+  Code     : HumanEval + BigCodeBench + APPS
+  Reasoning: LogiQA + HellaSwag + ARC
+  Code     : LiveCodeBench (easy/medium/hard) -- execution-scored, 300 samples
 
 Usage:
-    python tests/build_dataset.py                    # saves to datasets/hf_1000.json
-    python tests/build_dataset.py --output my.json   # custom output path
-    python tests/build_dataset.py --count 500        # build 500 instead of 1000
-
-The output JSON can be used directly with load_test.py:
-    python tests/load_test.py --dataset datasets/hf_1000.json
+    python tests/build_dataset.py
+    python tests/build_dataset.py --output my.json
+    python tests/build_dataset.py --count 1200
 """
 from __future__ import annotations
 import argparse
@@ -26,14 +22,9 @@ import os
 import random
 from collections import defaultdict
 
-# ---------------------------------------------------------------------------
-# Dataset loaders
-# ---------------------------------------------------------------------------
 
 def load_mmlu(n: int) -> list[dict]:
-    """MMLU: 57 subjects. Map subjects to easy/medium/hard."""
     from datasets import load_dataset
-
     EASY_SUBJECTS = [
         "high_school_geography", "high_school_us_history", "high_school_world_history",
         "high_school_biology", "high_school_chemistry", "high_school_physics",
@@ -49,10 +40,8 @@ def load_mmlu(n: int) -> list[dict]:
         "professional_psychology", "medical_genetics", "clinical_knowledge",
         "abstract_algebra", "formal_logic", "logical_fallacies",
     ]
-
     results = []
     per_difficulty = n // 3
-
     for subjects, complexity, count in [
         (EASY_SUBJECTS,   "easy",   per_difficulty),
         (MEDIUM_SUBJECTS, "medium", per_difficulty),
@@ -76,12 +65,10 @@ def load_mmlu(n: int) -> list[dict]:
                     })
             except Exception as e:
                 print(f"  [MMLU] skipped {subject}: {e}")
-
     return random.sample(results, min(n, len(results)))
 
 
 def load_gsm8k(n: int) -> list[dict]:
-    """GSM8K: grade-school math word problems. Complexity = medium."""
     from datasets import load_dataset
     ds = load_dataset("openai/gsm8k", "main", split="test", trust_remote_code=False)
     ds = ds.shuffle(seed=42).select(range(min(n, len(ds))))
@@ -98,10 +85,8 @@ def load_gsm8k(n: int) -> list[dict]:
 
 
 def load_math_benchmark(n: int) -> list[dict]:
-    """MATH benchmark: competition math. Level 1-2=easy, 3-4=medium, 5=hard."""
     from datasets import load_dataset
     import re as _re
-
     COMPLEXITY_MAP = {"1": "easy", "2": "easy", "3": "medium", "4": "medium", "5": "hard"}
     ds = None
     for name, cfg, split in [
@@ -114,16 +99,14 @@ def load_math_benchmark(n: int) -> list[dict]:
             break
         except Exception as e:
             print(f"  [MATH/{name}] skipped: {e}")
-
     if ds is None:
         return []
-
     ds = ds.shuffle(seed=42).select(range(min(n * 3, len(ds))))
     results = []
     for row in ds:
         level = str(row.get("level", "3")).replace("Level ", "")
         complexity = COMPLEXITY_MAP.get(level, "medium")
-        problem  = row.get("problem",  row.get("question", ""))
+        problem = row.get("problem", row.get("question", ""))
         solution = row.get("solution", row.get("answer", ""))
         m = _re.search(r"\\boxed\{([^}]+)\}", solution)
         ground_truth = m.group(1) if m else solution.strip()[:50]
@@ -136,15 +119,6 @@ def load_math_benchmark(n: int) -> list[dict]:
 
 
 def load_humaneval(n: int) -> list[dict]:
-    """HumanEval: Python function synthesis.
-
-    Splits by prompt length:
-      short prompt (<=300 chars) -> easy
-      longer prompt              -> medium
-
-    HumanEval includes the function signature so models know the function
-    name to implement, making evaluation reliable.
-    """
     from datasets import load_dataset
     try:
         ds = load_dataset("openai/openai_humaneval", split="test", trust_remote_code=False)
@@ -167,15 +141,6 @@ def load_humaneval(n: int) -> list[dict]:
 
 
 def load_bigcodebench(n: int) -> list[dict]:
-    """BigCodeBench: real-world library usage (numpy, pandas, requests, etc.).
-
-    Better than HumanEval for distinguishing specialized coding models.
-    Tests practical library knowledge where coder-32b excels over general models.
-    HumanEval only tests small isolated functions -- BigCodeBench tests
-    real-world tasks that require knowing specific library APIs.
-
-    Complexity: difficulty <= 2 -> medium, >= 3 -> hard
-    """
     from datasets import load_dataset
     try:
         ds = load_dataset("bigcode/bigcodebench", split="v0.1.2", trust_remote_code=True)
@@ -186,7 +151,6 @@ def load_bigcodebench(n: int) -> list[dict]:
         except Exception as e:
             print(f"  [BigCodeBench] skipped: {e}")
             return []
-
     ds = ds.shuffle(seed=42).select(range(min(n * 2, len(ds))))
     results = []
     for row in ds:
@@ -198,18 +162,18 @@ def load_bigcodebench(n: int) -> list[dict]:
             difficulty = int(difficulty)
         except Exception:
             difficulty = 3
-        complexity   = "medium" if difficulty <= 2 else "hard"
-        ground_truth = row.get("test", "")
+        complexity = "medium" if difficulty <= 2 else "hard"
+        test_code = row.get("test", "")
         results.append({
-            "domain": "code", "complexity": complexity,
+            "domain": "code",
+            "complexity": complexity,
             "query": f"Complete the following Python task:\n\n{prompt.strip()}",
-            "ground_truth": ground_truth,
+            "ground_truth": test_code,
         })
     return results[:n]
 
 
 def load_apps(n: int) -> list[dict]:
-    """APPS: competitive programming. Complexity = hard."""
     from datasets import load_dataset
     try:
         ds = load_dataset("codeparrot/apps", "all", split="test", trust_remote_code=False)
@@ -226,7 +190,6 @@ def load_apps(n: int) -> list[dict]:
 
 
 def load_logiqa(n: int) -> list[dict]:
-    """LogiQA: logical reasoning MCQ. Complexity = medium."""
     from datasets import load_dataset
     try:
         ds = load_dataset("lucasmccabe/logiqa", split="test", trust_remote_code=False)
@@ -239,20 +202,19 @@ def load_logiqa(n: int) -> list[dict]:
     ds = ds.shuffle(seed=42).select(range(min(n, len(ds))))
     results = []
     for row in ds:
-        context  = row.get("context",  row.get("passage",  ""))
-        question = row.get("query",    row.get("question", ""))
-        options  = row.get("options",  row.get("answers",  []))
+        context = row.get("context", row.get("passage", ""))
+        question = row.get("query",   row.get("question", ""))
+        options  = row.get("options", row.get("answers",  []))
         labels   = ["A", "B", "C", "D"]
         opts_str = "\n".join(f"{labels[i]}) {options[i]}" for i in range(min(len(options), 4)))
         query    = f"Context: {context}\n\nQuestion: {question}\n{opts_str}"
-        ans_idx  = row.get("correct_option", row.get("answer", 0))
+        ans_idx = row.get("correct_option", row.get("answer", 0))
         ground_truth = options[ans_idx] if isinstance(ans_idx, int) and ans_idx < len(options) else str(ans_idx)
         results.append({"domain": "reasoning", "complexity": "medium", "query": query, "ground_truth": ground_truth})
     return results
 
 
 def load_hellaswag(n: int) -> list[dict]:
-    """HellaSwag: commonsense sentence completion. Complexity = easy."""
     from datasets import load_dataset
     try:
         ds = load_dataset("Rowan/hellaswag", split="validation", trust_remote_code=False)
@@ -266,14 +228,13 @@ def load_hellaswag(n: int) -> list[dict]:
         labels = ["A", "B", "C", "D"]
         opts   = "\n".join(f"{labels[i]}) {row['endings'][i]}" for i in range(len(row["endings"])))
         query  = f"Choose the best continuation:\n\n{ctx}\n\n{opts}"
-        label  = int(row.get("label", 0))
+        label = int(row.get("label", 0))
         ground_truth = row["endings"][label] if label < len(row["endings"]) else ""
         results.append({"domain": "reasoning", "complexity": "easy", "query": query, "ground_truth": ground_truth})
     return results
 
 
 def load_arc(n: int) -> list[dict]:
-    """ARC: science MCQ. Easy->easy, Challenge->hard."""
     from datasets import load_dataset
     results = []
     for split_name, complexity, count in [("easy", "easy", n//2), ("challenge", "hard", n - n//2)]:
@@ -295,62 +256,142 @@ def load_arc(n: int) -> list[dict]:
     return results
 
 
-# ---------------------------------------------------------------------------
-# Balance and build final dataset
-# ---------------------------------------------------------------------------
+def load_writing_prompts(n: int) -> list[dict]:
+    from datasets import load_dataset
+    try:
+        ds = load_dataset("euclaise/writingprompts", split="train", trust_remote_code=False)
+    except Exception:
+        try:
+            ds = load_dataset("writing_prompts", split="train", trust_remote_code=False)
+        except Exception as e:
+            print(f"  [WritingPrompts] skipped: {e}")
+            return []
+    ds = ds.shuffle(seed=42).select(range(min(n * 2, len(ds))))
+    results = []
+    for row in ds:
+        prompt = row.get("prompt", row.get("story", "")).strip()
+        prompt = prompt.replace("[WP]", "").replace("[SP]", "").replace("[EU]", "").strip()
+        if len(prompt) < 20 or len(prompt) > 600:
+            continue
+        complexity = "hard" if len(prompt.split()) > 40 else "medium"
+        results.append({"domain": "creative", "complexity": complexity,
+                        "query": f"Write a short story or response to this prompt: {prompt}"})
+    return random.sample(results, min(n, len(results)))
+
+
+def _strip_html(text: str) -> str:
+    import re as _re
+    text = _re.sub(r"<[^>]+>", " ", text)
+    for entity, char in [("&lt;", "<"), ("&gt;", ">"), ("&amp;", "&"),
+                         ("&nbsp;", " "), ("&#39;", "'"), ("&quot;", '"')]:
+        text = text.replace(entity, char)
+    return _re.sub(r"\s{2,}", " ", text).strip()
+
+
+def load_livecodebench(n: int) -> list[dict]:
+    """LiveCodeBench: competitive programming problems.
+
+    Uses livecodebench/code_generation_lite. Each item stores test cases as
+    a JSON string in ground_truth, which triggers the execution scorer.
+    """
+    from datasets import load_dataset
+    try:
+        ds = load_dataset("livecodebench/code_generation_lite",
+                          split="test", trust_remote_code=False)
+    except Exception:
+        try:
+            ds = load_dataset("livecodebench/code_generation_lite",
+                              trust_remote_code=False)
+            ds = ds["test"] if "test" in ds else list(ds.values())[0]
+        except Exception as e:
+            print(f"  [LiveCodeBench] skipped: {e}")
+            return []
+
+    COMPLEXITY_MAP = {"easy": "easy", "medium": "medium", "hard": "hard"}
+    ds = ds.shuffle(seed=42)
+    results = []
+    for row in ds:
+        difficulty = str(row.get("difficulty", "medium")).lower().strip()
+        complexity = COMPLEXITY_MAP.get(difficulty, "medium")
+        content = _strip_html(row.get("question_content", "")).strip()
+        starter = (row.get("starter_code") or "").strip()
+        if not content:
+            continue
+        prompt = f"Solve the following programming problem and provide a complete Python solution:\n\n{content}"
+        if starter:
+            prompt += f"\n\nUse this function signature:\n```python\n{starter}\n```"
+        try:
+            raw = row.get("public_test_cases", "[]")
+            test_cases = json.loads(raw) if isinstance(raw, str) else raw
+        except Exception:
+            test_cases = []
+        if not test_cases:
+            continue
+        results.append({
+            "domain":       "code",
+            "complexity":   complexity,
+            "query":        prompt,
+            "ground_truth": json.dumps(test_cases),
+            "source":       "livecodebench",
+        })
+        if len(results) >= n * 3:
+            break
+
+    per_diff: dict[str, list[dict]] = {"easy": [], "medium": [], "hard": []}
+    for item in results:
+        per_diff[item["complexity"]].append(item)
+    per_bucket = n // 3
+    balanced: list[dict] = []
+    for diff, pool in per_diff.items():
+        want = per_bucket if diff != "hard" else n - 2 * per_bucket
+        balanced.extend(random.sample(pool, min(want, len(pool))))
+    return balanced
+
 
 TARGET_DISTRIBUTION = {
-    ("factual",   "easy"):   85,
-    ("factual",   "medium"): 85,
-    ("factual",   "hard"):   80,
-    ("math",      "easy"):   85,
-    ("math",      "medium"): 90,
-    ("math",      "hard"):   75,
-    ("code",      "easy"):   85,
-    ("code",      "medium"): 90,
-    ("code",      "hard"):   75,
-    ("reasoning", "easy"):   85,
-    ("reasoning", "medium"): 90,
-    ("reasoning", "hard"):   75,
+    ("factual",   "easy"):   100,
+    ("factual",   "medium"): 100,
+    ("factual",   "hard"):   100,
+    ("math",      "easy"):   100,
+    ("math",      "medium"): 110,
+    ("math",      "hard"):    90,
+    ("code",      "easy"):   100,
+    ("code",      "medium"): 110,
+    ("code",      "hard"):    90,
+    ("reasoning", "easy"):   100,
+    ("reasoning", "medium"): 110,
+    ("reasoning", "hard"):    90,
 }
 
 
-def build(total: int, output: str) -> None:
+def build(total: int, output: str, lcb_count: int = 300) -> None:
     print(f"\n  Building {total}-request dataset from HuggingFace benchmarks...")
-    print(f"  Output: {output}\n")
-
+    print(f"  Output: {output}  (base={total - lcb_count} + LiveCodeBench={lcb_count})\n")
     os.makedirs(os.path.dirname(output) if os.path.dirname(output) else ".", exist_ok=True)
 
-    print("  Loading datasets:")
     all_items: list[dict] = []
 
     def add(name: str, items: list[dict]) -> None:
         print(f"    {name:<20} {len(items):4} items loaded")
         all_items.extend(items)
 
-    add("MMLU",           load_mmlu(260))
-    add("GSM8K",          load_gsm8k(150))
-    add("MATH benchmark", load_math_benchmark(100))
-    add("HumanEval",      load_humaneval(164))   # easy/medium split by prompt length
-    add("BigCodeBench",   load_bigcodebench(100))  # real-world library tasks (medium/hard)
-    add("APPS",           load_apps(75))
-    add("LogiQA",         load_logiqa(120))
-    add("HellaSwag",      load_hellaswag(100))
-    add("ARC",            load_arc(120))
+    add("MMLU",           load_mmlu(320))
+    add("GSM8K",          load_gsm8k(180))
+    add("MATH benchmark", load_math_benchmark(130))
+    add("HumanEval",      load_humaneval(200))
+    add("BigCodeBench",   load_bigcodebench(130))
+    add("APPS",           load_apps(90))
+    add("LogiQA",         load_logiqa(150))
+    add("HellaSwag",      load_hellaswag(130))
+    add("ARC",            load_arc(150))
 
-    print(f"\n  Total raw items: {len(all_items)}")
+    print(f"\n  Total raw base items: {len(all_items)}")
 
+    base_target = total - lcb_count
     buckets: dict[tuple, list[dict]] = defaultdict(list)
     for item in all_items:
         key = (item["domain"], item["complexity"])
         buckets[key].append(item)
-
-    print("\n  Available per bucket:")
-    for key in sorted(TARGET_DISTRIBUTION):
-        avail  = len(buckets[key])
-        want   = TARGET_DISTRIBUTION[key]
-        status = "OK" if avail >= want else f"only {avail}"
-        print(f"    {key[0]:<12} {key[1]:<8} want={want:3}  {status}")
 
     dataset: list[dict] = []
     for key, want in TARGET_DISTRIBUTION.items():
@@ -362,42 +403,51 @@ def build(total: int, output: str) -> None:
             if pool:
                 dataset.extend(random.choices(pool, k=want - len(pool)))
 
-    if len(dataset) < total:
-        dataset.extend(random.choices(all_items, k=total - len(dataset)))
+    if len(dataset) < base_target:
+        extra = random.choices(all_items, k=base_target - len(dataset))
+        dataset.extend(extra)
+    dataset = dataset[:base_target]
+
+    print(f"\n  Loading LiveCodeBench ({lcb_count} samples)...")
+    lcb_items = load_livecodebench(lcb_count)
+    print(f"    LiveCodeBench      {len(lcb_items):4} items loaded")
+
+    if lcb_items:
+        dataset.extend(lcb_items)
+    else:
+        print("  LiveCodeBench unavailable -- padding with existing code items")
+        code_pool = [x for x in all_items if x["domain"] == "code"]
+        dataset.extend(random.choices(code_pool, k=lcb_count))
 
     random.shuffle(dataset)
-    dataset = dataset[:total]
 
     with open(output, "w") as f:
         json.dump(dataset, f, indent=2)
 
     print(f"\n  Final dataset: {len(dataset)} requests")
     by_domain: dict[str, int] = defaultdict(int)
-    by_cplx:   dict[str, int] = defaultdict(int)
+    by_source: dict[str, int] = defaultdict(int)
     for item in dataset:
-        by_domain[item["domain"]]   += 1
-        by_cplx[item["complexity"]] += 1
-
+        by_domain[item["domain"]] += 1
+        by_source[item.get("source", "hf")] += 1
     print("\n  By domain:")
     for d, c in sorted(by_domain.items()):
         print(f"    {d:<12} {c:4}")
-    print("\n  By complexity:")
-    for c, n2 in sorted(by_cplx.items()):
-        print(f"    {c:<8} {n2:4}")
-
+    print("\n  By source:")
+    for s, n2 in sorted(by_source.items()):
+        print(f"    {s:<20} {n2:4}")
     print(f"\n  Saved to: {output}")
-    print(f"  Run load test with:")
-    print(f"    python tests/load_test.py --dataset {output}\n")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--output", default="datasets/hf_1000.json")
-    parser.add_argument("--count",  type=int, default=1000)
-    parser.add_argument("--seed",   type=int, default=42)
+    parser.add_argument("--output",    default="datasets/hf_1500.json")
+    parser.add_argument("--count",     type=int, default=1500)
+    parser.add_argument("--lcb-count", type=int, default=300)
+    parser.add_argument("--seed",      type=int, default=42)
     args = parser.parse_args()
     random.seed(args.seed)
-    build(args.count, args.output)
+    build(args.count, args.output, lcb_count=args.lcb_count)
 
 
 if __name__ == "__main__":
