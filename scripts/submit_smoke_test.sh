@@ -35,7 +35,9 @@ cat > "$PBSSCRIPT" << PBSEOF
 #PBS -e ${LOG_DIR}/job.err
 
 set -euo pipefail
-source /soft/anaconda3/etc/profile.d/conda.sh
+for _p in /soft/anaconda3 /soft/miniconda3 "\$HOME/.conda" "\$HOME/anaconda3" "\$HOME/miniconda3"; do
+    [ -f "\$_p/etc/profile.d/conda.sh" ] && source "\$_p/etc/profile.d/conda.sh" && break
+done
 conda activate 2026-06-08/vllm_env
 export HF_HOME=/eagle/UIC-HPC/yuping/hf_cache
 
@@ -131,7 +133,8 @@ bash scripts/test_baselines.sh
 echo ""
 echo "=================================================================="
 echo "  Smoke test complete.  \$(date)"
-if grep -q "FAIL: 0" "${LOG_DIR}/job.out" 2>/dev/null; then
+echo "  Results: \$(ls results/test_baselines_*/  2>/dev/null | head -1)"
+if grep -q "FAIL: 0" ~/vllm_logs/smoke_${TS}/job.out 2>/dev/null; then
     echo "  STATUS: ALL PASSED — safe to submit full experiment:"
     echo "    bash scripts/submit.sh"
 else
