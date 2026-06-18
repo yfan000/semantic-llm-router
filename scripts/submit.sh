@@ -49,12 +49,14 @@ cat > "$PBSSCRIPT" << PBSEOF
 #PBS -e ${LOG_DIR}/job.err
 
 # ── Environment setup ─────────────────────────────────────────────────────────
-# Try common conda paths on Sophia — avoids hard-coding a path that may differ
-# between login nodes and compute nodes.
-for _p in /soft/anaconda3 /soft/miniconda3 "\$HOME/.conda" "\$HOME/anaconda3" "\$HOME/miniconda3"; do
-    [ -f "\$_p/etc/profile.d/conda.sh" ] && source "\$_p/etc/profile.d/conda.sh" && break
-done
-conda activate 2026-06-08/vllm_env
+# Direct PATH activation — more reliable than conda activate in PBS batch jobs.
+# Avoids __conda_exe / shell-hook issues that occur in non-interactive shells.
+VLLM_ENV=\$(conda env list 2>/dev/null | awk '/2026-06-08\/vllm_env/ {print \$NF}')
+if [ -z "\$VLLM_ENV" ]; then
+    VLLM_ENV="\$HOME/.conda/envs/2026-06-08/vllm_env"
+fi
+export PATH="\${VLLM_ENV}/bin:\$PATH"
+echo "  Python: \$(which python)  (\$(python --version 2>&1))"
 
 export HF_HOME=/eagle/UIC-HPC/yuping/hf_cache
 

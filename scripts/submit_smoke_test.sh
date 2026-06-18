@@ -35,10 +35,12 @@ cat > "$PBSSCRIPT" << PBSEOF
 #PBS -e ${LOG_DIR}/job.err
 
 set -euo pipefail
-for _p in /soft/anaconda3 /soft/miniconda3 "\$HOME/.conda" "\$HOME/anaconda3" "\$HOME/miniconda3"; do
-    [ -f "\$_p/etc/profile.d/conda.sh" ] && source "\$_p/etc/profile.d/conda.sh" && break
-done
-conda activate 2026-06-08/vllm_env
+VLLM_ENV=\$(conda env list 2>/dev/null | awk '/2026-06-08\/vllm_env/ {print \$NF}')
+if [ -z "\$VLLM_ENV" ]; then
+    VLLM_ENV="\$HOME/.conda/envs/2026-06-08/vllm_env"
+fi
+export PATH="\${VLLM_ENV}/bin:\$PATH"
+echo "  Python: \$(which python)  (\$(python --version 2>&1))"
 export HF_HOME=/eagle/UIC-HPC/yuping/hf_cache
 
 cd ~/semantic-llm-router
