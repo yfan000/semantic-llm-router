@@ -62,12 +62,10 @@ cat > "$PBSSCRIPT" << PBSEOF
 set -euo pipefail
 
 # ── Environment ───────────────────────────────────────────────────────────────
-VLLM_ENV=\$(conda env list 2>/dev/null | awk '/2026-06-08\/vllm_env/ {print \$NF}')
-if [ -z "\$VLLM_ENV" ]; then
-    VLLM_ENV="\$HOME/.conda/envs/2026-06-08/vllm_env"
-fi
+echo "PBS script started at \$(date) on \$(hostname)"
+VLLM_ENV="\$HOME/.conda/envs/2026-06-08/vllm_env"
 export PATH="\${VLLM_ENV}/bin:\$PATH"
-echo "  Python: \$(which python)  (\$(python --version 2>&1))"
+echo "  Python: \$(which python 2>/dev/null || echo NOT FOUND)  (\$(python --version 2>&1 || echo N/A))"
 export HF_HOME=/eagle/UIC-HPC/yuping/hf_cache
 
 cd ~/semantic-llm-router

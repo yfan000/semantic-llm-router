@@ -49,14 +49,10 @@ cat > "$PBSSCRIPT" << PBSEOF
 #PBS -e ${LOG_DIR}/job.err
 
 # ── Environment setup ─────────────────────────────────────────────────────────
-# Direct PATH activation — more reliable than conda activate in PBS batch jobs.
-# Avoids __conda_exe / shell-hook issues that occur in non-interactive shells.
-VLLM_ENV=\$(conda env list 2>/dev/null | awk '/2026-06-08\/vllm_env/ {print \$NF}')
-if [ -z "\$VLLM_ENV" ]; then
-    VLLM_ENV="\$HOME/.conda/envs/2026-06-08/vllm_env"
-fi
+echo "PBS script started at \$(date) on \$(hostname)"
+VLLM_ENV="\$HOME/.conda/envs/2026-06-08/vllm_env"
 export PATH="\${VLLM_ENV}/bin:\$PATH"
-echo "  Python: \$(which python)  (\$(python --version 2>&1))"
+echo "  Python: \$(which python 2>/dev/null || echo NOT FOUND)  (\$(python --version 2>&1 || echo N/A))"
 
 export HF_HOME=/eagle/UIC-HPC/yuping/hf_cache
 

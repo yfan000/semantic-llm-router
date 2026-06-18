@@ -34,13 +34,17 @@ cat > "$PBSSCRIPT" << PBSEOF
 #PBS -o ${LOG_DIR}/job.out
 #PBS -e ${LOG_DIR}/job.err
 
-set -euo pipefail
-VLLM_ENV=\$(conda env list 2>/dev/null | awk '/2026-06-08\/vllm_env/ {print \$NF}')
-if [ -z "\$VLLM_ENV" ]; then
-    VLLM_ENV="\$HOME/.conda/envs/2026-06-08/vllm_env"
-fi
+echo "PBS script started at \$(date)"
+echo "HOST: \$(hostname)"
+
+# Hardcode the vllm_env path — avoids conda shell-hook issues in PBS batch jobs.
+# If this path is wrong, check with: which python (on login node with env active)
+VLLM_ENV="\$HOME/.conda/envs/2026-06-08/vllm_env"
 export PATH="\${VLLM_ENV}/bin:\$PATH"
-echo "  Python: \$(which python)  (\$(python --version 2>&1))"
+
+echo "  VLLM_ENV : \$VLLM_ENV"
+echo "  Python   : \$(which python 2>/dev/null || echo NOT FOUND)"
+echo "  Version  : \$(python --version 2>&1 || echo N/A)"
 export HF_HOME=/eagle/UIC-HPC/yuping/hf_cache
 
 cd ~/semantic-llm-router
