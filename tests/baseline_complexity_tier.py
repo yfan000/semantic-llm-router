@@ -14,6 +14,13 @@ Usage:
         --output    results/baseline_tier.csv \\
         --concurrency 50 \\
         --node2-host sophia-gpu-09
+
+    # Data-driven optimal tier (from build_optimal_tier.py):
+    python tests/baseline_complexity_tier.py \\
+        --dataset      datasets/hf_1500.json \\
+        --tier-map     results/optimal_tier_maps.json \\
+        --tier-variant accuracy_optimal \\
+        --output       results/baseline_tier_optimal_acc.csv
 """
 from __future__ import annotations
 import argparse
@@ -108,8 +115,14 @@ FIELDNAMES = [
     "wall_ms", "slo_ms", "slo_violated", "response_text", "error",
 ]
 
+# Populated from --tier-map JSON when provided; keys are "domain:complexity"
+_DYNAMIC_TIER_MAP: dict[str, str] = {}
+
 
 def pick_model(domain: str, complexity: str) -> str:
+    if _DYNAMIC_TIER_MAP:
+        key = f"{domain}:{complexity}"
+        return _DYNAMIC_TIER_MAP.get(key, _COMPLEXITY_DEFAULT.get(complexity, "qwen-7b"))
     return TIER_MAP.get((domain, complexity),
                         _COMPLEXITY_DEFAULT.get(complexity, "qwen-7b"))
 
@@ -191,9 +204,15 @@ async def run(dataset_path: str, output: str, concurrency: int) -> None:
     print(f"\n  [Complexity-Tier] {n} requests, concurrency={concurrency}")
     print(f"  Output: {output}\n")
 
-    # Show routing table
-    for (d, c), m in sorted(TIER_MAP.items()):
-        print(f"    {d:<12} {c:<8} → {m}")
+    # Show active routing table
+    if _DYNAMIC_TIER_MAP:
+        print("  Data-driven tier map:")
+        for k, m in sorted(_DYNAMIC_TIER_MAP.items()):
+            print(f"    {k:<20} → {m}")
+    else:
+        print("  Hardcoded tier map:")
+        for (d, c), m in sorted(TIER_MAP.items()):
+            print(f"    {d:<12} {c:<8} → {m}")
     print()
 
     sem  = asyncio.Semaphore(concurrency)
@@ -214,7 +233,6 @@ async def run(dataset_path: str, output: str, concurrency: int) -> None:
                 print(f"\r  [{bar:<40}] {done}/{n}  {done/elapsed:.1f} req/s",
                       end="", flush=True)
 
-    results = []
     with open(output, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=FIELDNAMES, extrasaction="ignore")
         writer.writeheader()
@@ -242,12 +260,25 @@ async def run(dataset_path: str, output: str, concurrency: int) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset",     required=True)
-    parser.add_argument("--output",      default="")
-    parser.add_argument("--concurrency", type=int, default=50)
-    parser.add_argument("--node2-host",  default=None,
+    parser.add_argument("--dataset",      required=True)
+    parser.add_argument("--output",       default="")
+    parser.add_argument("--concurrency",  type=int, default=50)
+    parser.add_argument("--node2-host",   default=None,
                         help="Hostname of node 2 for llama4-scout (e.g. sophia-gpu-09)")
+    parser.add_argument("--tier-map",     default=None,
+                        help="JSON file from build_optimal_tier.py. Overrides hardcoded TIER_MAP.")
+    parser.add_argument("--tier-variant", default="accuracy_optimal",
+                        choices=["accuracy_optimal", "ttca_optimal"],
+                        help="Which variant to use from --tier-map (default: accuracy_optimal)")
     args = parser.parse_args()
+
+    if args.tier_map:
+        data = json.load(open(args.tier_map))
+        variant = data.get(args.tier_variant, {})
+        if not variant:
+            raise SystemExit(f"ERROR: variant '{args.tier_variant}' not found in {args.tier_map}")
+        _DYNAMIC_TIER_MAP.update(variant)
+        print(f"  [--tier-map] Using {args.tier_variant} from {args.tier_map} ({len(variant)} cells)")
 
     if args.node2_host:
         BACKENDS["llama4-scout"]["base_url"] = f"http://{args.node2_host}:8005"
@@ -259,7 +290,8 @@ def main() -> None:
 
     if not args.output:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        args.output = f"results/baseline_tier_{ts}.csv"
+        variant_tag = f"_{args.tier_variant}" if args.tier_map else ""
+        args.output = f"results/baseline_tier{variant_tag}_{ts}.csv"
 
     asyncio.run(run(args.dataset, args.output, args.concurrency))
 
