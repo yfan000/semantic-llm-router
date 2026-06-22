@@ -23,6 +23,8 @@ Contamination strategy:
                  no per-question date -- treated as lower-contamination-risk as-is.
   LiveCodeBench: filtered by contest_date >= CONTAMINATION_CUTOFF.
   SWE-bench:     filtered by created_at  >= CONTAMINATION_CUTOFF.
+                 Source files fetched from GitHub and stored in repo_files for
+                 real execution scoring in eval_all_models.py.
 
 Install dependencies:
     pip install datasets tqdm
@@ -111,19 +113,58 @@ def load_mmlu_pro(n: int) -> list[dict]:
     return random.sample(results, min(n, len(results)))
 
 
+# ---------------------------------------------------------------------------
+# SWE-bench helpers for fetching source files from GitHub
+# ---------------------------------------------------------------------------
+
+def _swe_fetch_file(repo: str, commit: str, filepath: str) -> str | None:
+    """Fetch one source file from GitHub raw content at a specific commit.
+
+    No auth needed for public repositories (all SWE-bench repos are public).
+    Rate limit: ~4 requests/s (we sleep 0.25s between calls in load_swe_bench).
+    """
+    import urllib.request as _ur
+    url = f"https://raw.githubusercontent.com/{repo}/{commit}/{filepath}"
+    try:
+        req = _ur.Request(url, headers={"User-Agent": "swe-eval-dataset/1.0"})
+        with _ur.urlopen(req, timeout=15) as r:
+            return r.read().decode("utf-8", errors="replace")
+    except Exception:
+        return None
+
+
+def _swe_affected_files(patch: str) -> list[str]:
+    """Parse a unified diff to extract the list of modified file paths."""
+    import re as _re
+    files = []
+    for line in patch.splitlines():
+        m = _re.match(r"^--- a/(.+)$", line)
+        if m and m.group(1) != "/dev/null":
+            files.append(m.group(1))
+    return files
+
+
 def load_swe_bench(n: int, cutoff: str = CONTAMINATION_CUTOFF) -> list[dict]:
     """SWE-bench Verified: real GitHub issues with known fixes (princeton-nlp).
 
-    Filters to issues created AFTER cutoff so no model has seen them in
-    training data. Scored by keyword overlap with the actual patch symbols.
+    Filters to issues created AFTER cutoff (no model has seen them in training).
+
+    For each item, the source files affected by the gold patch are fetched from
+    GitHub and stored as repo_files so eval_all_models.py can:
+      1. Apply the model's patch with patch(1) -p1
+      2. Run the FAIL_TO_PASS tests with pytest
+      3. Return the real pass/fail score
+
+    The prompt asks the model to output a unified diff patch + explanation.
 
     Complexity mapping:
-      patch lines <= 20  -> easy
-      patch lines <= 80  -> medium
-      patch lines > 80   -> hard
+      patch changed lines <= 20  -> easy
+      patch changed lines <= 80  -> medium
+      patch changed lines > 80   -> hard
     """
-    from datasets import load_dataset
+    import time as _time
     import re as _re
+    from datasets import load_dataset
 
     ds = None
     for ds_name in ["princeton-nlp/SWE-bench_Verified", "princeton-nlp/SWE-bench"]:
@@ -137,17 +178,28 @@ def load_swe_bench(n: int, cutoff: str = CONTAMINATION_CUTOFF) -> list[dict]:
     if ds is None:
         return []
 
-    results = []
+    # First pass: collect all candidates that pass the date filter
+    candidates = []
     for row in ds:
         created_at = str(row.get("created_at", "") or row.get("pull_created_at", ""))
         if created_at and created_at < cutoff:
             continue
 
-        problem = str(row.get("problem_statement", "")).strip()
-        repo    = str(row.get("repo", "")).strip()
-        patch   = str(row.get("patch", "")).strip()
+        problem     = str(row.get("problem_statement", "")).strip()
+        repo        = str(row.get("repo", "")).strip()
+        patch       = str(row.get("patch", "")).strip()
+        base_commit = str(row.get("base_commit", "")).strip()
+        instance_id = str(row.get("instance_id", "")).strip()
+        test_patch  = str(row.get("test_patch", "")).strip()
 
-        if not problem or not patch:
+        fail_to_pass = row.get("FAIL_TO_PASS", [])
+        if isinstance(fail_to_pass, str):
+            try:
+                fail_to_pass = json.loads(fail_to_pass)
+            except Exception:
+                fail_to_pass = []
+
+        if not problem or not patch or not base_commit:
             continue
 
         patch_lines = len([l for l in patch.splitlines()
@@ -159,33 +211,33 @@ def load_swe_bench(n: int, cutoff: str = CONTAMINATION_CUTOFF) -> list[dict]:
         else:
             complexity = "hard"
 
-        query = (
-            f"Repository: {repo}\n\n"
-            f"Bug report:\n{problem[:800]}\n\n"
-            f"Describe the root cause of this bug and how to fix it. "
-            f"Include specific function names, variable names, or code changes needed."
-        )
-
         patch_symbols = " ".join(_re.findall(r"\b[A-Za-z_][A-Za-z0-9_]{3,}\b", patch))
         ground_truth  = patch_symbols[:500] if patch_symbols else patch[:200]
 
-        results.append({
+        candidates.append({
             "domain":       "code",
             "complexity":   complexity,
-            "query":        query,
             "ground_truth": ground_truth,
             "source":       "swe_bench",
             "created_at":   created_at,
+            "instance_id":  instance_id,
+            "repo":         repo,
+            "base_commit":  base_commit,
+            "gold_patch":   patch,
+            "test_patch":   test_patch,
+            "fail_to_pass": fail_to_pass,
+            "_problem":     problem,
         })
-        if len(results) >= n * 2:
+        if len(candidates) >= n * 2:
             break
 
-    if not results:
+    if not candidates:
         print(f"  [SWE-bench] no items found after cutoff {cutoff}")
         return []
 
+    # Balance per complexity and select final items
     per_diff: dict[str, list[dict]] = {"easy": [], "medium": [], "hard": []}
-    for item in results:
+    for item in candidates:
         per_diff[item["complexity"]].append(item)
     per_bucket = n // 3
     balanced: list[dict] = []
@@ -193,7 +245,34 @@ def load_swe_bench(n: int, cutoff: str = CONTAMINATION_CUTOFF) -> list[dict]:
         want = per_bucket if diff != "hard" else n - 2 * per_bucket
         balanced.extend(random.sample(pool, min(want, len(pool))))
 
-    print(f"  [SWE-bench] {len(results)} items after cutoff {cutoff} -> using {len(balanced)}")
+    # Fetch original source files for real execution scoring
+    print(f"  [SWE-bench] fetching source files for {len(balanced)} items "
+          f"(cutoff={cutoff}, ~{len(balanced) * 3 * 0.25:.0f}s)...")
+    fetched = 0
+    for item in balanced:
+        affected  = _swe_affected_files(item["gold_patch"])[:5]  # max 5 files
+        repo_files: dict[str, str] = {}
+        for fp in affected:
+            content = _swe_fetch_file(item["repo"], item["base_commit"], fp)
+            if content:
+                repo_files[fp] = content
+            _time.sleep(0.25)  # stay under GitHub rate limit (~4 req/s)
+        item["repo_files"] = repo_files
+        if repo_files:
+            fetched += 1
+
+        # Build the prompt — ask for a diff patch + explanation
+        problem_text = item.pop("_problem", "")
+        item["query"] = (
+            f"Repository: {item['repo']}\n\n"
+            f"Bug report:\n{problem_text[:600]}\n\n"
+            f"Generate a unified diff patch (git format) to fix this bug. "
+            f"Wrap the patch in a ```diff code block. "
+            f"Also briefly explain the root cause."
+        )
+
+    print(f"  [SWE-bench] {len(balanced)} items selected, "
+          f"{fetched}/{len(balanced)} have source files for execution scoring")
     return balanced
 
 
@@ -604,7 +683,7 @@ def load_livecodebench(n: int, cutoff: str = CONTAMINATION_CUTOFF) -> list[dict]
 
 # 2400 base samples across 4 domains (factual, math, code, reasoning).
 # + 400 LiveCodeBench (post-cutoff, execution-scored)
-# + 200 SWE-bench Verified (post-cutoff GitHub issues)
+# + 200 SWE-bench Verified (post-cutoff GitHub issues, with source files)
 # = 3000 total
 TARGET_DISTRIBUTION = {
     ("factual",   "easy"):   200,
@@ -692,6 +771,7 @@ def build(total: int, output: str, lcb_count: int = 400,
         dataset.extend(random.choices(code_pool, k=lcb_count))
 
     print(f"\n  Loading SWE-bench Verified ({swe_count} samples, cutoff={cutoff})...")
+    print(f"  NOTE: fetching source files from GitHub takes ~{swe_count*3*0.25:.0f}s")
     swe_items = load_swe_bench(swe_count, cutoff=cutoff)
     print(f"    SWE-bench          {len(swe_items):4} items loaded")
 
@@ -712,10 +792,13 @@ def build(total: int, output: str, lcb_count: int = 400,
     by_domain: dict[str, int] = defaultdict(int)
     by_cplx:   dict[str, int] = defaultdict(int)
     by_source: dict[str, int] = defaultdict(int)
+    swe_with_files = 0
     for item in dataset:
         by_domain[item["domain"]]           += 1
         by_cplx[item["complexity"]]         += 1
         by_source[item.get("source", "hf")] += 1
+        if item.get("source") == "swe_bench" and item.get("repo_files"):
+            swe_with_files += 1
 
     print("\n  By domain:")
     for d, c in sorted(by_domain.items()):
@@ -728,9 +811,14 @@ def build(total: int, output: str, lcb_count: int = 400,
         print(f"    {s:<20} {n2:4}")
     print(f"\n  Contamination cutoff : {cutoff}")
     print(f"  Post-cutoff items    : LiveCodeBench={len(lcb_items)}, SWE-bench={len(swe_items)}")
+    print(f"  SWE-bench with files : {swe_with_files}/{len(swe_items)} "
+          f"(items with source files for execution scoring)")
     print(f"\n  Saved to: {output}")
     print(f"  Run load test with:")
     print(f"    python tests/load_test.py --dataset {output}\n")
+    print(f"  Evaluate with real SWE-bench execution:")
+    print(f"    python tests/eval_all_models.py --dataset {output}           # subprocess scorer")
+    print(f"    python tests/eval_all_models.py --dataset {output} --use-docker  # Docker scorer\n")
 
 
 # ---------------------------------------------------------------------------
@@ -745,7 +833,7 @@ def main() -> None:
     parser.add_argument("--lcb-count", type=int, default=400,
                         help="LiveCodeBench samples (post-cutoff, execution-scored)")
     parser.add_argument("--swe-count", type=int, default=200,
-                        help="SWE-bench Verified samples (post-cutoff GitHub issues)")
+                        help="SWE-bench Verified samples (post-cutoff, with source files)")
     parser.add_argument("--cutoff",    default=CONTAMINATION_CUTOFF,
                         help=f"Contamination cutoff YYYY-MM-DD (default: {CONTAMINATION_CUTOFF}). "
                              "Excludes LiveCodeBench/SWE-bench problems before this date.")
