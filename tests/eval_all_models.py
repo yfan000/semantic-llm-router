@@ -2,24 +2,32 @@
 eval_all_models.py — Pre-evaluation matrix.
 
 Runs every request in the dataset through ALL model backends before testing.
-Produces eval_matrix.csv with one row per (request × model), containing:
+Produces eval_matrix.csv with one row per (request x model), containing:
   - actual wall_ms for each model on each request
   - accuracy score and is_correct flag
 
 This matrix is then consumed by compare_ttca.py (--eval-matrix flag) for
 exact Time-to-Correct-Answer computation with no median-latency simulation.
 
+Scoring strategy by source:
+  LiveCodeBench  : execution-scored (stdin/stdout), ground_truth is JSON array
+  SWE-bench      : keyword overlap with patch symbols (source="swe_bench")
+  HumanEval/MBPP : execution-scored via assert statements in ground_truth
+  MMLU-Pro       : keyword overlap with correct answer text
+  GSM8K/MATH     : numeric extraction and comparison
+  LogiQA/ARC     : keyword overlap with correct answer text
+
 Workflow:
-    1. python tests/eval_all_models.py --dataset datasets/hf_1000.json
-    2. python tests/load_test.py       --dataset datasets/hf_1000.json ...
-    3. python tests/round_robin_test.py --dataset datasets/hf_1000.json ...
+    1. python tests/eval_all_models.py --dataset datasets/hf_3000.json
+    2. python tests/load_test.py       --dataset datasets/hf_3000.json ...
+    3. python tests/round_robin_test.py --dataset datasets/hf_3000.json ...
     4. python tests/compare_ttca.py --router ... --baseline ... --eval-matrix results/eval_matrix.csv
 
 Usage:
     python tests/eval_all_models.py \\
-        --dataset     datasets/hf_1000.json \\
+        --dataset     datasets/hf_3000.json \\
         --output      results/eval_matrix.csv \\
-        --concurrency 10
+        --concurrency 30
 """
 from __future__ import annotations
 
@@ -125,11 +133,8 @@ def _score_livecodebench(response: str, test_cases_json: str) -> float:
     Strategy:
       1. Extract code block from model output.
       2. For each test case: run the code as a script with stdin=test_input,
-         compare stdout to expected output (stdin/stdout style — works for
-         Codeforces/AtCoder; LeetCode function-style problems return 0.0 but
-         all models are evaluated identically so relative ranking is preserved).
-      3. Return fraction of passing test cases (0.0 – 1.0).
-         A syntactically invalid response scores 0.0 immediately.
+         compare stdout to expected output (stdin/stdout style).
+      3. Return fraction of passing test cases (0.0 - 1.0).
     """
     try:
         test_cases = json.loads(test_cases_json)
@@ -196,13 +201,17 @@ _SCORERS = {
 }
 
 
-def score_response(domain: str, response: str, gt: str):
+def score_response(domain: str, response: str, gt: str, source: str = "") -> float | None:
     if not response:
         return None
-    # LiveCodeBench items store test cases as a JSON array in ground_truth.
-    # Detect by prefix so we use the execution scorer instead of the code scorer.
+    # LiveCodeBench: ground_truth is a JSON array of test cases -> execution scorer
     if domain.lower() == "code" and gt.lstrip().startswith("[{"):
         return _score_livecodebench(response, gt)
+    # SWE-bench: ground_truth is patch symbol keywords -> keyword overlap scorer.
+    # _score_code() would try ast.parse() on a natural-language response and
+    # return 0.0 for everything, making all models look equally bad on SWE-bench.
+    if source == "swe_bench":
+        return _score_keyword(response, gt)
     scorer = _SCORERS.get(domain.lower())
     return scorer(response, gt) if scorer else None
 
@@ -252,7 +261,8 @@ async def call_model(
             text    = choices[0].get("message", {}).get("content", "") if choices else ""
             result["response_text"] = text
 
-            s = score_response(item["domain"], text, item.get("ground_truth", ""))
+            s = score_response(item["domain"], text, item.get("ground_truth", ""),
+                               item.get("source", ""))
             if s is not None:
                 result["score"]      = f"{s:.4f}"
                 result["is_correct"] = "true" if s >= CORRECT_THRESHOLD else "false"
@@ -281,9 +291,14 @@ async def run(dataset_path: str, output: str, concurrency: int) -> None:
 
     Path(output).parent.mkdir(parents=True, exist_ok=True)
 
+    # Show source breakdown
+    from collections import Counter
+    sources = Counter(item.get("source", "hf") for item in items)
+
     print(f"\n  Pre-evaluation: {n_req} requests x {n_mod} models = {n_total} calls")
     print(f"  Models      : {', '.join(b['model_id'] for b in BACKENDS)}")
     print(f"  Concurrency : {concurrency}  (total simultaneous calls)")
+    print(f"  Sources     : {dict(sources)}")
     print(f"  Output      : {output}\n")
 
     fieldnames = [
@@ -381,7 +396,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset",     required=True)
     parser.add_argument("--output",      default="results/eval_matrix.csv")
-    parser.add_argument("--concurrency", type=int, default=10,
+    parser.add_argument("--concurrency", type=int, default=30,
                         help="Max simultaneous calls across all models")
     parser.add_argument("--node2-host",  default=None,
                         help="Hostname of node 2 running llama4-scout (e.g. sophia-gpu-09).")
