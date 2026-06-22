@@ -11,7 +11,9 @@ exact Time-to-Correct-Answer computation with no median-latency simulation.
 
 Scoring strategy by source:
   LiveCodeBench  : execution-scored (stdin/stdout), ground_truth is JSON array
-  SWE-bench      : keyword overlap with patch symbols (source="swe_bench")
+  SWE-bench      : real execution — apply patch, run FAIL_TO_PASS tests with pytest
+                   Default: subprocess (patch + pytest, fallback=keyword on ImportError)
+                   --use-docker: official sweb.eval Docker images (most accurate)
   HumanEval/MBPP : execution-scored via assert statements in ground_truth
   MMLU-Pro       : keyword overlap with correct answer text
   GSM8K/MATH     : numeric extraction and comparison
@@ -28,6 +30,9 @@ Usage:
         --dataset     datasets/hf_3000.json \\
         --output      results/eval_matrix.csv \\
         --concurrency 30
+
+    # With Docker-based SWE-bench scoring (most accurate):
+    python tests/eval_all_models.py --dataset datasets/hf_3000.json --use-docker
 """
 from __future__ import annotations
 
@@ -36,7 +41,9 @@ import ast
 import asyncio
 import csv
 import json
+import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -46,6 +53,12 @@ from pathlib import Path
 from statistics import mean, median
 
 import httpx
+
+# Scoring mode for SWE-bench items.
+# "exec"   — subprocess: write source files, apply patch, run pytest, fallback=keyword
+# "docker" — official sweb.eval.x86_64.<instance_id> Docker images (most accurate)
+# Set by --use-docker flag in main().
+_SWE_SCORER: str = "exec"
 
 
 # ---------------------------------------------------------------------------
@@ -193,6 +206,192 @@ def _score_keyword(response: str, gt: str):
     return 1.0 if overlap >= 1.0 else overlap  # 100% keyword match required
 
 
+# ---------------------------------------------------------------------------
+# SWE-bench execution scoring
+# ---------------------------------------------------------------------------
+
+def _extract_diff(response: str) -> str:
+    """Extract a unified diff from a model response."""
+    m = re.search(r"```diff\s*(.*?)```", response, re.DOTALL)
+    if m:
+        return m.group(1).strip()
+    lines = response.splitlines()
+    diff_lines: list[str] = []
+    in_diff = False
+    for line in lines:
+        if line.startswith(("diff --git", "--- a/")):
+            in_diff = True
+        if in_diff:
+            diff_lines.append(line)
+    return "\n".join(diff_lines)
+
+
+def _score_swe_bench_exec(response: str, item: dict) -> float:
+    """Subprocess-based SWE-bench scoring.
+
+    Pipeline:
+      1. Extract diff from model response.
+      2. Write original source files (from item["repo_files"]) to a temp dir.
+      3. Apply model's patch with patch(1) -p1.
+      4. Write test_patch and run up to 3 FAIL_TO_PASS tests with pytest.
+      5. Return fraction of passing tests (0.0-1.0).
+
+    Falls back to _score_keyword() if:
+      - No repo_files in item (dataset built without source file fetching).
+      - Model produced no parseable diff.
+      - Tests fail with ImportError/ModuleNotFoundError (repo deps not installed).
+      - subprocess timeout.
+    """
+    repo_files   = item.get("repo_files", {})
+    fail_to_pass = item.get("fail_to_pass", []) or []
+    test_patch   = item.get("test_patch",   "")
+    ground_truth = item.get("ground_truth", "")
+
+    if not repo_files:
+        return _score_keyword(response, ground_truth) or 0.0
+
+    diff = _extract_diff(response)
+    if not diff:
+        return 0.0
+
+    tmpdir = None
+    try:
+        tmpdir = tempfile.mkdtemp(prefix="swe_exec_")
+
+        # Write original source files
+        for filepath, content in repo_files.items():
+            full = os.path.join(tmpdir, filepath)
+            os.makedirs(os.path.dirname(full), exist_ok=True)
+            with open(full, "w", encoding="utf-8") as f:
+                f.write(content)
+
+        # Write and apply model's patch
+        patch_path = os.path.join(tmpdir, "model.patch")
+        with open(patch_path, "w") as f:
+            f.write(diff)
+
+        r = subprocess.run(
+            ["patch", "-p1", "--fuzz=3", "-i", patch_path],
+            cwd=tmpdir, capture_output=True, text=True, timeout=15,
+        )
+        if r.returncode != 0:
+            return 0.0  # patch did not apply
+
+        # Write test code
+        if test_patch:
+            with open(os.path.join(tmpdir, "test_swe.py"), "w") as f:
+                f.write(test_patch)
+
+        # Run FAIL_TO_PASS tests (cap at 3 for speed)
+        tests = [t for t in fail_to_pass[:3]] if fail_to_pass else ["test_swe.py"]
+
+        r2 = subprocess.run(
+            [sys.executable, "-m", "pytest", "-x", "--tb=no", "-q",
+             "--no-header", "--override-ini=addopts="] + tests,
+            cwd=tmpdir, capture_output=True, text=True, timeout=60,
+        )
+        out = r2.stdout + r2.stderr
+
+        # Missing repo deps → env issue, not model quality → keyword fallback
+        if "ModuleNotFoundError" in out or "ImportError" in out:
+            return _score_keyword(response, ground_truth) or 0.0
+
+        if r2.returncode == 0:
+            return 1.0
+
+        m_pass = re.search(r"(\d+) passed", out)
+        m_fail = re.search(r"(\d+) failed", out)
+        passed = int(m_pass.group(1)) if m_pass else 0
+        failed = int(m_fail.group(1)) if m_fail else 0
+        total  = passed + failed
+        return passed / total if total > 0 else 0.0
+
+    except subprocess.TimeoutExpired:
+        return _score_keyword(response, ground_truth) or 0.0
+    except Exception:
+        return 0.0
+    finally:
+        if tmpdir:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def _score_swe_bench_docker(response: str, item: dict) -> float:
+    """Docker-based SWE-bench scoring using official sweb.eval images.
+
+    Each SWE-bench instance has a pre-built Docker image with the full repo
+    and all dependencies installed:
+      sweb.eval.x86_64.<instance_id>:latest
+
+    Pre-pull the needed images (one-time setup):
+      python -c "
+      import json, subprocess
+      items = [x for x in json.load(open('datasets/hf_3000.json'))
+               if x.get('source') == 'swe_bench' and x.get('instance_id')]
+      for iid in {x['instance_id'] for x in items}:
+          subprocess.run(['docker', 'pull', f'sweb.eval.x86_64.{iid}'])
+      "
+
+    Falls back to _score_swe_bench_exec() if image is not available locally.
+    """
+    instance_id  = item.get("instance_id", "")
+    fail_to_pass = item.get("fail_to_pass", []) or []
+    ground_truth = item.get("ground_truth", "")
+
+    diff = _extract_diff(response)
+    if not diff:
+        return 0.0
+
+    if not instance_id:
+        return _score_swe_bench_exec(response, item)
+
+    image = f"sweb.eval.x86_64.{instance_id}"
+    tests = " ".join(fail_to_pass[:5]) if fail_to_pass else ""
+
+    tmpdir = None
+    try:
+        tmpdir = tempfile.mkdtemp(prefix="swe_docker_")
+        patch_path = os.path.join(tmpdir, "patch.diff")
+        with open(patch_path, "w") as f:
+            f.write(diff)
+
+        cmd = [
+            "docker", "run", "--rm",
+            "-v", f"{patch_path}:/patch.diff:ro",
+            image,
+            "/bin/bash", "-c",
+            f"cd /testbed && git apply /patch.diff --allow-empty "
+            f"&& python -m pytest --tb=no -q --no-header {tests}",
+        ]
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+        out = r.stdout + r.stderr
+
+        # Image not pulled → fall back to subprocess
+        if any(msg in out for msg in
+               ("No such image", "pull access denied", "Unable to find image")):
+            return _score_swe_bench_exec(response, item)
+
+        if r.returncode == 0:
+            return 1.0
+
+        m_pass = re.search(r"(\d+) passed", out)
+        m_fail = re.search(r"(\d+) failed", out)
+        passed = int(m_pass.group(1)) if m_pass else 0
+        failed = int(m_fail.group(1)) if m_fail else 0
+        total  = passed + failed
+        return passed / total if total > 0 else 0.0
+
+    except subprocess.TimeoutExpired:
+        return _score_swe_bench_exec(response, item)
+    except FileNotFoundError:
+        print("  [SWE-bench] Docker not in PATH — falling back to subprocess scorer")
+        return _score_swe_bench_exec(response, item)
+    except Exception:
+        return _score_swe_bench_exec(response, item)
+    finally:
+        if tmpdir:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 _SCORERS = {
     "math":      _score_math,
     "code":      _score_code,
@@ -201,17 +400,18 @@ _SCORERS = {
 }
 
 
-def score_response(domain: str, response: str, gt: str, source: str = "") -> float | None:
+def score_response(domain: str, response: str, gt: str,
+                   source: str = "", item: dict | None = None) -> float | None:
     if not response:
         return None
     # LiveCodeBench: ground_truth is a JSON array of test cases -> execution scorer
     if domain.lower() == "code" and gt.lstrip().startswith("[{"):
         return _score_livecodebench(response, gt)
-    # SWE-bench: ground_truth is patch symbol keywords -> keyword overlap scorer.
-    # _score_code() would try ast.parse() on a natural-language response and
-    # return 0.0 for everything, making all models look equally bad on SWE-bench.
+    # SWE-bench: real execution scoring (patch + pytest) or Docker
     if source == "swe_bench":
-        return _score_keyword(response, gt)
+        if _SWE_SCORER == "docker":
+            return _score_swe_bench_docker(response, item or {})
+        return _score_swe_bench_exec(response, item or {})
     scorer = _SCORERS.get(domain.lower())
     return scorer(response, gt) if scorer else None
 
@@ -262,7 +462,7 @@ async def call_model(
             result["response_text"] = text
 
             s = score_response(item["domain"], text, item.get("ground_truth", ""),
-                               item.get("source", ""))
+                               item.get("source", ""), item)
             if s is not None:
                 result["score"]      = f"{s:.4f}"
                 result["is_correct"] = "true" if s >= CORRECT_THRESHOLD else "false"
@@ -291,14 +491,17 @@ async def run(dataset_path: str, output: str, concurrency: int) -> None:
 
     Path(output).parent.mkdir(parents=True, exist_ok=True)
 
-    # Show source breakdown
     from collections import Counter
     sources = Counter(item.get("source", "hf") for item in items)
+    swe_with_files = sum(1 for x in items
+                         if x.get("source") == "swe_bench" and x.get("repo_files"))
 
     print(f"\n  Pre-evaluation: {n_req} requests x {n_mod} models = {n_total} calls")
     print(f"  Models      : {', '.join(b['model_id'] for b in BACKENDS)}")
     print(f"  Concurrency : {concurrency}  (total simultaneous calls)")
     print(f"  Sources     : {dict(sources)}")
+    print(f"  SWE scorer  : {_SWE_SCORER}  "
+          f"({swe_with_files}/{sources.get('swe_bench', 0)} items have source files)")
     print(f"  Output      : {output}\n")
 
     fieldnames = [
@@ -347,7 +550,6 @@ async def run(dataset_path: str, output: str, concurrency: int) -> None:
     print(f"  Successful  : {len(ok)}")
     print(f"  Scorable    : {len(scorable)}")
 
-    # Per-model accuracy
     by_model: dict[str, list[bool]] = defaultdict(list)
     for r in scorable:
         by_model[r["model_id"]].append(r["is_correct"] == "true")
@@ -359,7 +561,6 @@ async def run(dataset_path: str, output: str, concurrency: int) -> None:
         n_t = len(correct_list)
         print(f"  {mid:<28} {n_c:>8} {n_t:>8} {n_c/max(n_t,1)*100:>9.1f}%")
 
-    # Per-domain breakdown
     by_dm: dict[tuple, list[bool]] = defaultdict(list)
     for r in scorable:
         by_dm[(r["domain"], r["model_id"])].append(r["is_correct"] == "true")
@@ -404,7 +605,17 @@ def main() -> None:
                         help="Evaluate only this model_id (e.g. qwen3-coder-30b). "
                              "Useful for adding priors for a single new model without "
                              "re-running the full 6-model eval matrix.")
+    parser.add_argument("--use-docker",  action="store_true",
+                        help="Use official sweb.eval Docker images for SWE-bench scoring "
+                             "(most accurate). Requires Docker and images pre-pulled: "
+                             "docker pull sweb.eval.x86_64.<instance_id>. "
+                             "Falls back to subprocess scorer if image not available.")
     args = parser.parse_args()
+
+    if args.use_docker:
+        global _SWE_SCORER
+        _SWE_SCORER = "docker"
+        print("  [SWE-bench] Using Docker-based execution scorer")
 
     if args.node2_host:
         BACKENDS.append({
@@ -413,7 +624,6 @@ def main() -> None:
             "base_url":   f"http://{args.node2_host}:8005",
         })
 
-    # Filter to a single model when --model is specified
     if args.model:
         filtered = [b for b in BACKENDS if b["model_id"] == args.model]
         if not filtered:
