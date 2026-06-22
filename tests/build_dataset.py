@@ -1,14 +1,18 @@
 """
 build_dataset.py — Download real benchmark queries from HuggingFace and
-build a balanced 1500-request test set for the semantic LLM router.
+build a balanced 3000-request test set for the semantic LLM router.
 
 Sources:
   Factual  : MMLU-Pro (post-cutoff, harder than MMLU, less contamination)
   Math     : GSM8K (grade-school, medium) + MATH benchmark (competition, hard)
-  Code     : HumanEval (medium) + BigCodeBench (hard) + APPS (hard)
+  Code     : HumanEval (easy/medium) + MBPP (easy) + BigCodeBench (medium/hard) + APPS (hard)
   Reasoning: LogiQA (medium) + HellaSwag (easy) + ARC (easy/hard)
-  Code     : LiveCodeBench (post-cutoff, execution-scored, 200 samples)
-  Code     : SWE-bench Verified (post-cutoff GitHub issues, 100 samples)
+  Code     : LiveCodeBench (post-cutoff, execution-scored, 400 samples)
+  Code     : SWE-bench Verified (post-cutoff GitHub issues, 200 samples)
+
+Dataset limits — why MBPP is added:
+  HumanEval has only 164 problems; not enough for code:easy at 3000-sample scale.
+  MBPP (374 sanitized problems) fills the gap; combined 538 unique easy code samples.
 
 Contamination strategy:
   All models have training cutoff <= March 2025 (latest: Qwen3-Coder-30B, May 2025).
@@ -24,12 +28,12 @@ Install dependencies:
     pip install datasets tqdm
 
 Usage:
-    python tests/build_dataset.py                       # saves to datasets/hf_1500.json
+    python tests/build_dataset.py                       # saves to datasets/hf_3000.json
     python tests/build_dataset.py --output my.json      # custom output path
     python tests/build_dataset.py --cutoff 2025-05-01   # custom contamination cutoff
 
 The output JSON can be used directly with load_test.py:
-    python tests/load_test.py --dataset datasets/hf_1500.json
+    python tests/load_test.py --dataset datasets/hf_3000.json
 """
 from __future__ import annotations
 import argparse
@@ -110,9 +114,8 @@ def load_mmlu_pro(n: int) -> list[dict]:
 def load_swe_bench(n: int, cutoff: str = CONTAMINATION_CUTOFF) -> list[dict]:
     """SWE-bench Verified: real GitHub issues with known fixes (princeton-nlp).
 
-    Filters to issues created AFTER `cutoff` so no model has seen them in
-    training data. Each item asks the model to diagnose and describe the fix
-    for a real bug; scored by keyword overlap with the actual patch.
+    Filters to issues created AFTER cutoff so no model has seen them in
+    training data. Scored by keyword overlap with the actual patch symbols.
 
     Complexity mapping:
       patch lines <= 20  -> easy
@@ -136,7 +139,6 @@ def load_swe_bench(n: int, cutoff: str = CONTAMINATION_CUTOFF) -> list[dict]:
 
     results = []
     for row in ds:
-        # Date filter — only problems created after all model training cutoffs
         created_at = str(row.get("created_at", "") or row.get("pull_created_at", ""))
         if created_at and created_at < cutoff:
             continue
@@ -148,7 +150,6 @@ def load_swe_bench(n: int, cutoff: str = CONTAMINATION_CUTOFF) -> list[dict]:
         if not problem or not patch:
             continue
 
-        # Complexity by patch size (changed lines)
         patch_lines = len([l for l in patch.splitlines()
                            if l.startswith("+") or l.startswith("-")])
         if patch_lines <= 20:
@@ -165,7 +166,6 @@ def load_swe_bench(n: int, cutoff: str = CONTAMINATION_CUTOFF) -> list[dict]:
             f"Include specific function names, variable names, or code changes needed."
         )
 
-        # Ground truth: key identifiers from the actual patch (function/class names)
         patch_symbols = " ".join(_re.findall(r"\b[A-Za-z_][A-Za-z0-9_]{3,}\b", patch))
         ground_truth  = patch_symbols[:500] if patch_symbols else patch[:200]
 
@@ -184,7 +184,6 @@ def load_swe_bench(n: int, cutoff: str = CONTAMINATION_CUTOFF) -> list[dict]:
         print(f"  [SWE-bench] no items found after cutoff {cutoff}")
         return []
 
-    # Balance per complexity
     per_diff: dict[str, list[dict]] = {"easy": [], "medium": [], "hard": []}
     for item in results:
         per_diff[item["complexity"]].append(item)
@@ -199,9 +198,7 @@ def load_swe_bench(n: int, cutoff: str = CONTAMINATION_CUTOFF) -> list[dict]:
 
 
 def load_mmlu(n: int) -> list[dict]:
-    """MMLU: 57 subjects. Map subjects to easy/medium/hard.
-    Kept for backward compatibility — load_mmlu_pro is preferred.
-    """
+    """MMLU: 57 subjects. Kept for backward compatibility — load_mmlu_pro is preferred."""
     from datasets import load_dataset
 
     EASY_SUBJECTS = [
@@ -222,7 +219,6 @@ def load_mmlu(n: int) -> list[dict]:
 
     results = []
     per_difficulty = n // 3
-
     for subjects, complexity, count in [
         (EASY_SUBJECTS,   "easy",   per_difficulty),
         (MEDIUM_SUBJECTS, "medium", per_difficulty),
@@ -308,11 +304,10 @@ def load_math_benchmark(n: int) -> list[dict]:
 
 
 def load_humaneval(n: int) -> list[dict]:
-    """HumanEval: Python function synthesis.
+    """HumanEval: 164 Python function synthesis problems.
 
-    Splits by prompt length:
-      short prompt (<=300 chars) -> easy
-      longer prompt              -> medium
+    Hard limit of 164 problems — supplement with load_mbpp() for larger datasets.
+    Short prompts (<=300 chars) -> easy, longer -> medium.
     """
     from datasets import load_dataset
     try:
@@ -332,6 +327,56 @@ def load_humaneval(n: int) -> list[dict]:
             "query": query, "ground_truth": ground_truth,
         })
     random.shuffle(results)
+    return results[:n]
+
+
+def load_mbpp(n: int) -> list[dict]:
+    """MBPP (Mostly Basic Python Problems): 374 sanitized function-synthesis problems.
+
+    Used to supplement HumanEval for code:easy since HumanEval only has 164 samples.
+    The sanitized version uses consistent function names so tests can be run directly.
+    Ground truth = assert statements -> execution-scored via _score_code().
+    Complexity = easy (simple one-function problems).
+    """
+    from datasets import load_dataset
+    for name, cfg, split in [
+        ("google-research-datasets/mbpp", "sanitized", "test"),
+        ("google-research-datasets/mbpp", "sanitized", "validation"),
+        ("google-research-datasets/mbpp", None, "test"),
+    ]:
+        try:
+            ds = load_dataset(name, cfg, split=split) if cfg else load_dataset(name, split=split)
+            break
+        except Exception as e:
+            print(f"  [MBPP/{cfg}] skipped: {e}")
+            ds = None
+
+    if ds is None:
+        print("  [MBPP] all sources failed, skipping")
+        return []
+
+    ds = ds.shuffle(seed=42)
+    results = []
+    for row in ds:
+        text  = str(row.get("prompt", row.get("text", ""))).strip()
+        tests = row.get("test_list", row.get("tests", []))
+        code  = str(row.get("code", ""))
+        if not text:
+            continue
+        if isinstance(tests, list):
+            ground_truth = "\n".join(tests)
+        else:
+            ground_truth = str(tests)
+        if not ground_truth and "assert" in code:
+            ground_truth = "\n".join(l.strip() for l in code.splitlines() if "assert" in l)
+        query = f"Write a Python function to solve the following problem:\n\n{text}"
+        results.append({
+            "domain": "code", "complexity": "easy",
+            "query": query, "ground_truth": ground_truth,
+        })
+        if len(results) >= n:
+            break
+
     return results[:n]
 
 
@@ -442,7 +487,7 @@ def load_hellaswag(n: int) -> list[dict]:
 
 
 def load_arc(n: int) -> list[dict]:
-    """ARC-Challenge: science MCQ. Easy->easy, Challenge->hard."""
+    """ARC: science MCQ. Easy->easy, Challenge->hard."""
     from datasets import load_dataset
     results = []
     for split_name, complexity, count in [("easy", "easy", n // 2), ("challenge", "hard", n - n // 2)]:
@@ -466,7 +511,6 @@ def load_arc(n: int) -> list[dict]:
 
 
 def _strip_html(text: str) -> str:
-    """Remove HTML tags from LiveCodeBench problem statements."""
     import re as _re
     text = _re.sub(r"<[^>]+>", " ", text)
     for entity, char in [("&lt;", "<"), ("&gt;", ">"), ("&amp;", "&"),
@@ -476,13 +520,10 @@ def _strip_html(text: str) -> str:
 
 
 def load_livecodebench(n: int, cutoff: str = CONTAMINATION_CUTOFF) -> list[dict]:
-    """LiveCodeBench: competitive programming problems (LeetCode, Codeforces, AtCoder).
+    """LiveCodeBench: competitive programming (LeetCode, Codeforces, AtCoder).
 
-    Uses livecodebench/code_generation_lite. Filters by contest_date >= cutoff
-    so problems are guaranteed to be outside all model training windows.
-
-    Complexity mapping: difficulty field -> easy / medium / hard (direct).
-    Evaluation: subprocess execution with stdin -> stdout comparison (pass@1).
+    Filters by contest_date >= cutoff — problems are outside all model training windows.
+    Scored by subprocess execution with stdin/stdout comparison (pass@1).
     """
     from datasets import load_dataset
 
@@ -504,7 +545,6 @@ def load_livecodebench(n: int, cutoff: str = CONTAMINATION_CUTOFF) -> list[dict]
     results = []
     skipped_date = 0
     for row in ds:
-        # Date filter — only keep problems from after all model training cutoffs
         contest_date = str(row.get("contest_date", "") or row.get("start_date", ""))
         if contest_date and contest_date < cutoff:
             skipped_date += 1
@@ -522,7 +562,6 @@ def load_livecodebench(n: int, cutoff: str = CONTAMINATION_CUTOFF) -> list[dict]
         if starter:
             prompt += f"\n\nUse this function signature:\n```python\n{starter}\n```"
 
-        # Test cases stored as JSON -> triggers _score_livecodebench() in eval_all_models.py
         try:
             raw = row.get("public_test_cases", "[]")
             test_cases = json.loads(raw) if isinstance(raw, str) else raw
@@ -536,17 +575,16 @@ def load_livecodebench(n: int, cutoff: str = CONTAMINATION_CUTOFF) -> list[dict]
             "domain":       "code",
             "complexity":   complexity,
             "query":        prompt,
-            "ground_truth": json.dumps(test_cases),  # JSON array -> execution scorer
+            "ground_truth": json.dumps(test_cases),
             "source":       "livecodebench",
         })
 
-        if len(results) >= n * 3:  # oversample then trim per-difficulty below
+        if len(results) >= n * 3:
             break
 
     if skipped_date > 0:
         print(f"  [LiveCodeBench] skipped {skipped_date} items before cutoff {cutoff}")
 
-    # Balance per difficulty
     per_diff: dict[str, list[dict]] = {"easy": [], "medium": [], "hard": []}
     for item in results:
         per_diff[item["complexity"]].append(item)
@@ -564,28 +602,28 @@ def load_livecodebench(n: int, cutoff: str = CONTAMINATION_CUTOFF) -> list[dict]
 # Balance and build final dataset
 # ---------------------------------------------------------------------------
 
-# 1200 base samples across 4 domains (factual, math, code, reasoning).
-# + 200 LiveCodeBench (post-cutoff, execution-scored)
-# + 100 SWE-bench (post-cutoff, real GitHub issues)
-# = 1500 total
+# 2400 base samples across 4 domains (factual, math, code, reasoning).
+# + 400 LiveCodeBench (post-cutoff, execution-scored)
+# + 200 SWE-bench Verified (post-cutoff GitHub issues)
+# = 3000 total
 TARGET_DISTRIBUTION = {
-    ("factual",   "easy"):   100,
-    ("factual",   "medium"): 100,
-    ("factual",   "hard"):   100,
-    ("math",      "easy"):   100,
-    ("math",      "medium"): 110,
-    ("math",      "hard"):    90,
-    ("code",      "easy"):   100,
-    ("code",      "medium"): 110,
-    ("code",      "hard"):    90,
-    ("reasoning", "easy"):   100,
-    ("reasoning", "medium"): 110,
-    ("reasoning", "hard"):    90,
+    ("factual",   "easy"):   200,
+    ("factual",   "medium"): 200,
+    ("factual",   "hard"):   200,
+    ("math",      "easy"):   200,
+    ("math",      "medium"): 220,
+    ("math",      "hard"):   180,
+    ("code",      "easy"):   200,
+    ("code",      "medium"): 220,
+    ("code",      "hard"):   180,
+    ("reasoning", "easy"):   200,
+    ("reasoning", "medium"): 220,
+    ("reasoning", "hard"):   180,
 }
 
 
-def build(total: int, output: str, lcb_count: int = 200,
-          swe_count: int = 100, cutoff: str = CONTAMINATION_CUTOFF) -> None:
+def build(total: int, output: str, lcb_count: int = 400,
+          swe_count: int = 200, cutoff: str = CONTAMINATION_CUTOFF) -> None:
     print(f"\n  Building {total}-request dataset from HuggingFace benchmarks...")
     print(f"  Contamination cutoff : {cutoff}")
     print(f"  Output : {output}")
@@ -594,29 +632,26 @@ def build(total: int, output: str, lcb_count: int = 200,
 
     os.makedirs(os.path.dirname(output) if os.path.dirname(output) else ".", exist_ok=True)
 
-    # ── Load base datasets ────────────────────────────────────────────────
     print("  Loading base datasets:")
-
     all_items: list[dict] = []
 
     def add(name: str, items: list[dict]) -> None:
         print(f"    {name:<20} {len(items):4} items loaded")
         all_items.extend(items)
 
-    # MMLU-Pro replaces MMLU: harder, released Jun 2024, lower contamination risk
-    add("MMLU-Pro",       load_mmlu_pro(320))
-    add("GSM8K",          load_gsm8k(180))
-    add("MATH benchmark", load_math_benchmark(130))
-    add("HumanEval",      load_humaneval(200))
-    add("BigCodeBench",   load_bigcodebench(130))
-    add("APPS",           load_apps(90))
-    add("LogiQA",         load_logiqa(150))
-    add("HellaSwag",      load_hellaswag(130))
-    add("ARC",            load_arc(150))
+    add("MMLU-Pro",       load_mmlu_pro(650))
+    add("GSM8K",          load_gsm8k(360))
+    add("MATH benchmark", load_math_benchmark(260))
+    add("HumanEval",      load_humaneval(164))   # hard limit: only 164 exist
+    add("MBPP",           load_mbpp(374))         # supplements HumanEval for code:easy
+    add("BigCodeBench",   load_bigcodebench(260))
+    add("APPS",           load_apps(180))
+    add("LogiQA",         load_logiqa(300))
+    add("HellaSwag",      load_hellaswag(260))
+    add("ARC",            load_arc(300))
 
     print(f"\n  Total raw base items: {len(all_items)}")
 
-    # ── Balance base by domain/complexity ─────────────────────────────────
     base_target = total - lcb_count - swe_count
     buckets: dict[tuple, list[dict]] = defaultdict(list)
     for item in all_items:
@@ -640,13 +675,11 @@ def build(total: int, output: str, lcb_count: int = 200,
             if pool:
                 dataset.extend(random.choices(pool, k=want - len(pool)))
 
-    # Pad base to target if needed
     if len(dataset) < base_target:
         extra = random.choices(all_items, k=base_target - len(dataset))
         dataset.extend(extra)
     dataset = dataset[:base_target]
 
-    # ── Load LiveCodeBench (post-cutoff, execution-scored) ────────────────
     print(f"\n  Loading LiveCodeBench ({lcb_count} samples, cutoff={cutoff})...")
     lcb_items = load_livecodebench(lcb_count, cutoff=cutoff)
     print(f"    LiveCodeBench      {len(lcb_items):4} items loaded")
@@ -654,11 +687,10 @@ def build(total: int, output: str, lcb_count: int = 200,
     if lcb_items:
         dataset.extend(lcb_items)
     else:
-        print("  WARNING: LiveCodeBench unavailable or no items after cutoff -- padding with existing code items")
+        print("  WARNING: LiveCodeBench unavailable or no items after cutoff -- padding")
         code_pool = [x for x in all_items if x["domain"] == "code"]
         dataset.extend(random.choices(code_pool, k=lcb_count))
 
-    # ── Load SWE-bench (post-cutoff GitHub issues) ────────────────────────
     print(f"\n  Loading SWE-bench Verified ({swe_count} samples, cutoff={cutoff})...")
     swe_items = load_swe_bench(swe_count, cutoff=cutoff)
     print(f"    SWE-bench          {len(swe_items):4} items loaded")
@@ -666,17 +698,15 @@ def build(total: int, output: str, lcb_count: int = 200,
     if swe_items:
         dataset.extend(swe_items)
     else:
-        print("  WARNING: SWE-bench unavailable or no items after cutoff -- padding with existing code items")
+        print("  WARNING: SWE-bench unavailable or no items after cutoff -- padding")
         code_pool = [x for x in all_items if x["domain"] == "code"]
         dataset.extend(random.choices(code_pool, k=swe_count))
 
     random.shuffle(dataset)
 
-    # ── Save ─────────────────────────────────────────────────────────────
     with open(output, "w") as f:
         json.dump(dataset, f, indent=2)
 
-    # ── Summary ──────────────────────────────────────────────────────────
     print(f"\n  Final dataset: {len(dataset)} requests")
 
     by_domain: dict[str, int] = defaultdict(int)
@@ -696,9 +726,8 @@ def build(total: int, output: str, lcb_count: int = 200,
     print("\n  By source:")
     for s, n2 in sorted(by_source.items()):
         print(f"    {s:<20} {n2:4}")
-    print(f"\n  Contamination cutoff: {cutoff}")
-    print(f"  Post-cutoff items: LiveCodeBench={len(lcb_items)}, SWE-bench={len(swe_items)}")
-
+    print(f"\n  Contamination cutoff : {cutoff}")
+    print(f"  Post-cutoff items    : LiveCodeBench={len(lcb_items)}, SWE-bench={len(swe_items)}")
     print(f"\n  Saved to: {output}")
     print(f"  Run load test with:")
     print(f"    python tests/load_test.py --dataset {output}\n")
@@ -710,17 +739,16 @@ def build(total: int, output: str, lcb_count: int = 200,
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--output",    default="datasets/hf_1500.json")
-    parser.add_argument("--count",     type=int, default=1500,
+    parser.add_argument("--output",    default="datasets/hf_3000.json")
+    parser.add_argument("--count",     type=int, default=3000,
                         help="Total samples (base + LiveCodeBench + SWE-bench)")
-    parser.add_argument("--lcb-count", type=int, default=200,
+    parser.add_argument("--lcb-count", type=int, default=400,
                         help="LiveCodeBench samples (post-cutoff, execution-scored)")
-    parser.add_argument("--swe-count", type=int, default=100,
+    parser.add_argument("--swe-count", type=int, default=200,
                         help="SWE-bench Verified samples (post-cutoff GitHub issues)")
     parser.add_argument("--cutoff",    default=CONTAMINATION_CUTOFF,
-                        help=f"Contamination cutoff date YYYY-MM-DD (default: {CONTAMINATION_CUTOFF}). "
-                             "Problems created before this date are excluded from "
-                             "LiveCodeBench and SWE-bench to prevent training-data leakage.")
+                        help=f"Contamination cutoff YYYY-MM-DD (default: {CONTAMINATION_CUTOFF}). "
+                             "Excludes LiveCodeBench/SWE-bench problems before this date.")
     parser.add_argument("--seed",      type=int, default=42)
     args = parser.parse_args()
 
