@@ -19,11 +19,11 @@ set -euo pipefail
 # ── Configuration ─────────────────────────────────────────────────────────────
 ROUTER_PORT=${ROUTER_PORT:-8080}
 PRIORS_FILE=${PRIORS_FILE:-"results/priors_all5.json"}
-DATASET=${DATASET:-"datasets/hf_1500.json"}
-N_REQUESTS=${N_REQUESTS:-1500}
+DATASET=${DATASET:-"datasets/hf_3000.json"}
+N_REQUESTS=${N_REQUESTS:-3000}
 CONCURRENCY=${CONCURRENCY:-50}
 EVAL_CONCURRENCY=${EVAL_CONCURRENCY:-30}
-# TTCA scoring: score = accuracy / (latency^TTCA_ALPHA × cost^TTCA_COST_BETA)  (higher = better)
+# TTCA scoring: score = accuracy / (latency^TTCA_ALPHA x cost^TTCA_COST_BETA)  (higher = better)
 # TTCA_ALPHA: 0.0 = pure accuracy  |  1.0 = classic TTCA  |  2.0 = quadratic latency penalty
 # TTCA_COST_BETA: 0.0 = cost excluded (default)  |  1.0 = cost penalized equally to latency
 TTCA_ALPHA=${TTCA_ALPHA:-1.0}
@@ -31,7 +31,6 @@ TTCA_COST_BETA=${TTCA_COST_BETA:-0.0}
 # Provisioner mode:
 #   static  — all models pre-loaded at startup, no auto-scaling (default, reproducible)
 #   dynamic — start with 2 fast models; provisioner scales up based on router demand
-#             (tests the new cold-model proactive spin-up feature)
 EXPERIMENT_MODE=${EXPERIMENT_MODE:-static}
 LOG_DIR="$HOME/vllm_logs"
 mkdir -p "$LOG_DIR"
@@ -58,7 +57,7 @@ echo "  Two-Node Experiment  $(date)"
 echo "  NODE1 : $NODE1  (qwen-7b / deepseek-r1-7b / qwen3-coder-30b / gemma-3-27b / deepseek-r1-14b)"
 echo "  NODE2 : $NODE2  (llama4-scout, 8 GPUs)"
 echo "  Router: $ROUTER_URL"
-echo "  TTCA_ALPHA: $TTCA_ALPHA  TTCA_COST_BETA: $TTCA_COST_BETA  (score = acc / lat^α × cost^β)"
+echo "  TTCA_ALPHA: $TTCA_ALPHA  TTCA_COST_BETA: $TTCA_COST_BETA  (score = acc / lat^a x cost^b)"
 echo "  MODE      : $EXPERIMENT_MODE  (static=all-preloaded | dynamic=cold-spinup)"
 echo "  Output    : $RESULTS_DIR"
 echo "=================================================================="
@@ -138,9 +137,6 @@ echo "  PID: $PROV1_PID  log: $LOG_DIR/provisioner_node1.log"
 # ── Step 3: Start Node 2 provisioner ─────────────────────────────────────────
 echo ""
 echo "[3/8] Starting provisioner on $NODE2 (llama4-scout, 8 GPUs)..."
-# Run the node2 provisioner in the background via SSH.
-# </dev/null closes the remote process's stdin so SSH exits cleanly.
-# disown removes the job from the shell's table so the shell doesn't wait.
 # shellcheck disable=SC2029
 ssh "$NODE2" "
     cd ~/semantic-llm-router
@@ -163,7 +159,7 @@ echo "  log: $LOG_DIR/provisioner_node2.log (on $NODE2)"
 echo ""
 if [ "$EXPERIMENT_MODE" = "dynamic" ]; then
     echo "[4/8] Waiting for seed models (dynamic mode — 2 initial + llama4-scout on node2)..."
-    wait_models 3   # qwen-7b + deepseek-r1-7b + llama4-scout
+    wait_models 3
 else
     echo "[4/8] Waiting for all 6 models (static mode)..."
     wait_models 6
@@ -202,7 +198,7 @@ curl --noproxy '*' -sf "$ROUTER_URL/v1/models" \
 
 # ── Step 5: Eval matrix ───────────────────────────────────────────────────────
 echo ""
-echo "[5/10] Building eval matrix (6 models x 1500 queries, ~30-45 min)..."
+echo "[5/10] Building eval matrix (6 models x $N_REQUESTS queries, ~60-90 min)..."
 python tests/eval_all_models.py \
     --dataset     "$DATASET" \
     --output      "$RESULTS_DIR/eval_matrix.csv" \
@@ -247,7 +243,7 @@ echo "  Models registered with real priors:"
 curl --noproxy '*' -sf "$ROUTER_URL/v1/models" \
     | python3 -c "import sys,json; [print(f'    {m[\"id\"]}') for m in json.load(sys.stdin)['data']]"
 
-# ── Step 8: TTCA load test ────────────────────────────────────────────────────
+# ── Step 8: TTCA load test (full system with retry) ───────────────────────────
 echo ""
 echo "[8/10] TTCA router load test (${N_REQUESTS} requests, real priors active)..."
 python tests/load_test.py \
@@ -269,7 +265,7 @@ python tests/load_test.py \
     --concurrency "$CONCURRENCY" \
     --output      "$RESULTS_DIR/router_accuracy.csv"
 
-# ── Step 10: Round-robin baseline + comparisons ───────────────────────────────
+# ── Step 10: Round-robin baseline ─────────────────────────────────────────────
 echo ""
 echo "[10/10] Round-robin baseline (${N_REQUESTS} requests)..."
 python tests/round_robin_test.py \
@@ -279,38 +275,12 @@ python tests/round_robin_test.py \
     --node2-host  "$NODE2"
 
 echo ""
-echo "=== Per-category breakdown: TTCA router vs Round-Robin ===" | tee "$RESULTS_DIR/compare_categories_ttca.txt"
-python tests/compare_categories.py \
-    --router      "$RESULTS_DIR/router_ttca.csv" \
-    --baseline    "$RESULTS_DIR/rr_baseline.csv" \
-    --eval-matrix "$RESULTS_DIR/eval_matrix.csv" \
-    --output      "$RESULTS_DIR/compare_categories_ttca.csv" \
-    | tee -a "$RESULTS_DIR/compare_categories_ttca.txt"
-
-echo ""
-echo "=== Per-category breakdown: Accuracy router vs Round-Robin ===" | tee "$RESULTS_DIR/compare_categories_accuracy.txt"
-python tests/compare_categories.py \
-    --router      "$RESULTS_DIR/router_accuracy.csv" \
-    --baseline    "$RESULTS_DIR/rr_baseline.csv" \
-    --eval-matrix "$RESULTS_DIR/eval_matrix.csv" \
-    --output      "$RESULTS_DIR/compare_categories_accuracy.csv" \
-    | tee -a "$RESULTS_DIR/compare_categories_accuracy.txt"
-
-echo ""
-echo "=== TTCA router vs Round-Robin ===" | tee "$RESULTS_DIR/compare_ttca_vs_rr.txt"
+echo "=== TTCA (with retry) vs Round-Robin ===" | tee "$RESULTS_DIR/compare_ttca_vs_rr.txt"
 python tests/compare_ttca.py \
     --router      "$RESULTS_DIR/router_ttca.csv" \
     --baseline    "$RESULTS_DIR/rr_baseline.csv" \
     --eval-matrix "$RESULTS_DIR/eval_matrix.csv" \
     | tee -a "$RESULTS_DIR/compare_ttca_vs_rr.txt"
-
-echo ""
-echo "=== Accuracy router vs Round-Robin ===" | tee "$RESULTS_DIR/compare_accuracy_vs_rr.txt"
-python tests/compare_ttca.py \
-    --router      "$RESULTS_DIR/router_accuracy.csv" \
-    --baseline    "$RESULTS_DIR/rr_baseline.csv" \
-    --eval-matrix "$RESULTS_DIR/eval_matrix.csv" \
-    | tee -a "$RESULTS_DIR/compare_accuracy_vs_rr.txt"
 
 echo ""
 echo "=== TTCA vs Accuracy router ===" | tee "$RESULTS_DIR/compare_ttca_vs_accuracy.txt"
@@ -320,15 +290,15 @@ python tests/compare_ttca.py \
     --eval-matrix "$RESULTS_DIR/eval_matrix.csv" \
     | tee -a "$RESULTS_DIR/compare_ttca_vs_accuracy.txt"
 
-# ── Baseline comparisons ──────────────────────────────────────────────────────
+# ── Baseline runs ──────────────────────────────────────────────────────────────
 echo ""
 echo "=================================================================="
-echo "  Baseline comparisons"
+echo "  Running baselines"
 echo "=================================================================="
 
-# Axis 1: Single-shot TTCA (no retry) — apple-to-apple vs baselines with no retry
+# TTCA no-retry (diagnostic: isolates retry benefit)
 echo ""
-echo "[Baseline 1/6] TTCA single-shot (no retry, ${N_REQUESTS} requests)..."
+echo "[Baseline 1/5] TTCA no-retry — diagnostic (${N_REQUESTS} requests)..."
 python tests/load_test.py \
     --dataset     "$DATASET" \
     --router      "$ROUTER_URL" \
@@ -338,18 +308,9 @@ python tests/load_test.py \
     --concurrency "$CONCURRENCY" \
     --output      "$RESULTS_DIR/ttca_no_retry.csv"
 
-# Axis 1: Complexity-tier routing (RouterDC-style, hand-built)
+# Cascade / RouteLLM-style
 echo ""
-echo "[Baseline 2/6] Complexity-tier routing — hand-built (${N_REQUESTS} requests)..."
-python tests/baseline_complexity_tier.py \
-    --dataset     "$DATASET" \
-    --concurrency "$CONCURRENCY" \
-    --node2-host  "$NODE2" \
-    --output      "$RESULTS_DIR/baseline_tier.csv"
-
-# Axis 1: Cascade routing (RouteLLM-style)
-echo ""
-echo "[Baseline 3/6] Cascade routing / RouteLLM-style (${N_REQUESTS} requests)..."
+echo "[Baseline 2/5] Cascade routing / RouteLLM-style (${N_REQUESTS} requests)..."
 python tests/baseline_cascade.py \
     --dataset     "$DATASET" \
     --priors      "$RESULTS_DIR/priors_new.json" \
@@ -357,9 +318,18 @@ python tests/baseline_cascade.py \
     --concurrency "$CONCURRENCY" \
     --output      "$RESULTS_DIR/baseline_cascade.csv"
 
-# Axis 1: Accuracy-optimal tier (data-driven upper bound on static routing by accuracy)
+# Complexity-tier (hand-built)
 echo ""
-echo "[Baseline 4/6] Accuracy-optimal tier — data-driven (${N_REQUESTS} requests)..."
+echo "[Baseline 3/5] Complexity-tier routing — hand-built (${N_REQUESTS} requests)..."
+python tests/baseline_complexity_tier.py \
+    --dataset     "$DATASET" \
+    --concurrency "$CONCURRENCY" \
+    --node2-host  "$NODE2" \
+    --output      "$RESULTS_DIR/baseline_tier.csv"
+
+# Accuracy-optimal tier (data-driven upper bound)
+echo ""
+echo "[Baseline 4/5] Accuracy-optimal tier — data-driven (${N_REQUESTS} requests)..."
 python tests/baseline_complexity_tier.py \
     --dataset      "$DATASET" \
     --concurrency  "$CONCURRENCY" \
@@ -368,9 +338,9 @@ python tests/baseline_complexity_tier.py \
     --tier-variant accuracy_optimal \
     --output       "$RESULTS_DIR/baseline_tier_optimal_acc.csv"
 
-# Axis 1: TTCA-optimal tier (data-driven upper bound on static TTCA-aware routing)
+# TTCA-optimal tier (data-driven upper bound on TTCA objective)
 echo ""
-echo "[Baseline 5/6] TTCA-optimal tier — data-driven (${N_REQUESTS} requests)..."
+echo "[Baseline 5/5] TTCA-optimal tier — data-driven (${N_REQUESTS} requests)..."
 python tests/baseline_complexity_tier.py \
     --dataset      "$DATASET" \
     --concurrency  "$CONCURRENCY" \
@@ -379,9 +349,9 @@ python tests/baseline_complexity_tier.py \
     --tier-variant ttca_optimal \
     --output       "$RESULTS_DIR/baseline_tier_optimal_ttca.csv"
 
-# Axis 2: vLLM Semantic Router (only if vllm-sr is running on port 8888)
+# vLLM Semantic Router (optional)
 echo ""
-echo "[Baseline 6/6] vLLM Semantic Router (if running on port 8888)..."
+echo "[Optional] vLLM Semantic Router (checking port 8888)..."
 if curl --noproxy '*' -sf "http://${NODE1}:8888/health" > /dev/null 2>&1 || \
    curl --noproxy '*' -sf "http://${NODE1}:8888/v1/models" > /dev/null 2>&1; then
     python tests/baseline_vllm_router.py \
@@ -394,9 +364,40 @@ else
     echo "  To run it: pip install vllm-sr && vllm-sr serve --config configs/vllm_sr_config.yaml"
 fi
 
-# ── Baseline comparison reports ───────────────────────────────────────────────
+# ── PRIMARY comparison reports (TTCA+retry vs full systems) ───────────────────
 echo ""
-echo "=== TTCA (with retry) vs TTCA (no retry) ===" | tee "$RESULTS_DIR/compare_retry_benefit.txt"
+echo "=================================================================="
+echo "  PRIMARY comparisons: TTCA+retry vs full baselines"
+echo "=================================================================="
+
+echo ""
+echo "=== TTCA (with retry) vs Cascade/RouteLLM ===" | tee "$RESULTS_DIR/compare_ttca_vs_cascade.txt"
+python tests/compare_categories.py \
+    --router      "$RESULTS_DIR/router_ttca.csv" \
+    --baseline    "$RESULTS_DIR/baseline_cascade.csv" \
+    --eval-matrix "$RESULTS_DIR/eval_matrix.csv" \
+    --output      "$RESULTS_DIR/compare_ttca_vs_cascade.csv" \
+    | tee -a "$RESULTS_DIR/compare_ttca_vs_cascade.txt"
+
+if [ -f "$RESULTS_DIR/baseline_vllm_sr.csv" ]; then
+    echo ""
+    echo "=== TTCA (with retry) vs vLLM Semantic Router ===" | tee "$RESULTS_DIR/compare_ttca_retry_vs_vllm_sr.txt"
+    python tests/compare_categories.py \
+        --router      "$RESULTS_DIR/router_ttca.csv" \
+        --baseline    "$RESULTS_DIR/baseline_vllm_sr.csv" \
+        --eval-matrix "$RESULTS_DIR/eval_matrix.csv" \
+        --output      "$RESULTS_DIR/compare_ttca_retry_vs_vllm_sr.csv" \
+        | tee -a "$RESULTS_DIR/compare_ttca_retry_vs_vllm_sr.txt"
+fi
+
+# ── DIAGNOSTIC comparison reports ─────────────────────────────────────────────
+echo ""
+echo "=================================================================="
+echo "  DIAGNOSTIC comparisons"
+echo "=================================================================="
+
+echo ""
+echo "=== TTCA (with retry) vs TTCA (no retry) — retry benefit ===" | tee "$RESULTS_DIR/compare_retry_benefit.txt"
 python tests/compare_ttca.py \
     --router      "$RESULTS_DIR/router_ttca.csv" \
     --baseline    "$RESULTS_DIR/ttca_no_retry.csv" \
@@ -404,22 +405,13 @@ python tests/compare_ttca.py \
     | tee -a "$RESULTS_DIR/compare_retry_benefit.txt"
 
 echo ""
-echo "=== TTCA (no retry) vs Complexity-Tier (hand-built) ===" | tee "$RESULTS_DIR/compare_vs_tier.txt"
+echo "=== TTCA (no retry) vs Complexity-Tier ===" | tee "$RESULTS_DIR/compare_vs_tier.txt"
 python tests/compare_categories.py \
     --router      "$RESULTS_DIR/ttca_no_retry.csv" \
     --baseline    "$RESULTS_DIR/baseline_tier.csv" \
     --eval-matrix "$RESULTS_DIR/eval_matrix.csv" \
     --output      "$RESULTS_DIR/compare_vs_tier.csv" \
     | tee -a "$RESULTS_DIR/compare_vs_tier.txt"
-
-echo ""
-echo "=== TTCA (no retry) vs Cascade/RouteLLM ===" | tee "$RESULTS_DIR/compare_vs_cascade.txt"
-python tests/compare_categories.py \
-    --router      "$RESULTS_DIR/ttca_no_retry.csv" \
-    --baseline    "$RESULTS_DIR/baseline_cascade.csv" \
-    --eval-matrix "$RESULTS_DIR/eval_matrix.csv" \
-    --output      "$RESULTS_DIR/compare_vs_cascade.csv" \
-    | tee -a "$RESULTS_DIR/compare_vs_cascade.txt"
 
 echo ""
 echo "=== TTCA (no retry) vs Accuracy-Optimal Tier ===" | tee "$RESULTS_DIR/compare_vs_tier_optimal_acc.txt"
@@ -439,52 +431,27 @@ python tests/compare_categories.py \
     --output      "$RESULTS_DIR/compare_vs_tier_optimal_ttca.csv" \
     | tee -a "$RESULTS_DIR/compare_vs_tier_optimal_ttca.txt"
 
-if [ -f "$RESULTS_DIR/baseline_vllm_sr.csv" ]; then
-    echo ""
-    echo "=== TTCA (no retry) vs vLLM Semantic Router ===" | tee "$RESULTS_DIR/compare_vs_vllm_sr.txt"
-    python tests/compare_categories.py \
-        --router      "$RESULTS_DIR/ttca_no_retry.csv" \
-        --baseline    "$RESULTS_DIR/baseline_vllm_sr.csv" \
-        --eval-matrix "$RESULTS_DIR/eval_matrix.csv" \
-        --output      "$RESULTS_DIR/compare_vs_vllm_sr.csv" \
-        | tee -a "$RESULTS_DIR/compare_vs_vllm_sr.txt"
-
-    echo ""
-    echo "=== TTCA (with retry) vs vLLM Semantic Router ===" | tee "$RESULTS_DIR/compare_ttca_retry_vs_vllm_sr.txt"
-    python tests/compare_categories.py \
-        --router      "$RESULTS_DIR/router_ttca.csv" \
-        --baseline    "$RESULTS_DIR/baseline_vllm_sr.csv" \
-        --eval-matrix "$RESULTS_DIR/eval_matrix.csv" \
-        --output      "$RESULTS_DIR/compare_ttca_retry_vs_vllm_sr.csv" \
-        | tee -a "$RESULTS_DIR/compare_ttca_retry_vs_vllm_sr.txt"
-fi
-
 # ── Done ──────────────────────────────────────────────────────────────────────
 echo ""
 echo "=================================================================="
 echo "  Experiment complete!  $(date)"
 echo "  Results: $RESULTS_DIR/"
 echo "    eval_matrix.csv"
-echo "    router_ttca.csv"
+echo "    router_ttca.csv            (our system: TTCA+retry)"
 echo "    router_accuracy.csv"
 echo "    rr_baseline.csv"
-echo "    compare_categories_ttca.csv         (TTCA vs round-robin)"
-echo "    compare_categories_accuracy.csv     (accuracy router vs round-robin)"
-echo "    compare_ttca_vs_rr.txt              (TTCA vs round-robin summary)"
-echo "    compare_ttca_vs_accuracy.txt        (TTCA vs accuracy router)"
-echo "  — Baseline comparisons —"
-echo "    ttca_no_retry.csv                   (TTCA single-shot, no cascade retry)"
-echo "    baseline_tier.csv                   (complexity-tier / RouterDC-style, hand-built)"
-echo "    baseline_cascade.csv                (2-model cascade / RouteLLM-style)"
-echo "    optimal_tier_maps.json              (data-driven tier maps from eval matrix)"
-echo "    baseline_tier_optimal_acc.csv       (accuracy-optimal static tier — upper bound)"
-echo "    baseline_tier_optimal_ttca.csv      (TTCA-optimal static tier — upper bound)"
-echo "    baseline_vllm_sr.csv                (vLLM Semantic Router, if running)"
-echo "    compare_retry_benefit.txt           (value of retry: TTCA+retry vs no-retry)"
-echo "    compare_vs_tier.csv                 (TTCA no-retry vs hand-built tier)"
-echo "    compare_vs_cascade.csv              (TTCA no-retry vs RouteLLM-style)"
-echo "    compare_vs_tier_optimal_acc.csv     (TTCA no-retry vs accuracy-optimal tier)"
-echo "    compare_vs_tier_optimal_ttca.csv    (TTCA no-retry vs TTCA-optimal tier)"
-echo "    compare_vs_vllm_sr.csv              (TTCA no-retry vs vLLM-SR, if run)"
-echo "    compare_ttca_retry_vs_vllm_sr.csv   (TTCA+retry vs vLLM-SR system comparison)"
+echo "    compare_ttca_vs_rr.txt     (TTCA+retry vs round-robin summary)"
+echo "    compare_ttca_vs_accuracy.txt"
+echo "  — PRIMARY comparisons (TTCA+retry vs full systems) —"
+echo "    compare_ttca_vs_rr.txt              TTCA+retry vs round-robin"
+echo "    compare_ttca_vs_cascade.csv         TTCA+retry vs cascade/RouteLLM"
+echo "    compare_ttca_retry_vs_vllm_sr.csv   TTCA+retry vs vLLM-SR (if run)"
+echo "  — DIAGNOSTIC —"
+echo "    compare_retry_benefit.txt           TTCA+retry vs TTCA no-retry (retry value)"
+echo "    compare_vs_tier.csv                 TTCA no-retry vs complexity-tier"
+echo "    compare_vs_tier_optimal_acc.csv     TTCA no-retry vs accuracy-optimal tier"
+echo "    compare_vs_tier_optimal_ttca.csv    TTCA no-retry vs TTCA-optimal tier"
+echo "  — Baselines produced —"
+echo "    baseline_cascade.csv   baseline_tier.csv   baseline_vllm_sr.csv"
+echo "    baseline_tier_optimal_acc.csv   baseline_tier_optimal_ttca.csv"
 echo "=================================================================="
