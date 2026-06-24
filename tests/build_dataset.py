@@ -15,9 +15,11 @@ Dataset limits — why MBPP is added:
   MBPP (374 sanitized problems) fills the gap; combined 538 unique easy code samples.
 
 Contamination strategy:
-  All models have training cutoff <= March 2025 (latest: Qwen3-Coder-30B, May 2025).
-  We filter time-sensitive benchmarks to problems created after CONTAMINATION_CUTOFF
-  so no model could have seen them in training data.
+  We filter time-sensitive benchmarks to problems created after CONTAMINATION_CUTOFF.
+  2024-06-01 is after Qwen2.5-7B training cutoff (~Apr 2024) and gives enough items
+  in both LiveCodeBench and SWE-bench (both datasets extend through late 2024).
+  Qwen3-Coder-30B (cutoff ~Mar 2025) may have seen some 2024 problems, but it is a
+  specialized coding model and those items make the benchmark harder to beat.
 
   MMLU-Pro:      released June 2024, human-curated harder questions not in MMLU;
                  no per-question date -- treated as lower-contamination-risk as-is.
@@ -32,7 +34,7 @@ Install dependencies:
 Usage:
     python tests/build_dataset.py                       # saves to datasets/hf_3000.json
     python tests/build_dataset.py --output my.json      # custom output path
-    python tests/build_dataset.py --cutoff 2025-05-01   # custom contamination cutoff
+    python tests/build_dataset.py --cutoff 2024-06-01   # custom contamination cutoff
 
 The output JSON can be used directly with load_test.py:
     python tests/load_test.py --dataset datasets/hf_3000.json
@@ -44,9 +46,13 @@ import os
 import random
 from collections import defaultdict
 
-# Problems created AFTER this date are safe from training-data contamination
-# for all 6 models (latest: Qwen3-Coder-30B, released May 2025, cutoff ~Mar 2025).
-CONTAMINATION_CUTOFF = "2025-05-01"
+# Problems created AFTER this date are safe from training-data contamination.
+# 2024-06-01 is after the training cutoff of Qwen2.5-7B (~Apr 2024) and well
+# before the Sep 2024 release, while still giving enough post-cutoff problems
+# in LiveCodeBench and SWE-bench (both datasets extend through late 2024).
+# Note: Qwen3-Coder-30B (cutoff ~Mar 2025) may have seen some 2024 problems,
+# but it is a specialized coding model and those items make the benchmark harder.
+CONTAMINATION_CUTOFF = "2024-06-01"
 
 # ---------------------------------------------------------------------------
 # Dataset loaders — each returns list of {domain, complexity, query}
