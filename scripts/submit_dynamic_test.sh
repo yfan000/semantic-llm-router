@@ -5,25 +5,33 @@
 # as request complexity increases:
 #
 #   Phase 1 — Cold start:  qwen-7b + deepseek-r1-7b (node1) + llama4-scout (node2)
-#   Phase 2 — Warm-up:     100 mixed easy/medium requests (seed models handle)
-#   Phase 3 — Code burst:  200 code:hard/medium requests -> triggers qwen3-coder-30b
-#   Phase 4 — Math burst:  200 math:hard requests -> triggers deepseek-r1-14b
+#   Phase 2 — Warm-up:     100 easy/medium requests at low concurrency (seed models handle)
+#   Phase 3 — Code burst:  300 code:hard/medium at high concurrency -> triggers qwen3-coder-30b
+#   Phase 4 — Math burst:  300 math:hard at high concurrency -> triggers deepseek-r1-14b
 #   Phase 5 — Measure:     compare accuracy before/after spin-ups
 #
 # Key assertions:
 #   [PASS] Seed models start (qwen-7b, deepseek-r1-7b, llama4-scout)
 #   [PASS] qwen3-coder-30b or deepseek-r1-14b spins up during code/math burst
 #   [PASS] No *-replica models appear in /v1/models
-#   [PASS] Accuracy after spin-up >= accuracy during cold start
+#   [PASS] Model count grows after bursts
+#
+# Why high concurrency for bursts:
+#   Provisioner triggers on: num_requests_running > 20 OR kv_cache > 70%.
+#   A100 with continuous batching handles concurrency=30 without queuing.
+#   At concurrency=80, deepseek-r1-7b (1 GPU) saturates on hard requests,
+#   pushing num_requests_running above RUNNING_THRESHOLD=20 -> provisioner fires.
 #
 # Usage:
 #   bash scripts/submit_dynamic_test.sh
-#   N_WARMUP=50 N_BURST=100 bash scripts/submit_dynamic_test.sh
+#   N_BURST=500 CONCURRENCY_BURST=100 bash scripts/submit_dynamic_test.sh
 
 set -euo pipefail
 
 N_WARMUP=${N_WARMUP:-100}    # requests during warm-up (easy/medium)
-N_BURST=${N_BURST:-200}      # requests per burst phase (hard)
+N_BURST=${N_BURST:-300}      # requests per burst phase (hard)
+CONCURRENCY_WARMUP=${CONCURRENCY_WARMUP:-20}   # low — seed models handle easily
+CONCURRENCY_BURST=${CONCURRENCY_BURST:-80}     # high — must saturate vLLM to trigger provisioner
 PROJECT=${PROJECT:-UIC-HPC}
 QUEUE=${QUEUE:-by-node}
 DATASET=${DATASET:-"datasets/hf_3000.json"}
@@ -66,9 +74,9 @@ mkdir -p "\$RESULTS_DIR"
 echo "=================================================================="
 echo "  Dynamic Provisioning Test   \$(date)"
 echo "  NODE1 : \$NODE1   NODE2 : \$NODE2"
-echo "  N_WARMUP  : ${N_WARMUP}"
-echo "  N_BURST   : ${N_BURST}"
-echo "  Dataset   : ${DATASET}"
+echo "  N_WARMUP          : ${N_WARMUP}  (concurrency=${CONCURRENCY_WARMUP})"
+echo "  N_BURST           : ${N_BURST}  (concurrency=${CONCURRENCY_BURST})"
+echo "  Dataset           : ${DATASET}"
 echo "=================================================================="
 
 # ── Helper: list registered models ───────────────────────────────────────────
@@ -142,10 +150,10 @@ echo ""
 echo "--- Models at cold start ---"
 list_models
 
-# ── Step 4: Phase 1 — Warm-up with easy/medium requests ──────────────────────
+# ── Step 4: Phase 1 — Warm-up (low concurrency, seed models handle) ──────────
 echo ""
-echo "[4] Phase 1: Warm-up (${N_WARMUP} easy/medium requests)..."
-echo "  Sending easy requests — seed models should handle all of these."
+echo "[4] Phase 1: Warm-up (${N_WARMUP} easy/medium, concurrency=${CONCURRENCY_WARMUP})..."
+echo "  Low concurrency — seed models handle without triggering provisioner."
 
 python3 -c "
 import json, random
@@ -161,19 +169,19 @@ python tests/load_test.py \
     --router      "\$ROUTER_URL" \
     --mode        ttca \
     --requests    ${N_WARMUP} \
-    --concurrency 20 \
+    --concurrency ${CONCURRENCY_WARMUP} \
     --output      "\$RESULTS_DIR/phase1_warmup.csv"
 
 echo ""
-echo "--- Models after warm-up ---"
+echo "--- Models after warm-up (should still be 3) ---"
 list_models
 MODELS_AFTER_WARMUP=\$(curl --noproxy '*' -sf "\$ROUTER_URL/v1/models" \
     | python3 -c "import sys,json; print(len(json.load(sys.stdin).get('data',[])))" 2>/dev/null || echo 0)
 
-# ── Step 5: Phase 2 — Code burst (triggers qwen3-coder-30b) ──────────────────
+# ── Step 5: Phase 2 — Code burst (high concurrency -> triggers spin-up) ──────
 echo ""
-echo "[5] Phase 2: Code burst (${N_BURST} code:hard/medium requests)..."
-echo "  Heavy code load should trigger qwen3-coder-30b spin-up (~10 min)."
+echo "[5] Phase 2: Code burst (${N_BURST} code:hard/medium, concurrency=${CONCURRENCY_BURST})..."
+echo "  High concurrency saturates deepseek-r1-7b -> provisioner triggers qwen3-coder-30b."
 
 python3 -c "
 import json, random
@@ -190,23 +198,23 @@ python tests/load_test.py \
     --router      "\$ROUTER_URL" \
     --mode        ttca \
     --requests    ${N_BURST} \
-    --concurrency 30 \
+    --concurrency ${CONCURRENCY_BURST} \
     --output      "\$RESULTS_DIR/phase2_code.csv"
 
 echo ""
-echo "--- Models after code burst ---"
+echo "--- Models immediately after code burst ---"
 list_models
 
-# Wait for provisioner poll to fire (poll_interval=30s)
-echo "  Waiting 60s for provisioner to react..."
-sleep 60
+# Wait for provisioner poll (interval=30s) + model startup (~10 min)
+echo "  Waiting 90s for provisioner to detect overload and trigger spin-up..."
+sleep 90
 echo ""
 echo "--- Models after provisioner poll ---"
 list_models
 
-# ── Step 6: Phase 3 — Math burst (triggers deepseek-r1-14b) ──────────────────
+# ── Step 6: Phase 3 — Math burst (high concurrency -> triggers deepseek-r1-14b) ─
 echo ""
-echo "[6] Phase 3: Math burst (${N_BURST} math:hard requests)..."
+echo "[6] Phase 3: Math burst (${N_BURST} math:hard, concurrency=${CONCURRENCY_BURST})..."
 
 python3 -c "
 import json, random
@@ -223,16 +231,14 @@ python tests/load_test.py \
     --router      "\$ROUTER_URL" \
     --mode        ttca \
     --requests    ${N_BURST} \
-    --concurrency 30 \
+    --concurrency ${CONCURRENCY_BURST} \
     --output      "\$RESULTS_DIR/phase3_math.csv"
 
 echo ""
 echo "--- Models after math burst ---"
 list_models
-
-# Wait for provisioner
-echo "  Waiting 60s for provisioner..."
-sleep 60
+echo "  Waiting 90s for provisioner..."
+sleep 90
 
 # ── Step 7: Final model inventory ────────────────────────────────────────────
 echo ""
@@ -267,14 +273,8 @@ echo "=================================================================="
 PASS=0
 FAIL=0
 
-assert_pass() {
-    echo "  [PASS] \$1"
-    PASS=\$((PASS + 1))
-}
-assert_fail() {
-    echo "  [FAIL] \$1"
-    FAIL=\$((FAIL + 1))
-}
+assert_pass() { echo "  [PASS] \$1"; PASS=\$((PASS + 1)); }
+assert_fail() { echo "  [FAIL] \$1"; FAIL=\$((FAIL + 1)); }
 
 [ "\$MODELS_AFTER_WARMUP" -ge 3 ] && \
     assert_pass "Seed models started (\$MODELS_AFTER_WARMUP registered after warmup)" || \
@@ -306,7 +306,7 @@ N_COLD=\$(echo \$COLD_MODELS_RUNNING | awk '{print \$1}')
 NAMES_COLD=\$(echo \$COLD_MODELS_RUNNING | cut -d' ' -f2-)
 [ "\$N_COLD" -ge 1 ] && \
     assert_pass "Cold model(s) spun up: \$NAMES_COLD" || \
-    assert_fail "No cold models spun up (qwen3-coder-30b / deepseek-r1-14b / gemma-3-27b)"
+    assert_fail "No cold models spun up (qwen3-coder-30b / deepseek-r1-14b / gemma-3-27b) — load may need to be higher"
 
 echo ""
 echo "  PASS: \$PASS   FAIL: \$FAIL"
@@ -316,22 +316,23 @@ echo ""
 echo "=================================================================="
 echo "  Dynamic test complete!  \$(date)"
 echo "  Results: \$RESULTS_DIR/"
-echo "    phase1_warmup.csv      easy/medium requests at cold start"
-echo "    phase2_code.csv        code:hard burst (triggers coder model)"
-echo "    phase3_math.csv        math:hard burst (triggers math model)"
+echo "    phase1_warmup.csv      easy/medium at cold start (concurrency=${CONCURRENCY_WARMUP})"
+echo "    phase2_code.csv        code:hard burst           (concurrency=${CONCURRENCY_BURST})"
+echo "    phase3_math.csv        math:hard burst           (concurrency=${CONCURRENCY_BURST})"
 echo "    phase_comparison.txt   accuracy across phases"
 echo ""
 echo "  Provisioner log (node1): ~/vllm_logs/prov_dyntest_node1.log"
-echo "  Check spin-up events:    grep 'SPIN UP\|Strategy B\|upgrade' ~/vllm_logs/prov_dyntest_node1.log"
+echo "  Check spin-up events:"
+echo "    grep 'SPIN UP\|Strategy B\|upgrade\|TRIGGER' ~/vllm_logs/prov_dyntest_node1.log"
 echo "=================================================================="
 PBSEOF
 
 echo "Submitting dynamic provisioning test..."
-echo "  N_WARMUP  : $N_WARMUP"
-echo "  N_BURST   : $N_BURST"
-echo "  Dataset   : $DATASET"
-echo "  Walltime  : 03:00:00"
-echo "  Log dir   : $LOG_DIR/"
+echo "  N_WARMUP          : $N_WARMUP  (concurrency=$CONCURRENCY_WARMUP)"
+echo "  N_BURST           : $N_BURST  (concurrency=$CONCURRENCY_BURST)"
+echo "  Dataset           : $DATASET"
+echo "  Walltime          : 03:00:00"
+echo "  Log dir           : $LOG_DIR/"
 echo ""
 
 JOBID=$(qsub "$PBSSCRIPT")
