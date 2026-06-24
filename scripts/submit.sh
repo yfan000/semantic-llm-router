@@ -17,11 +17,11 @@
 set -euo pipefail
 
 # ── Job parameters (override via env vars) ────────────────────────────────────
-WALLTIME=${WALLTIME:-08:00:00}
+WALLTIME=${WALLTIME:-10:00:00}
 TTCA_ALPHA=${TTCA_ALPHA:-1.0}
 TTCA_COST_BETA=${TTCA_COST_BETA:-0.0}
 EXPERIMENT_MODE=${EXPERIMENT_MODE:-static}
-N_REQUESTS=${N_REQUESTS:-1000}
+N_REQUESTS=${N_REQUESTS:-3000}
 CONCURRENCY=${CONCURRENCY:-50}
 EVAL_CONCURRENCY=${EVAL_CONCURRENCY:-30}
 PROJECT=${PROJECT:-UIC-HPC}
@@ -75,6 +75,7 @@ echo "  Nodes     : \$(sort -u \$PBS_NODEFILE | tr '\n' ' ')"
 echo "  TTCA_ALPHA    : ${TTCA_ALPHA}"
 echo "  TTCA_COST_BETA: ${TTCA_COST_BETA}"
 echo "  MODE          : ${EXPERIMENT_MODE}"
+echo "  N_REQUESTS    : ${N_REQUESTS}"
 echo "  Log dir       : ${LOG_DIR}/"
 echo "=================================================================="
 
