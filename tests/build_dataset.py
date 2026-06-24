@@ -118,11 +118,7 @@ def load_mmlu_pro(n: int) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 def _swe_fetch_file(repo: str, commit: str, filepath: str) -> str | None:
-    """Fetch one source file from GitHub raw content at a specific commit.
-
-    No auth needed for public repositories (all SWE-bench repos are public).
-    Rate limit: ~4 requests/s (we sleep 0.25s between calls in load_swe_bench).
-    """
+    """Fetch one source file from GitHub raw content at a specific commit."""
     import urllib.request as _ur
     url = f"https://raw.githubusercontent.com/{repo}/{commit}/{filepath}"
     try:
@@ -148,19 +144,8 @@ def load_swe_bench(n: int, cutoff: str = CONTAMINATION_CUTOFF) -> list[dict]:
     """SWE-bench Verified: real GitHub issues with known fixes (princeton-nlp).
 
     Filters to issues created AFTER cutoff (no model has seen them in training).
-
-    For each item, the source files affected by the gold patch are fetched from
-    GitHub and stored as repo_files so eval_all_models.py can:
-      1. Apply the model's patch with patch(1) -p1
-      2. Run the FAIL_TO_PASS tests with pytest
-      3. Return the real pass/fail score
-
-    The prompt asks the model to output a unified diff patch + explanation.
-
-    Complexity mapping:
-      patch changed lines <= 20  -> easy
-      patch changed lines <= 80  -> medium
-      patch changed lines > 80   -> hard
+    Source files are fetched from GitHub for real execution scoring.
+    Prompt asks for a unified diff patch + explanation.
     """
     import time as _time
     import re as _re
@@ -178,7 +163,6 @@ def load_swe_bench(n: int, cutoff: str = CONTAMINATION_CUTOFF) -> list[dict]:
     if ds is None:
         return []
 
-    # First pass: collect all candidates that pass the date filter
     candidates = []
     for row in ds:
         created_at = str(row.get("created_at", "") or row.get("pull_created_at", ""))
@@ -235,7 +219,6 @@ def load_swe_bench(n: int, cutoff: str = CONTAMINATION_CUTOFF) -> list[dict]:
         print(f"  [SWE-bench] no items found after cutoff {cutoff}")
         return []
 
-    # Balance per complexity and select final items
     per_diff: dict[str, list[dict]] = {"easy": [], "medium": [], "hard": []}
     for item in candidates:
         per_diff[item["complexity"]].append(item)
@@ -245,23 +228,21 @@ def load_swe_bench(n: int, cutoff: str = CONTAMINATION_CUTOFF) -> list[dict]:
         want = per_bucket if diff != "hard" else n - 2 * per_bucket
         balanced.extend(random.sample(pool, min(want, len(pool))))
 
-    # Fetch original source files for real execution scoring
     print(f"  [SWE-bench] fetching source files for {len(balanced)} items "
           f"(cutoff={cutoff}, ~{len(balanced) * 3 * 0.25:.0f}s)...")
     fetched = 0
     for item in balanced:
-        affected  = _swe_affected_files(item["gold_patch"])[:5]  # max 5 files
+        affected  = _swe_affected_files(item["gold_patch"])[:5]
         repo_files: dict[str, str] = {}
         for fp in affected:
             content = _swe_fetch_file(item["repo"], item["base_commit"], fp)
             if content:
                 repo_files[fp] = content
-            _time.sleep(0.25)  # stay under GitHub rate limit (~4 req/s)
+            _time.sleep(0.25)
         item["repo_files"] = repo_files
         if repo_files:
             fetched += 1
 
-        # Build the prompt — ask for a diff patch + explanation
         problem_text = item.pop("_problem", "")
         item["query"] = (
             f"Repository: {item['repo']}\n\n"
@@ -387,6 +368,7 @@ def load_humaneval(n: int) -> list[dict]:
 
     Hard limit of 164 problems — supplement with load_mbpp() for larger datasets.
     Short prompts (<=300 chars) -> easy, longer -> medium.
+    The function signature is in the prompt so models name the function correctly.
     """
     from datasets import load_dataset
     try:
@@ -415,8 +397,13 @@ def load_mbpp(n: int) -> list[dict]:
     Used to supplement HumanEval for code:easy since HumanEval only has 164 samples.
     The sanitized version uses consistent function names so tests can be run directly.
     Ground truth = assert statements -> execution-scored via _score_code().
-    Complexity = easy (simple one-function problems).
+
+    IMPORTANT: The expected function name is extracted from the reference code and
+    included in the prompt. Without this, models use generic names (e.g. 'solution')
+    but the tests call the specific name (e.g. 'median'), causing all tests to fail
+    even when the logic is correct — leading to artificially low code:easy accuracy.
     """
+    import re as _re
     from datasets import load_dataset
     for name, cfg, split in [
         ("google-research-datasets/mbpp", "sanitized", "test"),
@@ -442,13 +429,31 @@ def load_mbpp(n: int) -> list[dict]:
         code  = str(row.get("code", ""))
         if not text:
             continue
+
         if isinstance(tests, list):
             ground_truth = "\n".join(tests)
         else:
             ground_truth = str(tests)
         if not ground_truth and "assert" in code:
             ground_truth = "\n".join(l.strip() for l in code.splitlines() if "assert" in l)
-        query = f"Write a Python function to solve the following problem:\n\n{text}"
+
+        # Extract the expected function name from the reference code so the model
+        # names its function correctly. MBPP tests call the function by its exact
+        # name — a mismatch (model writes `calculate_median`, test calls `median`)
+        # causes every test to fail even when the logic is correct.
+        func_name = None
+        for line in code.splitlines():
+            m = _re.match(r"def (\w+)\s*\(", line)
+            if m:
+                func_name = m.group(1)
+                break
+
+        if func_name:
+            query = (f"Write a Python function named `{func_name}` to solve "
+                     f"the following problem:\n\n{text}")
+        else:
+            query = f"Write a Python function to solve the following problem:\n\n{text}"
+
         results.append({
             "domain": "code", "complexity": "easy",
             "query": query, "ground_truth": ground_truth,
