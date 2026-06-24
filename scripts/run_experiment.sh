@@ -431,17 +431,37 @@ python tests/compare_categories.py \
     --output      "$RESULTS_DIR/compare_vs_tier_optimal_ttca.csv" \
     | tee -a "$RESULTS_DIR/compare_vs_tier_optimal_ttca.txt"
 
+# ── Unified all-systems comparison ───────────────────────────────────────────
+echo ""
+echo "=================================================================="
+echo "  Unified all-systems comparison"
+echo "=================================================================="
+
+SYS_ARGS=(
+    "--system" "TTCA+retry:$RESULTS_DIR/router_ttca.csv"
+    "--system" "Cascade/RouteLLM:$RESULTS_DIR/baseline_cascade.csv"
+    "--system" "Round-Robin:$RESULTS_DIR/rr_baseline.csv"
+    "--system" "TTCA-no-retry:$RESULTS_DIR/ttca_no_retry.csv"
+    "--system" "Tier-optimal-acc:$RESULTS_DIR/baseline_tier_optimal_acc.csv"
+    "--system" "Tier-optimal-ttca:$RESULTS_DIR/baseline_tier_optimal_ttca.csv"
+    "--system" "Complexity-tier:$RESULTS_DIR/baseline_tier.csv"
+)
+[ -f "$RESULTS_DIR/baseline_vllm_sr.csv" ] && \
+    SYS_ARGS+=("--system" "vLLM-SR:$RESULTS_DIR/baseline_vllm_sr.csv")
+
+python tests/compare_all.py \
+    "${SYS_ARGS[@]}" \
+    --eval-matrix "$RESULTS_DIR/eval_matrix.csv" \
+    --ref         "TTCA+retry" \
+    --output      "$RESULTS_DIR/compare_all.csv" \
+    | tee "$RESULTS_DIR/compare_all.txt"
+
 # ── Done ──────────────────────────────────────────────────────────────────────
 echo ""
 echo "=================================================================="
 echo "  Experiment complete!  $(date)"
 echo "  Results: $RESULTS_DIR/"
-echo "    eval_matrix.csv"
-echo "    router_ttca.csv            (our system: TTCA+retry)"
-echo "    router_accuracy.csv"
-echo "    rr_baseline.csv"
-echo "    compare_ttca_vs_rr.txt     (TTCA+retry vs round-robin summary)"
-echo "    compare_ttca_vs_accuracy.txt"
+echo "    compare_all.txt / compare_all.csv  ALL systems side-by-side (start here)"
 echo "  — PRIMARY comparisons (TTCA+retry vs full systems) —"
 echo "    compare_ttca_vs_rr.txt              TTCA+retry vs round-robin"
 echo "    compare_ttca_vs_cascade.csv         TTCA+retry vs cascade/RouteLLM"
