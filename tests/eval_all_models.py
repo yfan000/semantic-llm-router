@@ -15,6 +15,7 @@ Scoring strategy by source:
                    Default: subprocess (patch + pytest, fallback=keyword on ImportError)
                    --use-docker: official sweb.eval Docker images (most accurate)
   HumanEval/MBPP : execution-scored via assert statements in ground_truth
+  BigCodeBench   : execution-scored via unittest.TestCase (unittest.main injected)
   MMLU-Pro       : keyword overlap with correct answer text
   GSM8K/MATH     : numeric extraction and comparison
   LogiQA/ARC     : keyword overlap with correct answer text
@@ -123,10 +124,21 @@ def _score_code(response: str, gt: str):
         ast.parse(code)
     except SyntaxError:
         return 0.0
-    if "assert" not in str(gt) and "==" not in str(gt):
+    gt_str = str(gt)
+    if "assert" not in gt_str and "==" not in gt_str:
         return 0.5  # syntax ok but no test to run
+
+    # BigCodeBench tests define a unittest.TestCase class but often omit
+    # unittest.main() at the end. Without it, running the script as a subprocess
+    # exits with code 0 even when all assertions would fail — the test methods
+    # are defined but never called, so the process succeeds vacuously.
+    # Fix: inject unittest.main() when a TestCase class is present but the
+    # call is missing, so tests actually execute and correctly report failures.
+    if "unittest.TestCase" in gt_str and "unittest.main" not in gt_str:
+        gt_str = gt_str + "\nimport unittest; unittest.main(verbosity=0, exit=True)"
+
     with tempfile.NamedTemporaryFile(suffix=".py", mode="w", delete=False) as f:
-        f.write(code + "\n" + str(gt))
+        f.write(code + "\n" + gt_str)
         fname = f.name
     try:
         r = subprocess.run([sys.executable, fname], timeout=5, capture_output=True)
@@ -316,23 +328,7 @@ def _score_swe_bench_exec(response: str, item: dict) -> float:
 
 
 def _score_swe_bench_docker(response: str, item: dict) -> float:
-    """Docker-based SWE-bench scoring using official sweb.eval images.
-
-    Each SWE-bench instance has a pre-built Docker image with the full repo
-    and all dependencies installed:
-      sweb.eval.x86_64.<instance_id>:latest
-
-    Pre-pull the needed images (one-time setup):
-      python -c "
-      import json, subprocess
-      items = [x for x in json.load(open('datasets/hf_3000.json'))
-               if x.get('source') == 'swe_bench' and x.get('instance_id')]
-      for iid in {x['instance_id'] for x in items}:
-          subprocess.run(['docker', 'pull', f'sweb.eval.x86_64.{iid}'])
-      "
-
-    Falls back to _score_swe_bench_exec() if image is not available locally.
-    """
+    """Docker-based SWE-bench scoring using official sweb.eval images."""
     instance_id  = item.get("instance_id", "")
     fail_to_pass = item.get("fail_to_pass", []) or []
     ground_truth = item.get("ground_truth", "")
@@ -365,7 +361,6 @@ def _score_swe_bench_docker(response: str, item: dict) -> float:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
         out = r.stdout + r.stderr
 
-        # Image not pulled → fall back to subprocess
         if any(msg in out for msg in
                ("No such image", "pull access denied", "Unable to find image")):
             return _score_swe_bench_exec(response, item)
