@@ -135,7 +135,7 @@ for m in json.load(sys.stdin).get('data', []):
     try:
         urllib.request.urlopen(
             urllib.request.Request(
-                'http://${NODE1}:8080/router/' + m['id'],
+                'http://\${NODE1}:8080/router/' + m['id'],
                 method='DELETE'), timeout=5)
     except: pass
 " 2>/dev/null || true
