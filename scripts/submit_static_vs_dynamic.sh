@@ -19,12 +19,23 @@
 #
 # Usage:
 #   bash scripts/submit_static_vs_dynamic.sh
-#   N_REQUESTS=500 bash scripts/submit_static_vs_dynamic.sh
+#   N_REQUESTS=500 RATE=10 bash scripts/submit_static_vs_dynamic.sh
+#
+# Parameters:
+#   N_REQUESTS   total requests per mode (default 300)
+#   CONCURRENCY  max simultaneous in-flight requests (default 50)
+#   RATE         arrival rate in req/s, open-loop (default: empty = closed-loop)
+#                Example: RATE=10 sends exactly 10 req/s regardless of model speed
+#                Leave empty for closed-loop (saturated queue, triggers provisioner faster)
+#   SEED         random seed for workload sampling (default 42, reproducible)
 
 set -euo pipefail
 
 N_REQUESTS=${N_REQUESTS:-300}
 CONCURRENCY=${CONCURRENCY:-50}
+RATE=${RATE:-""}          # empty = closed-loop; set e.g. RATE=10 for 10 req/s
+RATE_FLAG=""
+[ -n "$RATE" ] && RATE_FLAG="--rate ${RATE}"
 PROJECT=${PROJECT:-UIC-HPC}
 QUEUE=${QUEUE:-by-node}
 DATASET=${DATASET:-"datasets/hf_3000.json"}
@@ -64,10 +75,13 @@ ROUTER_URL="http://\${NODE1}:8080"
 RESULTS_DIR="results/static_vs_dynamic_${TS}"
 mkdir -p "\$RESULTS_DIR"
 
+RATE_STR="${RATE:-closed-loop}"
 echo "=================================================================="
 echo "  Static vs Dynamic Mode Comparison   \$(date)"
 echo "  NODE1 : \$NODE1   NODE2 : \$NODE2"
-echo "  N_REQUESTS  : ${N_REQUESTS}  (concurrency=${CONCURRENCY})"
+echo "  N_REQUESTS  : ${N_REQUESTS}"
+echo "  CONCURRENCY : ${CONCURRENCY}  (max in-flight)"
+echo "  RATE        : \${RATE_STR} req/s"
 echo "  Dataset     : ${DATASET}  (seed=${SEED})"
 echo "  Metrics     : accuracy, latency, energy/req, cost/req"
 echo "=================================================================="
@@ -161,13 +175,18 @@ echo "Waiting for all 6 models..."
 wait_models 6
 
 echo ""
-echo "Running workload — STATIC (${N_REQUESTS} requests)..."
+echo "[S4] Running workload — STATIC (${N_REQUESTS} requests, rate=${RATE:-closed-loop})..."
 STATIC_START=\$(date +%s)
 python tests/load_test.py \
-    --dataset /tmp/svd_workload.json --router "\$ROUTER_URL" \
-    --mode ttca --requests ${N_REQUESTS} --concurrency ${CONCURRENCY} \
-    --output "\$RESULTS_DIR/static_results.csv"
-STATIC_WALL=\$(($(date +%s) - STATIC_START))
+    --dataset     /tmp/svd_workload.json \
+    --router      "\$ROUTER_URL" \
+    --mode        ttca \
+    --requests    ${N_REQUESTS} \
+    --concurrency ${CONCURRENCY} \
+    ${RATE_FLAG} \
+    --output      "\$RESULTS_DIR/static_results.csv"
+STATIC_END=\$(date +%s)
+STATIC_WALL=\$((STATIC_END - STATIC_START))
 echo "  Static wall time: \${STATIC_WALL}s"
 
 echo "Tearing down static mode..."
@@ -206,13 +225,18 @@ echo "Waiting for seed models (3)..."
 wait_models 3
 
 echo ""
-echo "Running workload — DYNAMIC (${N_REQUESTS} requests, models spin up as needed)..."
+echo "[D4] Running workload — DYNAMIC (${N_REQUESTS} requests, rate=${RATE:-closed-loop})..."
 DYNAMIC_START=\$(date +%s)
 python tests/load_test.py \
-    --dataset /tmp/svd_workload.json --router "\$ROUTER_URL" \
-    --mode ttca --requests ${N_REQUESTS} --concurrency ${CONCURRENCY} \
-    --output "\$RESULTS_DIR/dynamic_results.csv"
-DYNAMIC_WALL=\$(($(date +%s) - DYNAMIC_START))
+    --dataset     /tmp/svd_workload.json \
+    --router      "\$ROUTER_URL" \
+    --mode        ttca \
+    --requests    ${N_REQUESTS} \
+    --concurrency ${CONCURRENCY} \
+    ${RATE_FLAG} \
+    --output      "\$RESULTS_DIR/dynamic_results.csv"
+DYNAMIC_END=\$(date +%s)
+DYNAMIC_WALL=\$((DYNAMIC_END - DYNAMIC_START))
 echo "  Dynamic wall time: \${DYNAMIC_WALL}s"
 
 DYNAMIC_SPINUPS=\$(grep "SPIN UP" ~/vllm_logs/prov_svd_dynamic_node1.log 2>/dev/null \
@@ -294,7 +318,9 @@ echo "=================================================================="
 PBSEOF
 
 echo "Submitting static vs dynamic comparison..."
-echo "  N_REQUESTS  : $N_REQUESTS  (concurrency=$CONCURRENCY)"
+echo "  N_REQUESTS  : $N_REQUESTS"
+echo "  CONCURRENCY : $CONCURRENCY"
+echo "  RATE        : ${RATE:-closed-loop} req/s"
 echo "  Dataset     : $DATASET  (seed=$SEED)"
 echo "  Walltime    : 05:00:00"
 echo "  Log dir     : $LOG_DIR/"
