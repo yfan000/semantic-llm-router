@@ -12,13 +12,16 @@
 #
 # Key assertions:
 #   [PASS] Seed models start (qwen-7b, deepseek-r1-7b, llama4-scout)
-#   [PASS] qwen3-coder-30b or deepseek-r1-14b spins up during code/math burst
+#   [PASS] At least 1 non-seed model was spun up (checked via log, not live count)
 #   [PASS] No *-replica models appear in /v1/models
-#   [PASS] Model count grows after bursts
+#   [PASS] A cold model (qwen3-coder-30b / deepseek-r1-14b) appeared
+#
+# Note on assertion design: intermediate models can be spun UP then DOWN (idle timeout)
+# before assertions run, so the live model count (MODELS_FINAL) may equal MODELS_AFTER_WARMUP
+# even when upgrades worked correctly. The log-based SPINUP_COUNT is the true indicator.
 #
 # Why high concurrency for bursts:
 #   Provisioner triggers on: num_requests_running > 20 OR kv_cache > 70%.
-#   A100 with continuous batching handles concurrency=30 without queuing.
 #   At concurrency=80, deepseek-r1-7b (1 GPU) saturates on hard requests,
 #   pushing num_requests_running above RUNNING_THRESHOLD=20 -> provisioner fires.
 #
@@ -181,7 +184,7 @@ MODELS_AFTER_WARMUP=\$(curl --noproxy '*' -sf "\$ROUTER_URL/v1/models" \
 # ── Step 5: Phase 2 — Code burst (high concurrency -> triggers spin-up) ──────
 echo ""
 echo "[5] Phase 2: Code burst (${N_BURST} code:hard/medium, concurrency=${CONCURRENCY_BURST})..."
-echo "  High concurrency saturates deepseek-r1-7b -> provisioner triggers qwen3-coder-30b."
+echo "  High concurrency saturates deepseek-r1-7b -> provisioner triggers upgrade."
 
 python3 -c "
 import json, random
@@ -204,15 +207,13 @@ python tests/load_test.py \
 echo ""
 echo "--- Models immediately after code burst ---"
 list_models
-
-# Wait for provisioner poll (interval=30s) + model startup (~10 min)
 echo "  Waiting 90s for provisioner to detect overload and trigger spin-up..."
 sleep 90
 echo ""
 echo "--- Models after provisioner poll ---"
 list_models
 
-# ── Step 6: Phase 3 — Math burst (high concurrency -> triggers deepseek-r1-14b) ─
+# ── Step 6: Phase 3 — Math burst ─────────────────────────────────────────────
 echo ""
 echo "[6] Phase 3: Math burst (${N_BURST} math:hard, concurrency=${CONCURRENCY_BURST})..."
 
@@ -247,6 +248,13 @@ MODELS_FINAL=\$(curl --noproxy '*' -sf "\$ROUTER_URL/v1/models" \
     | python3 -c "import sys,json; print(len(json.load(sys.stdin).get('data',[])))" 2>/dev/null || echo 0)
 list_models
 
+# Count distinct non-seed model IDs that appeared in SPIN UP log lines.
+# This includes models that were later spun down due to idle timeout — the
+# true indicator of whether dynamic upgrades worked.
+SPINUP_COUNT=\$(grep "SPIN UP" ~/vllm_logs/prov_dyntest_node1.log 2>/dev/null \
+    | grep -v "reason=initial" | awk '{print \$3}' | sort -u | wc -l | tr -d ' ')
+echo "  Distinct non-seed models spun up during test: \$SPINUP_COUNT"
+
 # ── Step 8: Compare accuracy across phases ────────────────────────────────────
 echo ""
 echo "[8] Accuracy comparison across phases..."
@@ -280,9 +288,11 @@ assert_fail() { echo "  [FAIL] \$1"; FAIL=\$((FAIL + 1)); }
     assert_pass "Seed models started (\$MODELS_AFTER_WARMUP registered after warmup)" || \
     assert_fail "Seed models failed to start (\$MODELS_AFTER_WARMUP registered)"
 
-[ "\$MODELS_FINAL" -gt "\$MODELS_AFTER_WARMUP" ] && \
-    assert_pass "Models spun up dynamically (\$MODELS_AFTER_WARMUP -> \$MODELS_FINAL)" || \
-    assert_fail "No new models spun up (\$MODELS_AFTER_WARMUP -> \$MODELS_FINAL) — check provisioner logs"
+# Use log-based count: intermediate models may be spun down before assertions run,
+# making MODELS_FINAL == MODELS_AFTER_WARMUP even when upgrades worked correctly.
+[ "\$SPINUP_COUNT" -ge 1 ] && \
+    assert_pass "Models spun up dynamically (\$SPINUP_COUNT non-seed model(s) via upgrade)" || \
+    assert_fail "No non-seed models were spun up — check provisioner logs"
 
 REPLICAS=\$(curl --noproxy '*' -sf "\$ROUTER_URL/v1/models" \
     | python3 -c "
@@ -304,9 +314,23 @@ print(len(found), ' '.join(sorted(found)))
 " 2>/dev/null || echo "0")
 N_COLD=\$(echo \$COLD_MODELS_RUNNING | awk '{print \$1}')
 NAMES_COLD=\$(echo \$COLD_MODELS_RUNNING | cut -d' ' -f2-)
+# Also check log — cold model may have been spun down already
+LOG_COLD=\$(grep "SPIN UP.*qwen3-coder-30b\|SPIN UP.*deepseek-r1-14b\|SPIN UP.*gemma-3-27b" \
+    ~/vllm_logs/prov_dyntest_node1.log 2>/dev/null | wc -l | tr -d ' ')
 [ "\$N_COLD" -ge 1 ] && \
-    assert_pass "Cold model(s) spun up: \$NAMES_COLD" || \
-    assert_fail "No cold models spun up (qwen3-coder-30b / deepseek-r1-14b / gemma-3-27b) — load may need to be higher"
+    assert_pass "Cold model(s) currently running: \$NAMES_COLD" || \
+    { [ "\$LOG_COLD" -ge 1 ] && \
+      assert_pass "Cold model(s) spun up (then idle-down): confirmed in log (\$LOG_COLD SPIN UP events)" || \
+      assert_fail "No cold models spun up (qwen3-coder-30b / deepseek-r1-14b / gemma-3-27b)"; }
+
+# Informational: quality-upgrade ceiling warnings
+CEILING_COUNT=\$(grep "Case 3 ceiling" ~/vllm_logs/prov_dyntest_node1.log 2>/dev/null | wc -l | tr -d ' ')
+if [ "\$CEILING_COUNT" -gt 0 ]; then
+    echo "  [INFO] 'Ceiling reached' logged \$CEILING_COUNT time(s) — quality-upgrade trigger"
+    echo "         could not find a better model via priors. Upgrades still happened via"
+    echo "         overload trigger (UPGRADE_PATH). Fix: run submit.sh once to generate"
+    echo "         priors for all 6 models, then use that priors file for dynamic tests."
+fi
 
 echo ""
 echo "  PASS: \$PASS   FAIL: \$FAIL"
