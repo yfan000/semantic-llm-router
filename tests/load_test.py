@@ -3,6 +3,7 @@
 Usage:
     python tests/load_test.py --router http://localhost:8000 --requests 1000
     python tests/load_test.py --mode ttca --no-retry  # single-shot baseline comparison
+    python tests/load_test.py --rate 10               # open-loop 10 req/s arrival rate
 """
 from __future__ import annotations
 import argparse
@@ -276,7 +277,16 @@ def analyse(rows: list[dict]) -> None:
 
 
 async def run(router_url: str, n_requests: int, concurrency: int, output: str,
-              dataset_path: str | None = None) -> None:
+              dataset_path: str | None = None,
+              rate: float | None = None) -> None:
+    """Run the load test.
+
+    Args:
+        rate: Optional target arrival rate in requests/second (open-loop).
+              None = closed-loop (fire as fast as concurrency allows).
+              When set, requests are dispatched at approximately this rate;
+              concurrency still caps simultaneous in-flight requests.
+    """
     requests_list = build_request_list(n_requests, dataset_path)
     os.makedirs(os.path.dirname(output) if os.path.dirname(output) else ".", exist_ok=True)
 
@@ -294,10 +304,13 @@ async def run(router_url: str, n_requests: int, concurrency: int, output: str,
     done = 0
     t0 = time.monotonic()
 
-    print(f"\n  Sending {n_requests} requests to {router_url} (concurrency={concurrency})")
+    rate_str = f"{rate:.1f} req/s (open-loop)" if rate else f"closed-loop (concurrency={concurrency})"
+    print(f"\n  Sending {n_requests} requests to {router_url}")
+    print(f"  Rate       : {rate_str}")
+    print(f"  Concurrency: {concurrency}  (max simultaneous in-flight)")
     if _NO_RETRY:
         print("  [No-Retry] cascade retry disabled -- single-shot mode")
-    print(f"  Output: {output}\n")
+    print(f"  Output     : {output}\n")
 
     async def bounded(req_id: int, item: dict, writer, f) -> None:
         nonlocal done
@@ -310,19 +323,39 @@ async def run(router_url: str, n_requests: int, concurrency: int, output: str,
             done += 1
             if done % max(n_requests // 20, 1) == 0:
                 elapsed = time.monotonic() - t0
+                actual_rate = done / elapsed
                 bar = "=" * int(done / n_requests * 40)
-                print(f"\r  [{bar:<40}] {done}/{n_requests}  {done/elapsed:.1f} req/s", end="", flush=True)
+                print(f"\r  [{bar:<40}] {done}/{n_requests}  {actual_rate:.1f} req/s", end="", flush=True)
 
     with open(output, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
-        await asyncio.gather(*[
-            bounded(i, requests_list[i], writer, f)
-            for i in range(n_requests)
-        ])
+
+        if rate is None:
+            # Closed-loop: dispatch all tasks immediately, semaphore limits concurrency
+            await asyncio.gather(*[
+                bounded(i, requests_list[i], writer, f)
+                for i in range(n_requests)
+            ])
+        else:
+            # Open-loop: dispatch at target rate, semaphore caps in-flight concurrency.
+            # Request i fires at t0 + i/rate seconds. If the semaphore is saturated
+            # (system overloaded), the request queues until a slot opens — this models
+            # real queue build-up rather than silently dropping requests.
+            interval = 1.0 / rate
+            tasks = []
+            for i in range(n_requests):
+                target_time = t0 + i * interval
+                delay = target_time - time.monotonic()
+                if delay > 0:
+                    await asyncio.sleep(delay)
+                task = asyncio.create_task(bounded(i, requests_list[i], writer, f))
+                tasks.append(task)
+            await asyncio.gather(*tasks)
 
     elapsed = time.monotonic() - t0
-    print(f"\r  [{'='*40}] {n_requests}/{n_requests}  ({elapsed:.1f}s total, {n_requests/elapsed:.1f} req/s)\n")
+    actual_rate = n_requests / elapsed
+    print(f"\r  [{'='*40}] {n_requests}/{n_requests}  ({elapsed:.1f}s total, {actual_rate:.1f} req/s)\n")
 
     analyse(results)
     print(f"  Full results saved to: {output}")
@@ -333,14 +366,22 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Load test the semantic LLM router")
     parser.add_argument("--router",      default="http://localhost:8000")
     parser.add_argument("--requests",    type=int, default=1000)
-    parser.add_argument("--concurrency", type=int, default=10)
+    parser.add_argument("--concurrency", type=int, default=10,
+                        help="Max simultaneous in-flight requests (default 10)")
     parser.add_argument("--output",      default="")
-    parser.add_argument("--dataset",     default=None)
+    parser.add_argument("--dataset",     default=None,
+                        help="Path to JSON dataset from build_dataset.py")
     parser.add_argument("--mode",        default=None,
-                        choices=["accuracy", "cost", "eco", "custom", "ttca"])
+                        choices=["accuracy", "cost", "eco", "custom", "ttca"],
+                        help="Force ALL requests to use this router mode (default: mixed)")
     parser.add_argument("--no-retry",    action="store_true",
-                        help="Disable cascade retry -- accept first model's answer. "
-                             "Use for single-shot baseline comparison.")
+                        help="Disable cascade retry — accept first model's answer "
+                             "regardless of correctness. Use for single-shot baseline comparison.")
+    parser.add_argument("--rate",        type=float, default=None,
+                        help="Target arrival rate in requests/second (open-loop). "
+                             "Default: None = closed-loop (fire as fast as concurrency allows). "
+                             "Example: --rate 10 dispatches one request every 0.1s. "
+                             "Concurrency still caps simultaneous in-flight requests.")
     args = parser.parse_args()
 
     if args.mode:
@@ -356,7 +397,8 @@ def main() -> None:
         args.output = f"results/load_test{suffix}_{ts}.csv"
 
     asyncio.run(run(args.router, args.requests, args.concurrency, args.output,
-                    getattr(args, "dataset", None)))
+                    getattr(args, "dataset", None),
+                    rate=args.rate))
 
 
 if __name__ == "__main__":
