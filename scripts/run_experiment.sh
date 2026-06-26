@@ -28,6 +28,12 @@ EVAL_CONCURRENCY=${EVAL_CONCURRENCY:-30}
 # TTCA_COST_BETA: 0.0 = cost excluded (default)  |  1.0 = cost penalized equally to latency
 TTCA_ALPHA=${TTCA_ALPHA:-1.0}
 TTCA_COST_BETA=${TTCA_COST_BETA:-0.0}
+# Per-domain latency exponents (override TTCA_ALPHA for specific domains).
+# Lower = accuracy-focused, higher = speed-focused. Default: factual=0.3, code=1.0.
+TTCA_ALPHA_FACTUAL=${TTCA_ALPHA_FACTUAL:-0.3}
+TTCA_ALPHA_MATH=${TTCA_ALPHA_MATH:-0.7}
+TTCA_ALPHA_CODE=${TTCA_ALPHA_CODE:-1.0}
+TTCA_ALPHA_REASONING=${TTCA_ALPHA_REASONING:-0.7}
 # Provisioner mode:
 #   static  — all models pre-loaded at startup, no auto-scaling (default, reproducible)
 #   dynamic — start with 2 fast models; provisioner scales up based on router demand
@@ -58,14 +64,19 @@ echo "  NODE1 : $NODE1  (qwen-7b / deepseek-r1-7b / qwen3-coder-30b / gemma-3-27
 echo "  NODE2 : $NODE2  (llama4-scout, 8 GPUs)"
 echo "  Router: $ROUTER_URL"
 echo "  TTCA_ALPHA: $TTCA_ALPHA  TTCA_COST_BETA: $TTCA_COST_BETA  (score = acc / lat^a x cost^b)"
+echo "  Domain alpha: factual=$TTCA_ALPHA_FACTUAL math=$TTCA_ALPHA_MATH code=$TTCA_ALPHA_CODE reasoning=$TTCA_ALPHA_REASONING"
 echo "  MODE      : $EXPERIMENT_MODE  (static=all-preloaded | dynamic=cold-spinup)"
 echo "  Output    : $RESULTS_DIR"
 echo "=================================================================="
 
-# Patch TTCA_ALPHA and TTCA_COST_BETA into config.py so the router uses the requested values.
-echo "  Setting TTCA_ALPHA=$TTCA_ALPHA TTCA_COST_BETA=$TTCA_COST_BETA in semantic_router/config.py..."
+# Patch TTCA params into config.py so the router uses the requested values.
+echo "  Patching semantic_router/config.py..."
 sed -i "s/^TTCA_ALPHA: float = .*/TTCA_ALPHA: float = ${TTCA_ALPHA}/" semantic_router/config.py
 sed -i "s/^TTCA_COST_BETA: float = .*/TTCA_COST_BETA: float = ${TTCA_COST_BETA}/" semantic_router/config.py
+sed -i "s/^TTCA_ALPHA_FACTUAL: float = .*/TTCA_ALPHA_FACTUAL: float = ${TTCA_ALPHA_FACTUAL}/" semantic_router/config.py
+sed -i "s/^TTCA_ALPHA_MATH: float = .*/TTCA_ALPHA_MATH: float = ${TTCA_ALPHA_MATH}/" semantic_router/config.py
+sed -i "s/^TTCA_ALPHA_CODE: float = .*/TTCA_ALPHA_CODE: float = ${TTCA_ALPHA_CODE}/" semantic_router/config.py
+sed -i "s/^TTCA_ALPHA_REASONING: float = .*/TTCA_ALPHA_REASONING: float = ${TTCA_ALPHA_REASONING}/" semantic_router/config.py
 grep "TTCA_" semantic_router/config.py
 
 # ── Helper: wait for router ───────────────────────────────────────────────────
@@ -296,7 +307,6 @@ echo "=================================================================="
 echo "  Running baselines"
 echo "=================================================================="
 
-# TTCA no-retry (diagnostic: isolates retry benefit)
 echo ""
 echo "[Baseline 1/5] TTCA no-retry — diagnostic (${N_REQUESTS} requests)..."
 python tests/load_test.py \
@@ -308,7 +318,6 @@ python tests/load_test.py \
     --concurrency "$CONCURRENCY" \
     --output      "$RESULTS_DIR/ttca_no_retry.csv"
 
-# Cascade / RouteLLM-style
 echo ""
 echo "[Baseline 2/5] Cascade routing / RouteLLM-style (${N_REQUESTS} requests)..."
 python tests/baseline_cascade.py \
@@ -318,7 +327,6 @@ python tests/baseline_cascade.py \
     --concurrency "$CONCURRENCY" \
     --output      "$RESULTS_DIR/baseline_cascade.csv"
 
-# Complexity-tier (hand-built)
 echo ""
 echo "[Baseline 3/5] Complexity-tier routing — hand-built (${N_REQUESTS} requests)..."
 python tests/baseline_complexity_tier.py \
@@ -327,7 +335,6 @@ python tests/baseline_complexity_tier.py \
     --node2-host  "$NODE2" \
     --output      "$RESULTS_DIR/baseline_tier.csv"
 
-# Accuracy-optimal tier (data-driven upper bound)
 echo ""
 echo "[Baseline 4/5] Accuracy-optimal tier — data-driven (${N_REQUESTS} requests)..."
 python tests/baseline_complexity_tier.py \
@@ -338,7 +345,6 @@ python tests/baseline_complexity_tier.py \
     --tier-variant accuracy_optimal \
     --output       "$RESULTS_DIR/baseline_tier_optimal_acc.csv"
 
-# TTCA-optimal tier (data-driven upper bound on TTCA objective)
 echo ""
 echo "[Baseline 5/5] TTCA-optimal tier — data-driven (${N_REQUESTS} requests)..."
 python tests/baseline_complexity_tier.py \
@@ -349,7 +355,6 @@ python tests/baseline_complexity_tier.py \
     --tier-variant ttca_optimal \
     --output       "$RESULTS_DIR/baseline_tier_optimal_ttca.csv"
 
-# vLLM Semantic Router (optional)
 echo ""
 echo "[Optional] vLLM Semantic Router (checking port 8888)..."
 if curl --noproxy '*' -sf "http://${NODE1}:8888/health" > /dev/null 2>&1 || \
@@ -361,7 +366,6 @@ if curl --noproxy '*' -sf "http://${NODE1}:8888/health" > /dev/null 2>&1 || \
         --output      "$RESULTS_DIR/baseline_vllm_sr.csv"
 else
     echo "  vllm-sr not running on port 8888 — skipping."
-    echo "  To run it: pip install vllm-sr && vllm-sr serve --config configs/vllm_sr_config.yaml"
 fi
 
 # ── PRIMARY comparison reports (TTCA+retry vs full systems) ───────────────────
