@@ -3,7 +3,20 @@ import logging
 from fastapi import HTTPException
 from semantic_router.schemas import BidResponse, UserPreference, RouterMode
 from semantic_router.reputation_tracker import ReputationTracker
-from semantic_router.config import TTCA_ALPHA, TTCA_COST_BETA
+from semantic_router.config import (
+    TTCA_ALPHA, TTCA_COST_BETA,
+    TTCA_ALPHA_FACTUAL, TTCA_ALPHA_MATH,
+    TTCA_ALPHA_CODE, TTCA_ALPHA_REASONING,
+)
+
+# Domain-specific latency exponents for TTCA scoring.
+# Built at import time from config constants so they pick up sed-patched values.
+_DOMAIN_ALPHA: dict[str, float] = {
+    "factual":   TTCA_ALPHA_FACTUAL,
+    "math":      TTCA_ALPHA_MATH,
+    "code":      TTCA_ALPHA_CODE,
+    "reasoning": TTCA_ALPHA_REASONING,
+}
 
 log = logging.getLogger(__name__)
 
@@ -80,6 +93,7 @@ def rank_bids(
     """Return all bids sorted best-first by weighted score.
 
     TTCA mode: score = acc / (lat^alpha x cost^beta)  -- higher is better.
+    Uses domain-specific alpha: factual=0.3 (accuracy), code=1.0 (classic TTCA).
     beta=0 (default) reduces to classic TTCA acc/lat^alpha.
     """
     if not bids:
@@ -97,6 +111,10 @@ def rank_bids(
         candidates = sorted(bids, key=lambda b: b.estimated_latency_ms)
 
     if pref.mode == RouterMode.TTCA:
+        # Use domain-specific alpha if configured; fall back to global TTCA_ALPHA.
+        # Lower alpha = accuracy-focused (factual:0.3), higher = speed-focused (code:1.0).
+        alpha = _DOMAIN_ALPHA.get(domain, TTCA_ALPHA)
+
         def ttca_score(bid: BidResponse) -> float:
             acc = max(bid.estimated_accuracy, 0.01)
             per_cat = reputation.get_avg_latency_ms_per_cat(bid.model_id, domain, complexity)
@@ -104,11 +122,12 @@ def rank_bids(
             lat = per_cat if per_cat is not None else (
                 global_ if global_ is not None else bid.estimated_latency_ms
             )
-            lat = max(lat, 1.0)
+            lat = max(lat, 1.0)   # guard against zero/negative
             cost = max(bid.estimated_cost_usd, 1e-9)
-            return acc / ((lat ** TTCA_ALPHA) * (cost ** TTCA_COST_BETA))
+            # Domain-specific alpha: factual=0.3 (accuracy), code=1.0 (classic TTCA)
+            return acc / ((lat ** alpha) * (cost ** TTCA_COST_BETA))
 
-        ranked = sorted(candidates, key=ttca_score, reverse=True)
+        ranked = sorted(candidates, key=ttca_score, reverse=True)   # highest score first
         for bid in ranked:
             per_cat = reputation.get_avg_latency_ms_per_cat(bid.model_id, domain, complexity)
             global_  = reputation.get_avg_latency_ms(bid.model_id)
@@ -120,12 +139,12 @@ def rank_bids(
                 "global" if global_ is not None else "estimated"
             )
             cost = max(bid.estimated_cost_usd, 1e-9)
-            score = bid.estimated_accuracy / ((lat ** TTCA_ALPHA) * (cost ** TTCA_COST_BETA))
+            score = bid.estimated_accuracy / ((lat ** alpha) * (cost ** TTCA_COST_BETA))
             log.info(
-                "  TTCA %-22s lat=%dms(%s) acc=%.3f cost=%.6f alpha=%.1f beta=%.1f score=%.4f",
+                "  TTCA %-22s lat=%dms(%s) acc=%.3f cost=%.6f alpha=%.1f(domain=%s) beta=%.1f score=%.4f",
                 bid.model_id, lat, src,
                 bid.estimated_accuracy, bid.estimated_cost_usd,
-                TTCA_ALPHA, TTCA_COST_BETA, score,
+                alpha, domain, TTCA_COST_BETA, score,
             )
         return ranked
 
