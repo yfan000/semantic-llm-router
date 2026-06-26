@@ -424,6 +424,12 @@ python tests/compare_categories.py \
 
 echo ""
 echo "=== TTCA (with retry) vs Cascade/RouteLLM ===" | tee "$RESULTS_DIR/compare_ttca_vs_cascade.txt"
+python tests/compare_ttca.py \
+    --router      "$RESULTS_DIR/router_ttca.csv" \
+    --baseline    "$RESULTS_DIR/baseline_cascade.csv" \
+    --eval-matrix "$RESULTS_DIR/eval_matrix.csv" \
+    | tee -a "$RESULTS_DIR/compare_ttca_vs_cascade.txt"
+echo ""
 python tests/compare_categories.py \
     --router      "$RESULTS_DIR/router_ttca.csv" \
     --baseline    "$RESULTS_DIR/baseline_cascade.csv" \
