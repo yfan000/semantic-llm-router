@@ -151,6 +151,18 @@ MODEL_CATALOG: dict[str, ModelSpec] = {
         expected_tokens_per_sec=900.0,    # 14B with reasoning, 28GB weights → fast on 2×40GB
         max_model_len=8192,
     ),
+    # ── For upgrade experiment only: old coder model (dense 32B) ────────────────
+    # Used in submit_upgrade_test.sh to demonstrate zero-downtime model upgrade.
+    # Shows TTCA routing migrating from coder-32b → qwen3-coder-30b automatically.
+    "coder-32b": ModelSpec(
+        model_id="coder-32b", model_name="Qwen/Qwen2.5-Coder-32B-Instruct",
+        gpus_needed=4, port=8006,
+        domains=["code", "math"], accuracy_tier=3,
+        min_accuracy_capability={"code": 0.91, "math": 0.88},
+        efficiency_tokens_per_joule=3.5,
+        expected_tokens_per_sec=600.0,  # dense 32B, slower than MoE qwen3-coder-30b
+        max_model_len=8192,
+    ),
     # ── Node 2 (8 GPUs) ──────────────────────────────────────────────────────
     "llama4-scout": ModelSpec(
         model_id="llama4-scout", model_name="meta-llama/Llama-4-Scout-17B-16E-Instruct",
