@@ -356,14 +356,65 @@ summarize('\$RESULTS_DIR/static_results.csv',  'Static ')
 summarize('\$RESULTS_DIR/dynamic_results.csv', 'Dynamic')
 "
 
+# ── GPU energy comparison (idle + serving, from provisioner logs) ──────────────
+echo ""
+echo "=================================================================="
+echo "  GPU ENERGY COMPARISON (includes idle GPU power)"
+echo "  Static:  all GPUs always on → idle models still burn power"
+echo "  Dynamic: GPUs power down when not needed"
+echo "=================================================================="
+python3 tests/compute_gpu_energy.py \
+    --log   ~/vllm_logs/prov_svd_static_node1.log \
+    --wall  \$STATIC_WALL \
+    --label "Static (node1)" \
+    | tee -a "\$RESULTS_DIR/gpu_energy_comparison.txt"
+python3 tests/compute_gpu_energy.py \
+    --log   ~/vllm_logs/prov_svd_dynamic_node1.log \
+    --wall  \$DYNAMIC_WALL \
+    --label "Dynamic (node1)" \
+    | tee -a "\$RESULTS_DIR/gpu_energy_comparison.txt"
+echo "  Note: node2 (llama4-scout, 8 GPUs) runs same duration in both modes."
+echo "  The difference is entirely on node1 (model provisioning decisions)."
+
+# ── TTCA comparison: Dynamic vs Cascade baseline ───────────────────────────────
+echo ""
+echo "=================================================================="
+echo "  TTCA: Dynamic mode vs Cascade/RouteLLM baseline"
+echo "  (Fair apple-to-apple: both start with limited models)"
+echo "=================================================================="
+python tests/baseline_cascade.py \
+    --dataset     /tmp/svd_workload.json \
+    --priors      "${PRIORS}" \
+    --threshold   0.80 \
+    --concurrency ${CONCURRENCY} \
+    --output      "\$RESULTS_DIR/dynamic_baseline_cascade.csv"
+
+echo ""
+echo "=== Dynamic mode vs Cascade/RouteLLM ===" | tee "\$RESULTS_DIR/compare_dynamic_vs_cascade.txt"
+python tests/compare_ttca.py \
+    --router      "\$RESULTS_DIR/dynamic_results.csv" \
+    --baseline    "\$RESULTS_DIR/dynamic_baseline_cascade.csv" \
+    --eval-matrix "\$RESULTS_DIR/eval_matrix.csv" \
+    | tee -a "\$RESULTS_DIR/compare_dynamic_vs_cascade.txt"
+echo ""
+python tests/compare_categories.py \
+    --router      "\$RESULTS_DIR/dynamic_results.csv" \
+    --baseline    "\$RESULTS_DIR/dynamic_baseline_cascade.csv" \
+    --eval-matrix "\$RESULTS_DIR/eval_matrix.csv" \
+    --output      "\$RESULTS_DIR/compare_dynamic_vs_cascade.csv" \
+    | tee -a "\$RESULTS_DIR/compare_dynamic_vs_cascade.txt"
+
 # ── Done ───────────────────────────────────────────────────────────────────────
 echo "=================================================================="
 echo "  Comparison complete!  \$(date)"
 echo "  Results: \$RESULTS_DIR/"
-echo "    static_results.csv         Static mode load test"
-echo "    dynamic_results.csv        Dynamic mode load test"
-echo "    static_vs_dynamic.csv      Side-by-side comparison (all metrics)"
-echo "    static_vs_dynamic.txt      Human-readable comparison"
+echo "    static_results.csv              Static mode load test"
+echo "    dynamic_results.csv             Dynamic mode load test"
+echo "    static_vs_dynamic.csv           Side-by-side accuracy/latency/energy"
+echo "    static_vs_dynamic.txt           Human-readable comparison"
+echo "    gpu_energy_comparison.txt        GPU-hours including idle (key energy metric)"
+echo "    dynamic_baseline_cascade.csv    Cascade baseline on same dynamic workload"
+echo "    compare_dynamic_vs_cascade.txt  Dynamic vs Cascade TTCA comparison"
 echo ""
 echo "  Key insight: Static has zero cold-start latency but wastes GPU energy"
 echo "  on idle models. Dynamic saves energy but pays a penalty for first"
