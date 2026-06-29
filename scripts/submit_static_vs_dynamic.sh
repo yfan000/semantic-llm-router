@@ -160,6 +160,7 @@ sleep 8; wait_router; echo "  Router ready."
 
 echo ""
 echo "[S2] Starting all 5 models on \$NODE1 (static)..."
+STATIC_PROV_START=\$(date +%s)
 nohup python provisioner/dynamic_provisioner.py \
     --router-url  "\$ROUTER_URL" \
     --node-host   "\$NODE1" \
@@ -227,6 +228,7 @@ sleep 8; wait_router; echo "  Router ready."
 
 echo ""
 echo "[D2] Starting seed models (dynamic mode)..."
+DYNAMIC_PROV_START=\$(date +%s)
 nohup python provisioner/dynamic_provisioner.py \
     --router-url  "\$ROUTER_URL" \
     --node-host   "\$NODE1" \
@@ -291,6 +293,35 @@ echo "  Dynamic wall time: \${DYNAMIC_WALL}s"
 DYNAMIC_SPINUPS=\$(grep "SPIN UP" ~/vllm_logs/prov_svd_dynamic_node1.log 2>/dev/null \
     | grep -v "reason=initial" | awk '{print \$3}' | sort -u | tr '\n' ',' | sed 's/,$//')
 echo "  Models dynamically spun up: \${DYNAMIC_SPINUPS:-none}"
+
+# ── TTCA comparison: Dynamic vs Cascade baseline ───────────────────────────────
+# NOTE: run BEFORE kill_all_models — cascade hits the live router URL
+echo ""
+echo "=================================================================="
+echo "  TTCA: Dynamic mode vs Cascade/RouteLLM baseline"
+echo "  (Fair apple-to-apple: both start with limited models)"
+echo "=================================================================="
+python tests/baseline_cascade.py \
+    --dataset     /tmp/svd_workload.json \
+    --priors      "${PRIORS}" \
+    --threshold   0.80 \
+    --concurrency ${CONCURRENCY} \
+    --output      "\$RESULTS_DIR/dynamic_baseline_cascade.csv"
+
+echo ""
+echo "=== Dynamic mode vs Cascade/RouteLLM ===" | tee "\$RESULTS_DIR/compare_dynamic_vs_cascade.txt"
+python tests/compare_ttca.py \
+    --router      "\$RESULTS_DIR/dynamic_results.csv" \
+    --baseline    "\$RESULTS_DIR/dynamic_baseline_cascade.csv" \
+    --eval-matrix "\$RESULTS_DIR/eval_matrix.csv" \
+    | tee -a "\$RESULTS_DIR/compare_dynamic_vs_cascade.txt"
+echo ""
+python tests/compare_categories.py \
+    --router      "\$RESULTS_DIR/dynamic_results.csv" \
+    --baseline    "\$RESULTS_DIR/dynamic_baseline_cascade.csv" \
+    --eval-matrix "\$RESULTS_DIR/eval_matrix.csv" \
+    --output      "\$RESULTS_DIR/compare_dynamic_vs_cascade.csv" \
+    | tee -a "\$RESULTS_DIR/compare_dynamic_vs_cascade.txt"
 
 echo ""
 echo "[D5] Tearing down dynamic mode..."
@@ -364,39 +395,13 @@ echo "  Static:  all GPUs always on → idle models still burn power"
 echo "  Dynamic: GPUs power down when not needed"
 echo "=================================================================="
 python3 tests/compute_gpu_energy.py \
-    --static-log   ~/vllm_logs/prov_svd_static_node1.log \
-    --static-wall  \$STATIC_WALL \
-    --dynamic-log  ~/vllm_logs/prov_svd_dynamic_node1.log \
-    --dynamic-wall \$DYNAMIC_WALL \
+    --static-log          ~/vllm_logs/prov_svd_static_node1.log \
+    --static-wall         \$STATIC_WALL \
+    --static-start-epoch  \$STATIC_PROV_START \
+    --dynamic-log         ~/vllm_logs/prov_svd_dynamic_node1.log \
+    --dynamic-wall        \$DYNAMIC_WALL \
+    --dynamic-start-epoch \$DYNAMIC_PROV_START \
     | tee "\$RESULTS_DIR/gpu_energy_comparison.txt"
-
-# ── TTCA comparison: Dynamic vs Cascade baseline ───────────────────────────────
-echo ""
-echo "=================================================================="
-echo "  TTCA: Dynamic mode vs Cascade/RouteLLM baseline"
-echo "  (Fair apple-to-apple: both start with limited models)"
-echo "=================================================================="
-python tests/baseline_cascade.py \
-    --dataset     /tmp/svd_workload.json \
-    --priors      "${PRIORS}" \
-    --threshold   0.80 \
-    --concurrency ${CONCURRENCY} \
-    --output      "\$RESULTS_DIR/dynamic_baseline_cascade.csv"
-
-echo ""
-echo "=== Dynamic mode vs Cascade/RouteLLM ===" | tee "\$RESULTS_DIR/compare_dynamic_vs_cascade.txt"
-python tests/compare_ttca.py \
-    --router      "\$RESULTS_DIR/dynamic_results.csv" \
-    --baseline    "\$RESULTS_DIR/dynamic_baseline_cascade.csv" \
-    --eval-matrix "\$RESULTS_DIR/eval_matrix.csv" \
-    | tee -a "\$RESULTS_DIR/compare_dynamic_vs_cascade.txt"
-echo ""
-python tests/compare_categories.py \
-    --router      "\$RESULTS_DIR/dynamic_results.csv" \
-    --baseline    "\$RESULTS_DIR/dynamic_baseline_cascade.csv" \
-    --eval-matrix "\$RESULTS_DIR/eval_matrix.csv" \
-    --output      "\$RESULTS_DIR/compare_dynamic_vs_cascade.csv" \
-    | tee -a "\$RESULTS_DIR/compare_dynamic_vs_cascade.txt"
 
 # ── Done ───────────────────────────────────────────────────────────────────────
 echo "=================================================================="
