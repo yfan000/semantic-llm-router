@@ -136,18 +136,76 @@ def print_report(result: dict) -> None:
         print(f"    {model:<28} {gs:8.0f} GPU-s  ({wh:.1f} Wh, {pct:.1f}%)")
 
 
+def print_comparison(static: dict, dynamic: dict) -> None:
+    """Side-by-side GPU core-hours comparison: static vs dynamic."""
+    if not static or not dynamic:
+        return
+
+    s_gh  = static["gpu_hours"]
+    d_gh  = dynamic["gpu_hours"]
+    saved = s_gh - d_gh
+    pct   = saved / max(s_gh, 1e-9) * 100
+
+    s_wh  = static["total_wh"]
+    d_wh  = dynamic["total_wh"]
+
+    print(f"\n  {'='*70}")
+    print(f"  GPU CORE-HOURS COMPARISON: Static vs Dynamic")
+    print(f"  {'='*70}")
+    print(f"  {'Metric':<32} {'Static':>12}  {'Dynamic':>12}  {'Savings':>12}")
+    print(f"  {'-'*68}")
+    print(f"  {'Wall time (s)':<32} {static['wall_time_s']:>12.0f}  "
+          f"{dynamic['wall_time_s']:>12.0f}  {'':>12}")
+    print(f"  {'Avg GPUs active (node1)':<32} {static['avg_gpus']:>12.1f}  "
+          f"{dynamic['avg_gpus']:>12.1f}  "
+          f"{static['avg_gpus']-dynamic['avg_gpus']:>+12.1f}")
+    print(f"  {'Total GPU-hours (node1)':<32} {s_gh:>12.3f}  "
+          f"{d_gh:>12.3f}  "
+          f"{saved:>+12.3f}  ({pct:.1f}% saved)")
+    print(f"  {'Total energy (Wh, node1)':<32} {s_wh:>12.1f}  "
+          f"{d_wh:>12.1f}  "
+          f"{s_wh-d_wh:>+12.1f}  ({(s_wh-d_wh)/max(s_wh,1)*100:.1f}% saved)")
+    print(f"  {'-'*68}")
+    print(f"  Note: node2 (llama4-scout, 8 GPUs) runs identically in both modes.")
+    print(f"        The difference above is entirely from node1 provisioning decisions.")
+    print(f"\n  Dynamic mode saves {saved:.3f} GPU-hours ({pct:.1f}%) on node1")
+    print(f"  by only loading models when needed (idle models consume no power).")
+    print(f"  {'='*70}\n")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Compute total GPU energy from provisioner log (including idle)")
-    parser.add_argument("--log",   required=True,
+    parser.add_argument("--log",   default=None,
                         help="Path to provisioner log (prov_svd_*.log)")
-    parser.add_argument("--wall",  type=float, required=True,
+    parser.add_argument("--wall",  type=float, default=None,
                         help="Experiment wall time in seconds")
     parser.add_argument("--label", default="",
                         help="Label for the report (e.g. 'Static' or 'Dynamic')")
+    # Comparison mode: pass both logs at once
+    parser.add_argument("--static-log",  default=None,
+                        help="[Compare mode] Static provisioner log")
+    parser.add_argument("--static-wall", type=float, default=None,
+                        help="[Compare mode] Static wall time (s)")
+    parser.add_argument("--dynamic-log",  default=None,
+                        help="[Compare mode] Dynamic provisioner log")
+    parser.add_argument("--dynamic-wall", type=float, default=None,
+                        help="[Compare mode] Dynamic wall time (s)")
     args = parser.parse_args()
 
-    result = compute_gpu_energy(args.log, args.wall, args.label)
+    # Compare mode: both static and dynamic logs provided
+    if args.static_log and args.dynamic_log:
+        static  = compute_gpu_energy(args.static_log,  args.static_wall or 0,  "Static")
+        dynamic = compute_gpu_energy(args.dynamic_log, args.dynamic_wall or 0, "Dynamic")
+        print_report(static)
+        print_report(dynamic)
+        print_comparison(static, dynamic)
+        return
+
+    # Single mode
+    if not args.log:
+        parser.error("Provide --log (single mode) or --static-log + --dynamic-log (compare mode)")
+    result = compute_gpu_energy(args.log, args.wall or 0, args.label)
     print_report(result)
 
     # Machine-readable summary line for scripting
