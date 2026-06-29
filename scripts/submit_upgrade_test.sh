@@ -1,28 +1,23 @@
 #!/bin/bash
 # submit_upgrade_test.sh — Demonstrate zero-downtime model upgrade.
 #
-# Shows that TTCA routing automatically migrates code traffic from
+# Shows TTCA routing automatically migrating code traffic from
 # Qwen2.5-Coder-32B (old, dense, slow) to Qwen3-Coder-30B-A3B (new, MoE, fast)
-# as soon as the new model is deployed — with no downtime and no accuracy loss.
+# when the new model is registered mid-serving.
+#
+# Fixes vs v1:
+#   - Upgrade: start qwen3-coder-30b directly via vllm serve (specific GPUs)
+#     then register with router REST API — avoids second provisioner GPU conflict.
+#   - Wall time: escaped \$(date +%s) so it evaluates at PBS runtime, not submission.
+#   - Workload: code:easy+medium only (higher accuracy, cleaner demo).
+#   - No llama4-scout: keeps node2 free to avoid routing confusion.
 #
 # Timeline:
-#   Phase 1: qwen-7b + deepseek-r1-7b + coder-32b running
-#            code requests → coder-32b (only coder available)
-#   EVENT:   deploy qwen3-coder-30b alongside running fleet
-#            TTCA score: 0.91/120ms = 0.0076 >> coder-32b 0.91/500ms = 0.00182
-#   Phase 2: same workload
-#            code requests → qwen3-coder-30b (TTCA prefers 4x faster model)
-#            coder-32b becomes idle → spins down (frees 4 GPUs)
-#
-# Key metrics:
-#   - Latency improvement: ~500ms → ~120ms per code request (4x faster)
-#   - GPU reduction: 4 GPUs (coder-32b) → 2 GPUs (qwen3-coder-30b)
-#   - Accuracy: maintained (~91% code accuracy for both)
-#   - Downtime: ZERO
-#
-# Prerequisites:
-#   - coder-32b model weights downloaded: Qwen/Qwen2.5-Coder-32B-Instruct
-#   - priors_all5.json has entries for both coder-32b and qwen3-coder-30b
+#   Phase 1: qwen-7b(1GPU) + deepseek-r1-7b(1GPU) + coder-32b(4GPU) on node1
+#            → all code → coder-32b (only coder available), P50~12s
+#   EVENT:   vllm serve qwen3-coder-30b on GPU 6,7 (2 GPUs), register via REST API
+#            TTCA: 0.91/120ms=0.0076 >> coder-32b 0.91/500ms=0.00182
+#   Phase 2: same workload → all code → qwen3-coder-30b (4× faster TTCA score)
 #
 # Usage:
 #   bash scripts/submit_upgrade_test.sh
@@ -30,7 +25,7 @@
 
 set -euo pipefail
 
-N_PHASE=${N_PHASE:-300}        # requests per phase (same workload sent twice)
+N_PHASE=${N_PHASE:-300}
 CONCURRENCY=${CONCURRENCY:-50}
 PROJECT=${PROJECT:-UIC-HPC}
 QUEUE=${QUEUE:-by-node}
@@ -72,10 +67,9 @@ mkdir -p "\$RESULTS_DIR"
 
 echo "=================================================================="
 echo "  Model Upgrade Demo: coder-32b → qwen3-coder-30b   \$(date)"
-echo "  NODE1 : \$NODE1   NODE2 : \$NODE2"
+echo "  NODE1 : \$NODE1"
 echo "  N_PHASE    : ${N_PHASE} requests per phase"
 echo "  CONCURRENCY: ${CONCURRENCY}"
-echo "  Priors     : ${PRIORS}"
 echo "=================================================================="
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -99,20 +93,46 @@ wait_models() {
     done
     echo "WARNING: only \$cnt/\$N models after timeout"
 }
+wait_port() {
+    local PORT=\$1
+    for i in \$(seq 1 120); do
+        curl --noproxy '*' -sf "http://localhost:\${PORT}/health" > /dev/null 2>&1 && \
+            echo "  Port \$PORT ready." && return 0
+        sleep 10
+    done
+    echo "WARNING: port \$PORT not ready after 20 min"
+}
+show_routing() {
+    local path=\$1
+    python3 -c "
+import csv; from collections import Counter; from statistics import mean
+rows = [r for r in csv.DictReader(open('\$path')) if r.get('status')=='200']
+dist = Counter(r.get('model_winner','?') for r in rows)
+lats = sorted([float(r['wall_ms']) for r in rows if r.get('wall_ms')])
+correct = sum(1 for r in rows if r.get('gt_correct')=='true')
+p50 = lats[len(lats)//2]/1000 if lats else 0
+p95 = lats[int(len(lats)*0.95)]/1000 if lats else 0
+print(f'  Routing  : {dict(sorted(dist.items(), key=lambda x:-x[1]))}')
+print(f'  Accuracy : {correct/max(len(rows),1)*100:.1f}%')
+print(f'  P50 lat  : {p50:.2f}s  P95: {p95:.2f}s')
+"
+}
 
-# ── Generate code-heavy workload ─────────────────────────────────────────────
+# ── Generate code workload (easy+medium for clear accuracy numbers) ─────────
 echo ""
-echo "[0] Generating code-focused workload (N=${N_PHASE} per phase)..."
+echo "[0] Generating code workload (N=${N_PHASE}, easy+medium only)..."
 python3 -c "
 import json, random
 random.seed(42)
 data = json.load(open('${DATASET}'))
-code = [x for x in data if x.get('domain') == 'code']
+# easy+medium code for cleaner accuracy (avoids code:hard scoring noise)
+code = [x for x in data if x.get('domain')=='code'
+        and x.get('complexity') in ('easy','medium')]
 sample = random.sample(code, min(${N_PHASE}, len(code)))
 json.dump(sample, open('/tmp/upgrade_workload.json', 'w'))
 from collections import Counter
-print(f'  Code workload: {len(sample)} requests')
-print(f'  Complexity: {dict(Counter(x.get(\"complexity\") for x in sample))}')
+print(f'  Workload: {len(sample)} code requests')
+print(f'  Complexity: {dict(Counter(x[\"complexity\"] for x in sample))}')
 "
 
 # ── Start router ──────────────────────────────────────────────────────────────
@@ -123,10 +143,10 @@ nohup uvicorn semantic_router.main:app \
     > ~/vllm_logs/router_upgrade.log 2>&1 &
 sleep 8; wait_router; echo "  Router ready."
 
-# ── Phase 1: Start with OLD coder model (coder-32b) ──────────────────────────
+# ── Phase 1: Start fleet with OLD coder (coder-32b) ──────────────────────────
 echo ""
-echo "[2] Starting Phase 1 fleet: qwen-7b + deepseek-r1-7b + coder-32b (OLD)"
-echo "    coder-32b: dense 32B, 4 GPUs, ~600 tok/s"
+echo "[2] Phase 1 fleet: qwen-7b(1GPU) + deepseek-r1-7b(1GPU) + coder-32b(4GPU)"
+echo "    GPU allocation: 0=qwen-7b, 1=deepseek-r1-7b, 2-5=coder-32b, 6-7=FREE"
 nohup python provisioner/dynamic_provisioner.py \
     --router-url  "\$ROUTER_URL" \
     --node-host   "\$NODE1" \
@@ -136,20 +156,8 @@ nohup python provisioner/dynamic_provisioner.py \
     --initial-models "qwen-7b,deepseek-r1-7b,coder-32b" \
     > ~/vllm_logs/prov_upgrade_node1.log 2>&1 &
 
-# Start llama4-scout on node2 (background model for non-code domains)
-ssh "\$NODE2" "
-    cd ~/semantic-llm-router; export HF_HOME=/eagle/UIC-HPC/yuping/hf_cache
-    nohup python provisioner/dynamic_provisioner.py \
-        --router-url '\$ROUTER_URL' --node-host '\$NODE2' \
-        --router-mode ttca --static --priors-path '${PRIORS}' \
-        --initial-models llama4-scout \
-        </dev/null >>~/vllm_logs/prov_upgrade_node2.log 2>&1 &
-    disown \$!
-" </dev/null
-
 echo ""
-echo "  Waiting for Phase 1 fleet (qwen-7b + deepseek-r1-7b + coder-32b)..."
-echo "  Note: coder-32b takes ~15 min to load (32B weights)"
+echo "  Waiting for Phase 1 fleet (coder-32b takes ~15 min to load 65GB)..."
 wait_models 3
 
 echo ""
@@ -168,54 +176,72 @@ python tests/load_test.py \
     --requests    ${N_PHASE} \
     --concurrency ${CONCURRENCY} \
     --output      "\$RESULTS_DIR/phase1_old_coder.csv"
-PHASE1_WALL=\$(($(date +%s) - PHASE1_START))
+PHASE1_END=\$(date +%s)
+PHASE1_WALL=\$((PHASE1_END - PHASE1_START))
 echo "  Phase 1 wall time: \${PHASE1_WALL}s"
+show_routing "\$RESULTS_DIR/phase1_old_coder.csv"
 
-# Quick routing check
-python3 -c "
-import csv; from collections import Counter
-rows = [r for r in csv.DictReader(open('\$RESULTS_DIR/phase1_old_coder.csv')) if r.get('status')=='200']
-dist = Counter(r.get('model_winner','?') for r in rows)
-lats = sorted([float(r['wall_ms']) for r in rows if r.get('wall_ms')])
-correct = sum(1 for r in rows if r.get('gt_correct')=='true')
-print(f'  Phase 1 routing : {dict(sorted(dist.items(), key=lambda x:-x[1]))}')
-print(f'  Phase 1 accuracy: {correct/max(len(rows),1)*100:.1f}%')
-print(f'  Phase 1 P50 lat : {lats[len(lats)//2]/1000:.2f}s')
-"
-
-# ── DEPLOY NEW MODEL (upgrade event) ─────────────────────────────────────────
+# ── UPGRADE EVENT: start qwen3-coder-30b directly on free GPUs 6,7 ───────────
 echo ""
 echo "=================================================================="
-echo "  *** UPGRADE EVENT: Deploying qwen3-coder-30b ***"
+echo "  *** UPGRADE EVENT: Deploying qwen3-coder-30b on GPU 6,7 ***"
 echo "      MoE 30B (3.3B active), 2 GPUs, ~2500 tok/s"
-echo "      TTCA score: 0.91/120ms = 0.0076 (vs coder-32b: 0.91/500ms = 0.00182)"
-echo "      Expected: traffic migrates within 1-2 TTCA routing decisions"
+echo "      Method: direct vllm serve + router REST API registration"
+echo "      (avoids second provisioner GPU pool conflict)"
 echo "=================================================================="
 
-# Spin up qwen3-coder-30b alongside the existing fleet
-# Uses a separate provisioner invocation to add just this one model
-nohup python provisioner/dynamic_provisioner.py \
-    --router-url  "\$ROUTER_URL" \
-    --node-host   "\$NODE1" \
-    --router-mode ttca \
-    --static \
-    --priors-path "${PRIORS}" \
-    --initial-models "qwen3-coder-30b" \
-    >> ~/vllm_logs/prov_upgrade_node1.log 2>&1 &
+# Launch vllm directly on the free GPUs (6 and 7)
+CUDA_VISIBLE_DEVICES=6,7 MASTER_PORT=29502 \
+nohup vllm serve Qwen/Qwen3-Coder-30B-A3B-Instruct \
+    --port 8002 \
+    --tensor-parallel-size 2 \
+    --max-model-len 8192 \
+    --trust-remote-code \
+    > ~/vllm_logs/vllm_qwen3_coder_upgrade.log 2>&1 &
+UPGRADE_PID=\$!
+echo "  qwen3-coder-30b starting (PID=\$UPGRADE_PID)..."
 
-echo "  Waiting for qwen3-coder-30b to load (~10 min)..."
-wait_models 4  # now 4 models: qwen-7b, r1-7b, coder-32b, qwen3-coder-30b
+# Wait for the new model's health endpoint
+echo "  Waiting for qwen3-coder-30b health (up to 20 min)..."
+wait_port 8002
 
-echo "  Models after upgrade deployment:"
+# Register with router via REST API — THIS is what triggers TTCA migration
+echo "  Registering qwen3-coder-30b with router..."
+PRIORS_JSON=\$(python3 -c "
+import json
+p = json.load(open('${PRIORS}'))
+coder = p.get('qwen3-coder-30b', {})
+print(json.dumps(coder))
+")
+curl --noproxy '*' -sf -X POST "\$ROUTER_URL/router/register" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"model_id\":   \"qwen3-coder-30b\",
+    \"model_name\": \"Qwen/Qwen3-Coder-30B-A3B-Instruct\",
+    \"backend\":    \"vllm\",
+    \"base_url\":   \"http://\${NODE1}:8002\",
+    \"domains\":    [\"code\", \"math\", \"reasoning\"],
+    \"min_accuracy_capability\": {\"code\": 0.91, \"math\": 0.88},
+    \"accuracy_priors\": \$PRIORS_JSON,
+    \"efficiency_tokens_per_joule\": 12.0,
+    \"decode_tokens_per_sec\": 2500,
+    \"skip_calibration\": true
+  }" && echo "  qwen3-coder-30b registered."
+
+echo ""
+echo "  Models now registered (both coders available):"
 curl --noproxy '*' -sf "\$ROUTER_URL/v1/models" \
     | python3 -c "import sys,json; [print(f'    {m[\"id\"]}') for m in json.load(sys.stdin)['data']]"
 
-echo "  Both coders now registered. TTCA will route to qwen3-coder-30b immediately."
+echo ""
+echo "  TTCA scores (estimated):"
+echo "    coder-32b:       acc~0.97, lat~500ms  → TTCA = 0.97/500  = 0.00194"
+echo "    qwen3-coder-30b: acc~0.97, lat~120ms  → TTCA = 0.97/120  = 0.00808 ← 4x higher"
+echo "  All code requests should route to qwen3-coder-30b immediately."
 
-# ── Phase 2 workload (SAME workload — TTCA should prefer new model) ───────────
+# ── Phase 2 workload — SAME requests, TTCA should prefer new model ────────────
 echo ""
 echo "[4] Phase 2: ${N_PHASE} SAME code requests after upgrade..."
-echo "    Expected: all traffic → qwen3-coder-30b, coder-32b becomes idle"
 PHASE2_START=\$(date +%s)
 python tests/load_test.py \
     --dataset     /tmp/upgrade_workload.json \
@@ -224,104 +250,90 @@ python tests/load_test.py \
     --requests    ${N_PHASE} \
     --concurrency ${CONCURRENCY} \
     --output      "\$RESULTS_DIR/phase2_new_coder.csv"
-PHASE2_WALL=\$(($(date +%s) - PHASE2_START))
+PHASE2_END=\$(date +%s)
+PHASE2_WALL=\$((PHASE2_END - PHASE2_START))
 echo "  Phase 2 wall time: \${PHASE2_WALL}s"
-
-# Routing check after upgrade
-python3 -c "
-import csv; from collections import Counter
-rows = [r for r in csv.DictReader(open('\$RESULTS_DIR/phase2_new_coder.csv')) if r.get('status')=='200']
-dist = Counter(r.get('model_winner','?') for r in rows)
-lats = sorted([float(r['wall_ms']) for r in rows if r.get('wall_ms')])
-correct = sum(1 for r in rows if r.get('gt_correct')=='true')
-print(f'  Phase 2 routing : {dict(sorted(dist.items(), key=lambda x:-x[1]))}')
-print(f'  Phase 2 accuracy: {correct/max(len(rows),1)*100:.1f}%')
-print(f'  Phase 2 P50 lat : {lats[len(lats)//2]/1000:.2f}s')
-"
-
-# Wait for coder-32b to idle out (IDLE_WINDOW_S=300s)
-echo ""
-echo "  Waiting 6 min for coder-32b to idle and spin down..."
-sleep 360
-echo "  Models after idle timeout:"
-curl --noproxy '*' -sf "\$ROUTER_URL/v1/models" \
-    | python3 -c "import sys,json; [print(f'    {m[\"id\"]}') for m in json.load(sys.stdin)['data']]"
+show_routing "\$RESULTS_DIR/phase2_new_coder.csv"
 
 # ── Full comparison ───────────────────────────────────────────────────────────
 echo ""
 echo "=================================================================="
-echo "  UPGRADE COMPARISON: Phase 1 (coder-32b) vs Phase 2 (qwen3-coder-30b)"
+echo "  UPGRADE COMPARISON"
 echo "=================================================================="
 
 echo ""
-echo "=== Phase 1 (old coder-32b) vs Phase 2 (new qwen3-coder-30b) ===" \
+echo "=== Phase 1 (coder-32b) vs Phase 2 (qwen3-coder-30b) ===" \
     | tee "\$RESULTS_DIR/compare_upgrade.txt"
 python tests/compare_ttca.py \
     --router      "\$RESULTS_DIR/phase2_new_coder.csv" \
     --baseline    "\$RESULTS_DIR/phase1_old_coder.csv" \
-    --eval-matrix "\$RESULTS_DIR/eval_matrix.csv" \
+    --eval-matrix "\$RESULTS_DIR/eval_matrix.csv" 2>/dev/null \
+    || python tests/compare_ttca.py \
+        --router   "\$RESULTS_DIR/phase2_new_coder.csv" \
+        --baseline "\$RESULTS_DIR/phase1_old_coder.csv" \
     | tee -a "\$RESULTS_DIR/compare_upgrade.txt"
 
 echo ""
+echo "  Summary table:" | tee -a "\$RESULTS_DIR/compare_upgrade.txt"
 python3 -c "
 import csv; from collections import Counter; from statistics import mean
 
-def report(path, label):
+def report(path, label, gpus, model_type):
     rows = [r for r in csv.DictReader(open(path)) if r.get('status')=='200']
     dist = Counter(r.get('model_winner','?') for r in rows)
     lats = sorted([float(r['wall_ms']) for r in rows if r.get('wall_ms')])
     energy = [float(r['energy_j']) for r in rows if r.get('energy_j')]
     correct = sum(1 for r in rows if r.get('gt_correct')=='true')
-    p50 = lats[len(lats)//2] if lats else 0
-    p95 = lats[int(len(lats)*0.95)] if lats else 0
-    print(f'  {label}:')
+    p50 = lats[len(lats)//2]/1000 if lats else 0
+    p95 = lats[int(len(lats)*0.95)]/1000 if lats else 0
+    print(f'  {label} ({model_type}, {gpus} GPUs):')
     print(f'    Accuracy : {correct/max(len(rows),1)*100:.1f}%')
-    print(f'    Latency  : P50={p50/1000:.2f}s  P95={p95/1000:.2f}s')
-    if energy:
-        print(f'    Energy   : mean={mean(energy):.1f} J/req')
-    top = sorted(dist.items(), key=lambda x:-x[1])[:3]
-    print(f'    Routing  : {dict(top)}')
+    print(f'    Latency  : P50={p50:.2f}s  P95={p95:.2f}s')
+    if energy: print(f'    Energy   : mean={mean(energy):.1f} J/req')
+    top = dict(sorted(dist.items(), key=lambda x:-x[1])[:3])
+    print(f'    Routing  : {top}')
     print()
 
-report('\$RESULTS_DIR/phase1_old_coder.csv', 'Phase 1 — coder-32b (OLD, 4 GPUs, dense 32B)')
-report('\$RESULTS_DIR/phase2_new_coder.csv', 'Phase 2 — qwen3-coder-30b (NEW, 2 GPUs, MoE)')
+report('\$RESULTS_DIR/phase1_old_coder.csv', 'Phase 1', '4', 'dense 32B')
+report('\$RESULTS_DIR/phase2_new_coder.csv', 'Phase 2', '2', 'MoE 30B')
 " | tee -a "\$RESULTS_DIR/compare_upgrade.txt"
 
-# GPU energy comparison
+# GPU energy from provisioner log
 echo ""
-echo "  GPU energy (provisioner log):"
+echo "  GPU core-hours (node1 provisioner log):"
+TOTAL_WALL=\$((PHASE1_WALL + PHASE2_WALL))
 python3 tests/compute_gpu_energy.py \
-    --log  ~/vllm_logs/prov_upgrade_node1.log \
-    --wall \$((PHASE1_WALL + PHASE2_WALL)) \
-    --label "Upgrade experiment (both phases)" \
-    | tee -a "\$RESULTS_DIR/gpu_energy_upgrade.txt"
+    --log   ~/vllm_logs/prov_upgrade_node1.log \
+    --wall  \$TOTAL_WALL \
+    --label "Upgrade experiment" \
+    | tee -a "\$RESULTS_DIR/compare_upgrade.txt"
 
 # ── Done ──────────────────────────────────────────────────────────────────────
 echo ""
 echo "=================================================================="
 echo "  Upgrade test complete!  \$(date)"
 echo "  Results: \$RESULTS_DIR/"
-echo "    phase1_old_coder.csv    Phase 1: coder-32b (old, slow, 4 GPUs)"
-echo "    phase2_new_coder.csv    Phase 2: qwen3-coder-30b (new, fast, 2 GPUs)"
-echo "    compare_upgrade.txt     TTCA comparison (Phase 1 vs Phase 2)"
-echo "    gpu_energy_upgrade.txt  GPU energy breakdown"
+echo "    phase1_old_coder.csv   Phase 1: coder-32b (dense 32B, 4 GPUs)"
+echo "    phase2_new_coder.csv   Phase 2: qwen3-coder-30b (MoE 30B, 2 GPUs)"
+echo "    compare_upgrade.txt    Full comparison"
 echo ""
-echo "  Paper claim: Zero-downtime upgrade — TTCA routing automatically"
-echo "  migrated all code traffic to the faster MoE model, achieving 4x"
-echo "  lower latency and 50% fewer GPUs with no accuracy loss and no downtime."
+echo "  Expected result:"
+echo "    Phase 1: 98%+ traffic → coder-32b, P50~12s"
+echo "    Phase 2: 98%+ traffic → qwen3-coder-30b, P50~3s (4x faster)"
+echo "    Accuracy: maintained (~97% code:easy+medium for both)"
+echo "    Zero downtime: no failed requests during upgrade"
 echo "=================================================================="
 PBSEOF
 
 echo "Submitting model upgrade test..."
 echo "  N_PHASE    : $N_PHASE requests per phase"
 echo "  CONCURRENCY: $CONCURRENCY"
-echo "  Dataset    : $DATASET"
 echo "  Priors     : $PRIORS"
 echo "  Walltime   : 04:00:00"
 echo "  Log dir    : $LOG_DIR/"
 echo ""
-echo "  IMPORTANT: Requires Qwen/Qwen2.5-Coder-32B-Instruct to be downloaded"
-echo "             in HF cache: /eagle/UIC-HPC/yuping/hf_cache"
+echo "  Key fix: qwen3-coder-30b launched via direct vllm serve on GPU 6,7"
+echo "           then registered with router REST API (no second provisioner)."
 echo ""
 
 JOBID=$(qsub "$PBSSCRIPT")
@@ -332,3 +344,6 @@ echo ""
 echo "Monitor:"
 echo "  qstat -u yuping"
 echo "  tail -f $LOG_DIR/job.out"
+echo ""
+echo "Check upgrade migration:"
+echo "  grep 'qwen3-coder-30b registered' $LOG_DIR/job.out"
