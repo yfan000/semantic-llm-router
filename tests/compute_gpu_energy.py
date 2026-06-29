@@ -42,15 +42,25 @@ MODEL_GPUS: dict[str, int] = {
 }
 
 
-def parse_events(log_path: str) -> list[tuple[datetime, str, str]]:
-    """Extract (timestamp, UP/DOWN, model_id) from provisioner log."""
+def parse_events(log_path: str,
+                 start_epoch: float = 0.0) -> list[tuple[datetime, str, str]]:
+    """Extract (timestamp, UP/DOWN, model_id) from provisioner log.
+
+    start_epoch: Unix timestamp of experiment start.  Events logged before
+    this time are skipped — they belong to earlier runs appended to the
+    same log file on the same day.
+    """
     events: list[tuple[datetime, str, str]] = []
     today = date.today()
+    # Earliest allowed wall-clock time (same-day, derived from epoch)
+    start_dt = datetime.fromtimestamp(start_epoch) if start_epoch > 0 else None
     for line in open(log_path, errors="replace"):
         # Match lines like: "14:23:07 [INFO] SPIN UP  qwen-7b  reason=initial..."
         m = re.search(r"(\d{2}:\d{2}:\d{2}).*SPIN (UP|DOWN)\s+(\S+)", line)
         if m:
             t = datetime.combine(today, datetime.strptime(m.group(1), "%H:%M:%S").time())
+            if start_dt and t < start_dt:
+                continue  # stale event from a previous run logged earlier today
             action = m.group(2)
             model  = m.group(3).strip().rstrip(",")
             events.append((t, action, model))
@@ -58,9 +68,10 @@ def parse_events(log_path: str) -> list[tuple[datetime, str, str]]:
 
 
 def compute_gpu_energy(log_path: str, wall_time_s: float,
-                       label: str = "") -> dict:
+                       label: str = "",
+                       start_epoch: float = 0.0) -> dict:
     """Parse provisioner log → total GPU energy including idle."""
-    events = parse_events(log_path)
+    events = parse_events(log_path, start_epoch=start_epoch)
 
     if not events:
         print(f"  WARNING: no SPIN UP/DOWN events found in {log_path}")
@@ -182,21 +193,30 @@ def main() -> None:
                         help="Experiment wall time in seconds")
     parser.add_argument("--label", default="",
                         help="Label for the report (e.g. 'Static' or 'Dynamic')")
+    parser.add_argument("--start-epoch", type=float, default=0.0,
+                        help="[Single mode] Unix timestamp when this experiment started;"
+                             " events before this time are ignored (fixes stale log entries)")
     # Comparison mode: pass both logs at once
     parser.add_argument("--static-log",  default=None,
                         help="[Compare mode] Static provisioner log")
     parser.add_argument("--static-wall", type=float, default=None,
                         help="[Compare mode] Static wall time (s)")
+    parser.add_argument("--static-start-epoch", type=float, default=0.0,
+                        help="[Compare mode] Unix timestamp when static experiment started")
     parser.add_argument("--dynamic-log",  default=None,
                         help="[Compare mode] Dynamic provisioner log")
     parser.add_argument("--dynamic-wall", type=float, default=None,
                         help="[Compare mode] Dynamic wall time (s)")
+    parser.add_argument("--dynamic-start-epoch", type=float, default=0.0,
+                        help="[Compare mode] Unix timestamp when dynamic experiment started")
     args = parser.parse_args()
 
     # Compare mode: both static and dynamic logs provided
     if args.static_log and args.dynamic_log:
-        static  = compute_gpu_energy(args.static_log,  args.static_wall or 0,  "Static")
-        dynamic = compute_gpu_energy(args.dynamic_log, args.dynamic_wall or 0, "Dynamic")
+        static  = compute_gpu_energy(args.static_log,  args.static_wall or 0,  "Static",
+                                     start_epoch=args.static_start_epoch)
+        dynamic = compute_gpu_energy(args.dynamic_log, args.dynamic_wall or 0, "Dynamic",
+                                     start_epoch=args.dynamic_start_epoch)
         print_report(static)
         print_report(dynamic)
         print_comparison(static, dynamic)
@@ -205,7 +225,8 @@ def main() -> None:
     # Single mode
     if not args.log:
         parser.error("Provide --log (single mode) or --static-log + --dynamic-log (compare mode)")
-    result = compute_gpu_energy(args.log, args.wall or 0, args.label)
+    result = compute_gpu_energy(args.log, args.wall or 0, args.label,
+                                start_epoch=args.start_epoch)
     print_report(result)
 
     # Machine-readable summary line for scripting
