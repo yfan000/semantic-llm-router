@@ -364,17 +364,11 @@ echo "  Static:  all GPUs always on → idle models still burn power"
 echo "  Dynamic: GPUs power down when not needed"
 echo "=================================================================="
 python3 tests/compute_gpu_energy.py \
-    --log   ~/vllm_logs/prov_svd_static_node1.log \
-    --wall  \$STATIC_WALL \
-    --label "Static (node1)" \
-    | tee -a "\$RESULTS_DIR/gpu_energy_comparison.txt"
-python3 tests/compute_gpu_energy.py \
-    --log   ~/vllm_logs/prov_svd_dynamic_node1.log \
-    --wall  \$DYNAMIC_WALL \
-    --label "Dynamic (node1)" \
-    | tee -a "\$RESULTS_DIR/gpu_energy_comparison.txt"
-echo "  Note: node2 (llama4-scout, 8 GPUs) runs same duration in both modes."
-echo "  The difference is entirely on node1 (model provisioning decisions)."
+    --static-log   ~/vllm_logs/prov_svd_static_node1.log \
+    --static-wall  \$STATIC_WALL \
+    --dynamic-log  ~/vllm_logs/prov_svd_dynamic_node1.log \
+    --dynamic-wall \$DYNAMIC_WALL \
+    | tee "\$RESULTS_DIR/gpu_energy_comparison.txt"
 
 # ── TTCA comparison: Dynamic vs Cascade baseline ───────────────────────────────
 echo ""
