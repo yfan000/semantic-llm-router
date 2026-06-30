@@ -13,11 +13,13 @@
 #   - No llama4-scout: keeps node2 free to avoid routing confusion.
 #
 # Timeline:
-#   Phase 1: qwen-7b(1GPU) + deepseek-r1-7b(1GPU) + coder-32b(4GPU) on node1
-#            → all code → coder-32b (only coder available), P50~12s
-#   EVENT:   vllm serve qwen3-coder-30b on GPU 6,7 (2 GPUs), register via REST API
-#            TTCA: 0.91/120ms=0.0076 >> coder-32b 0.91/500ms=0.00182
-#   Phase 2: same workload → all code → qwen3-coder-30b (4× faster TTCA score)
+#   Phase 1: qwen-7b(GPU0) + deepseek-r1-7b(GPU1) + coder-32b(GPU2,3) on node1
+#            → all code → coder-32b (only coder available), P50~16-20s
+#   EVENT:   vllm serve qwen3-coder-30b on GPU 4,5, register via REST API
+#            Pre-warm: 30 requests on same workload → real latency in EMA
+#            Provisioner poll: TTCA ratio >= 1.5 → SPIN DOWN coder-32b (superseded)
+#   Phase 2: same workload → 100% qwen3-coder-30b (coder-32b deregistered)
+#            P50~3-6s (MoE 3.3B active params vs dense 32B — equal GPU count)
 #
 # Usage:
 #   bash scripts/submit_upgrade_test.sh
@@ -145,8 +147,10 @@ sleep 8; wait_router; echo "  Router ready."
 
 # ── Phase 1: Start fleet with OLD coder (coder-32b) ──────────────────────────
 echo ""
-echo "[2] Phase 1 fleet: qwen-7b(1GPU) + deepseek-r1-7b(1GPU) + coder-32b(4GPU)"
-echo "    GPU allocation: 0=qwen-7b, 1=deepseek-r1-7b, 2-5=coder-32b, 6-7=FREE"
+echo "[2] Phase 1 fleet: qwen-7b(1GPU) + deepseek-r1-7b(1GPU) + coder-32b(2GPU)"
+echo "    GPU allocation: 0=qwen-7b, 1=deepseek-r1-7b, 2-3=coder-32b, 4-7=FREE"
+echo "    (equal GPUs for fair comparison: both coders on 2 GPUs)"
+PROV_START=\$(date +%s)
 nohup python provisioner/dynamic_provisioner.py \
     --router-url  "\$ROUTER_URL" \
     --node-host   "\$NODE1" \
@@ -181,17 +185,19 @@ PHASE1_WALL=\$((PHASE1_END - PHASE1_START))
 echo "  Phase 1 wall time: \${PHASE1_WALL}s"
 show_routing "\$RESULTS_DIR/phase1_old_coder.csv"
 
-# ── UPGRADE EVENT: start qwen3-coder-30b directly on free GPUs 6,7 ───────────
+# ── UPGRADE EVENT: start qwen3-coder-30b directly on free GPUs 4,5 ───────────
 echo ""
 echo "=================================================================="
-echo "  *** UPGRADE EVENT: Deploying qwen3-coder-30b on GPU 6,7 ***"
-echo "      MoE 30B (3.3B active), 2 GPUs, ~2500 tok/s"
+echo "  *** UPGRADE EVENT: Deploying qwen3-coder-30b on GPU 4,5 ***"
+echo "      MoE 30B (3.3B active), 2 GPUs — same GPU count as coder-32b"
 echo "      Method: direct vllm serve + router REST API registration"
-echo "      (avoids second provisioner GPU pool conflict)"
+echo "      Provisioner will detect supersession via TTCA comparison"
+echo "      and retire coder-32b automatically after pre-warm."
 echo "=================================================================="
 
-# Launch vllm directly on the free GPUs (6 and 7)
-CUDA_VISIBLE_DEVICES=6,7 MASTER_PORT=29502 \
+# Launch vllm directly on the free GPUs (4 and 5)
+# coder-32b uses GPUs 2,3 (provisioner-allocated); 4,5,6,7 are free
+CUDA_VISIBLE_DEVICES=4,5 MASTER_PORT=29502 \
 nohup vllm serve Qwen/Qwen3-Coder-30B-A3B-Instruct \
     --port 8002 \
     --tensor-parallel-size 2 \
@@ -205,7 +211,7 @@ echo "  qwen3-coder-30b starting (PID=\$UPGRADE_PID)..."
 echo "  Waiting for qwen3-coder-30b health (up to 20 min)..."
 wait_port 8002
 
-# Register with router via REST API — THIS is what triggers TTCA migration
+# Register with router via REST API
 echo "  Registering qwen3-coder-30b with router..."
 PRIORS_JSON=\$(python3 -c "
 import json
@@ -233,11 +239,45 @@ echo "  Models now registered (both coders available):"
 curl --noproxy '*' -sf "\$ROUTER_URL/v1/models" \
     | python3 -c "import sys,json; [print(f'    {m[\"id\"]}') for m in json.load(sys.stdin)['data']]"
 
+# Pre-warm qwen3-coder-30b on the SAME workload as Phase 1 (concurrency=5, low load).
+# This populates the reputation tracker's avg_latency_ms for qwen3-coder-30b from
+# identical prompts so the TTCA comparison is fair (same token distribution).
+# The provisioner checks sample_count >= 20 before running supersession logic.
 echo ""
-echo "  TTCA scores (estimated):"
-echo "    coder-32b:       acc~0.97, lat~500ms  → TTCA = 0.97/500  = 0.00194"
-echo "    qwen3-coder-30b: acc~0.97, lat~120ms  → TTCA = 0.97/120  = 0.00808 ← 4x higher"
-echo "  All code requests should route to qwen3-coder-30b immediately."
+echo "  Pre-warming qwen3-coder-30b on same workload (30 req, concurrency=5)..."
+echo "  (low concurrency measures intrinsic latency without queue effects)"
+python tests/load_test.py \
+    --dataset     /tmp/upgrade_workload.json \
+    --router      "\$ROUTER_URL" \
+    --mode        ttca \
+    --requests    30 \
+    --concurrency 5 \
+    --output      /tmp/warmup_results.csv
+echo "  Pre-warm complete. Reputation tracker has latency data for both coders."
+
+# Show measured TTCA scores after pre-warm
+echo ""
+echo "  Measured TTCA scores after pre-warm:"
+python3 -c "
+import csv; from statistics import median
+rows_w = [r for r in csv.DictReader(open('/tmp/warmup_results.csv')) if r.get('status')=='200' and r.get('model_winner')=='qwen3-coder-30b']
+rows_p = [r for r in csv.DictReader(open('\$RESULTS_DIR/phase1_old_coder.csv')) if r.get('status')=='200' and r.get('model_winner')=='coder-32b']
+if rows_w:
+    new_lat = median(float(r['wall_ms']) for r in rows_w)
+    new_acc = sum(1 for r in rows_w if r.get('gt_correct')=='true') / len(rows_w)
+    print(f'    qwen3-coder-30b: acc={new_acc:.2f}, P50={new_lat/1000:.2f}s  TTCA={new_acc/new_lat:.7f}')
+if rows_p:
+    old_lat = median(float(r['wall_ms']) for r in rows_p)
+    old_acc = sum(1 for r in rows_p if r.get('gt_correct')=='true') / len(rows_p)
+    print(f'    coder-32b:       acc={old_acc:.2f}, P50={old_lat/1000:.2f}s  TTCA={old_acc/old_lat:.7f}')
+    if rows_w:
+        ratio = (new_acc/new_lat) / (old_acc/old_lat) if (old_acc/old_lat) > 0 else float('inf')
+        print(f'    TTCA ratio: {ratio:.2f}x  (threshold=1.5x for supersession)')
+" 2>/dev/null || true
+
+echo ""
+echo "  Provisioner will detect supersession at next poll cycle (~30s)..."
+echo "  Watch for: SUPERSESSION_CHECK and SPIN DOWN coder-32b in provisioner log"
 
 # ── Phase 2 workload — SAME requests, TTCA should prefer new model ────────────
 echo ""
@@ -294,18 +334,57 @@ def report(path, label, gpus, model_type):
     print(f'    Routing  : {top}')
     print()
 
-report('\$RESULTS_DIR/phase1_old_coder.csv', 'Phase 1', '4', 'dense 32B')
+report('\$RESULTS_DIR/phase1_old_coder.csv', 'Phase 1', '2', 'dense 32B')
 report('\$RESULTS_DIR/phase2_new_coder.csv', 'Phase 2', '2', 'MoE 30B')
 " | tee -a "\$RESULTS_DIR/compare_upgrade.txt"
+
+# ── Wait for provisioner to retire coder-32b via supersession trigger ────────
+echo ""
+echo "=================================================================="
+echo "  Waiting for provisioner to retire coder-32b (up to 3 min)..."
+echo "  The provisioner compares TTCA scores every 30s poll cycle."
+echo "  Once ratio >= 1.5x, it deregisters coder-32b and drains (60s)."
+echo "=================================================================="
+RETIRE_TIMEOUT=180
+RETIRED=0
+for i in \$(seq 1 \$RETIRE_TIMEOUT); do
+    if grep -q "SPIN DOWN coder-32b drain_complete" \
+            ~/vllm_logs/prov_upgrade_node1.log 2>/dev/null; then
+        RETIRED=1
+        echo "  coder-32b retired! GPUs 2,3 freed. (\${i}s after Phase 2)"
+        break
+    fi
+    # Also check for immediate deregister
+    if grep -q "reason=superseded_by=qwen3-coder-30b" \
+            ~/vllm_logs/prov_upgrade_node1.log 2>/dev/null && [ "\$i" -gt 60 ]; then
+        RETIRED=1
+        echo "  coder-32b deregistered and drain complete. (\${i}s after Phase 2)"
+        break
+    fi
+    sleep 1
+done
+
+if [ "\$RETIRED" -eq 0 ]; then
+    echo "  WARNING: coder-32b not retired within \${RETIRE_TIMEOUT}s"
+    echo "  Check provisioner log: ~/vllm_logs/prov_upgrade_node1.log"
+    echo "  Look for: SUPERSESSION_CHECK and SPIN DOWN coder-32b"
+fi
+
+# Show supersession log entries
+echo ""
+echo "  Supersession log:"
+grep -E "SUPERSESSION_CHECK|RETIRE|SPIN DOWN coder-32b|drain_complete" \
+    ~/vllm_logs/prov_upgrade_node1.log 2>/dev/null | tail -10 || echo "  (no entries yet)"
 
 # GPU energy from provisioner log
 echo ""
 echo "  GPU core-hours (node1 provisioner log):"
 TOTAL_WALL=\$((PHASE1_WALL + PHASE2_WALL))
 python3 tests/compute_gpu_energy.py \
-    --log   ~/vllm_logs/prov_upgrade_node1.log \
-    --wall  \$TOTAL_WALL \
-    --label "Upgrade experiment" \
+    --log         ~/vllm_logs/prov_upgrade_node1.log \
+    --wall        \$TOTAL_WALL \
+    --start-epoch \$PROV_START \
+    --label       "Upgrade experiment" \
     | tee -a "\$RESULTS_DIR/compare_upgrade.txt"
 
 # ── Done ──────────────────────────────────────────────────────────────────────
@@ -313,15 +392,16 @@ echo ""
 echo "=================================================================="
 echo "  Upgrade test complete!  \$(date)"
 echo "  Results: \$RESULTS_DIR/"
-echo "    phase1_old_coder.csv   Phase 1: coder-32b (dense 32B, 4 GPUs)"
+echo "    phase1_old_coder.csv   Phase 1: coder-32b (dense 32B, 2 GPUs)"
 echo "    phase2_new_coder.csv   Phase 2: qwen3-coder-30b (MoE 30B, 2 GPUs)"
 echo "    compare_upgrade.txt    Full comparison"
 echo ""
 echo "  Expected result:"
-echo "    Phase 1: 98%+ traffic → coder-32b, P50~12s"
-echo "    Phase 2: 98%+ traffic → qwen3-coder-30b, P50~3s (4x faster)"
-echo "    Accuracy: maintained (~97% code:easy+medium for both)"
-echo "    Zero downtime: no failed requests during upgrade"
+echo "    Phase 1: 100% traffic → coder-32b, P50~16-20s (32B dense, 2 GPU)"
+echo "    Phase 2: 100% traffic → qwen3-coder-30b, P50~3-6s (MoE 3.3B active)"
+echo "    Accuracy: maintained (~43% real execution, both phases)"
+echo "    Zero downtime: 0 errors during upgrade event"
+echo "    coder-32b retired: provisioner SPIN DOWN after TTCA ratio >= 1.5x"
 echo "=================================================================="
 PBSEOF
 
@@ -332,8 +412,10 @@ echo "  Priors     : $PRIORS"
 echo "  Walltime   : 04:00:00"
 echo "  Log dir    : $LOG_DIR/"
 echo ""
-echo "  Key fix: qwen3-coder-30b launched via direct vllm serve on GPU 6,7"
-echo "           then registered with router REST API (no second provisioner)."
+echo "  Key changes:"
+echo "    - coder-32b on 2 GPUs (equal to qwen3-coder-30b, fair comparison)"
+echo "    - Pre-warm on same workload before Phase 2 (fair TTCA measurement)"
+echo "    - Provisioner auto-retires coder-32b via TTCA supersession trigger"
 echo ""
 
 JOBID=$(qsub "$PBSSCRIPT")
@@ -345,5 +427,5 @@ echo "Monitor:"
 echo "  qstat -u yuping"
 echo "  tail -f $LOG_DIR/job.out"
 echo ""
-echo "Check upgrade migration:"
-echo "  grep 'qwen3-coder-30b registered' $LOG_DIR/job.out"
+echo "Watch for supersession:"
+echo "  grep -E 'SUPERSESSION_CHECK|SPIN DOWN coder-32b' ~/vllm_logs/prov_upgrade_node1.log"
