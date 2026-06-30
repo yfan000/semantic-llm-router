@@ -435,6 +435,8 @@ class DynamicProvisioner:
 
         GPU guard: new model must not use more GPUs than old model, preventing
         llama4-scout (8 GPUs) from retiring qwen3-coder-30b (2 GPUs).
+
+        Safe to call in static mode: only retires old models, never spins up new ones.
         """
         managed_ids  = set(self.running)
         external_ids = set(reputation) - managed_ids
@@ -1092,7 +1094,7 @@ class DynamicProvisioner:
                 candidates.sort(key=lambda x: (x[0].gpus_needed, -x[1]))
                 best, best_acc = candidates[0]
                 log.info("  Strategy A downgrade: %s (%d GPUs, acc=%.3f) for %s "
-                         "(current=%.3f is high → trade quality for speed)",
+                         "(current=%.3f is high -> trade quality for speed)",
                          best.model_id, best.gpus_needed, best_acc, domain, current_acc)
                 return await self.spin_up(
                     best.model_id,
@@ -1119,7 +1121,7 @@ class DynamicProvisioner:
                 if acc is not None and acc < MIN_ACCEPTABLE_ACCURACY:
                     continue
                 log.info(
-                    "  Strategy B upgrade (no replica): %s → %s "
+                    "  Strategy B upgrade (no replica): %s -> %s "
                     "(queue=%d, domain=%s, acc=%.3f)",
                     overloaded_id, next_model, queue_depth, upgrade_domain, acc or 0,
                 )
@@ -1164,9 +1166,17 @@ class DynamicProvisioner:
             try:
                 log.info("--- Poll: %d models running, %d GPUs free ---",
                          len(self.running), self.gpu_pool.free_count())
+                # Always drain the router spin-up queue first (router-triggered spin-ups
+                # take priority over the provisioner's own reactive decisions).
                 await self._process_spin_up_queue()
                 if static:
+                    # Static mode: no reactive spin-up/down, but still check for
+                    # dead processes and supersession (retiring externally-superseded
+                    # models does not constitute reactive scaling).
                     await self._check_dead_processes()
+                    reputation = await self._get_router_reputation()
+                    await self._check_supersession_candidates(reputation)
+                    await self._check_drain_deadlines()
                 else:
                     await self.evaluate_and_act()
             except Exception as e:
@@ -1233,7 +1243,7 @@ def main() -> None:
                         help="Comma-separated list of model IDs to start immediately")
     parser.add_argument("--static", action="store_true",
                         help="Disable auto-scaling: spin up initial models and only route, "
-                             "no further spin-up or spin-down decisions")
+                             "no further spin-up or spin-down decisions (supersession still runs)")
     parser.add_argument("--node-host", default="localhost",
                         help="Hostname or IP of this node, used as base_url when registering "
                              "models with the router. Set to the node's hostname when running "
