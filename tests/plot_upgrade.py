@@ -31,7 +31,7 @@ from collections import Counter
 from statistics import median
 
 
-# ── Data loading ────────────────────────────────────────────────────────────────────────────────────
+# ── Data loading ──────────────────────────────────────────────────────────────
 
 def load_csv(path: str) -> list[dict]:
     try:
@@ -49,7 +49,7 @@ def safe_float(v: str, default: float = 0.0) -> float:
         return default
 
 
-# ── Time-series computation ───────────────────────────────────────────────────────────────────────────
+# ── Time-series computation ───────────────────────────────────────────────────
 
 def make_timeline(rows1: list[dict], rows2: list[dict], bin_size: int = 30) -> dict:
     """
@@ -128,7 +128,7 @@ def make_timeline(rows1: list[dict], rows2: list[dict], bin_size: int = 30) -> d
     }
 
 
-# ── Figure ─────────────────────────────────────────────────────────────────────────────────
+# ── Figure ────────────────────────────────────────────────────────────────────
 
 def plot_figure(
     rows1: list[dict],
@@ -160,7 +160,7 @@ def plot_figure(
     fig, (ax_top, ax_bot) = plt.subplots(2, 1, figsize=(9, 5), sharex=False)
     fig.subplots_adjust(hspace=0.35)
 
-    # ── Panel A: routing distribution ─────────────────────────────────────────────────────
+    # ── Panel A: routing distribution ────────────────────────────────────────
     xs = [b["x_center"] for b in all_bins]
     models_seen = set()
     for b in all_bins:
@@ -212,7 +212,7 @@ def plot_figure(
     ax_top.text(mid2, -16, "Phase 2\n(qwen3-coder-30b)", ha="center", va="top", fontsize=7.5,
                 color="#55A868", transform=ax_top.get_xaxis_transform())
 
-    # ── Panel B: P50 latency per window ────────────────────────────────────────────────────
+    # ── Panel B: P50 latency per window ──────────────────────────────────────
     for model, color in [(old_model, "#4C72B0"), (new_model, "#55A868")]:
         lx, ly = [], []
         for b in all_bins:
@@ -248,7 +248,7 @@ def plot_figure(
     plt.close()
 
 
-# ── LaTeX table ────────────────────────────────────────────────────────────────────────────────────
+# ── LaTeX table ───────────────────────────────────────────────────────────────
 
 def print_latex_table(
     rows1: list[dict],
@@ -272,9 +272,22 @@ def print_latex_table(
             "acc":    correct / max(len(ok), 1) * 100,
         }
 
-    # Steady-state latency from pre-warm (intrinsic, low-concurrency)
-    wup_new = [r for r in warmup if r.get("model_winner") == "qwen3-coder-30b"]
-    p50_new_intrinsic = median(safe_float(r["wall_ms"]) / 1000 for r in wup_new) if wup_new else 0.0
+    # Steady-state latency from pre-warm (intrinsic, low-concurrency).
+    # Fallback chain: warmup rows → Phase 2 rows → Phase 1 P50 (last resort).
+    wup_new = [r for r in warmup if r.get("model_winner") == "qwen3-coder-30b"
+               and (r.get("status") == "200" or r.get("status") == 200)]
+    if wup_new:
+        p50_new_intrinsic = median(safe_float(r["wall_ms"]) / 1000 for r in wup_new)
+        p50_source = "pre-warm"
+    else:
+        # Warmup had 0 qwen3-coder-30b rows — fall back to Phase 2 measurements
+        p2_new = stats(rows2, "qwen3-coder-30b")
+        if p2_new["n"] > 0:
+            p50_new_intrinsic = p2_new["p50_s"]
+            p50_source = "Phase 2 (load test)"
+        else:
+            p50_new_intrinsic = stats(rows1, "coder-32b")["p50_s"]
+            p50_source = "Phase 1 fallback (no qwen3 data)"
 
     p1 = stats(rows1, "coder-32b")
     p2e = stats(rows2)               # full Phase 2 energy (both models mixed)
@@ -287,46 +300,46 @@ def print_latex_table(
     lat_delta    = (p1["p50_s"] - p50_new_intrinsic) / max(p1["p50_s"], 1) * 100
 
     table = rf"""
-% ─── Paper Table: Zero-downtime model upgrade ───────────────────────────────────────────────────
+% --- Paper Table: Zero-downtime model upgrade ---
 % Phase 1 = coder-32b (dense 32B), Phase 2 = qwen3-coder-30b (MoE 3.3B active)
-% Both models use 2 A100 GPUs. Pre-warm measures intrinsic latency (concurrency=5).
+% Both models use 2 A100 GPUs. Latency source: {p50_source}
 
-\\begin{{table}}[t]
-\\centering
-\\caption{{Automatic zero-downtime model upgrade: coder-32b $\\to$ qwen3-coder-30b.
-  Both models use 2 A100 GPUs. Latency measured at concurrency=5 (intrinsic).
-  TTCA ratio {ttca_ratio:.2f}$\\times$ $>$ {threshold:.1f}$\\times$ threshold triggered automatic supersession.}}
-\\label{{tab:upgrade}}
-\\small
-\\begin{{tabular}}{{lccr}}
-\\toprule
+\begin{{table}}[t]
+\centering
+\caption{{Automatic zero-downtime model upgrade: coder-32b $\to$ qwen3-coder-30b.
+  Both models use 2 A100 GPUs.
+  TTCA ratio {ttca_ratio:.2f}$\times$ $>$ {threshold:.1f}$\times$ threshold triggered automatic supersession.}}
+\label{{tab:upgrade}}
+\small
+\begin{{tabular}}{{lccr}}
+\toprule
 Metric & coder-32b & qwen3-coder-30b & Change \\\\
-\\midrule
-Model params (active) & 32B & 3.3B (MoE) & — \\\\
-GPU count & 2 $\\times$ A100 & 2 $\\times$ A100 & — \\\\
-Latency P50 & {p1['p50_s']:.1f}s & {p50_new_intrinsic:.1f}s & $-{lat_delta:.0f}\\%$ \\\\
-Energy / request & {p1['energy']:.0f}\\,J & {p2e['energy']:.0f}\\,J & $-{energy_delta:.0f}\\%$ \\\\
-First-try accuracy & {p1['acc']:.0f}\\% & {stats(rows2)['acc']:.0f}\\% & $\\approx$ \\\\
-Service interruption & — & {errors1 + errors2} / {total_requests} errors & zero \\\\
-Migration time & — & $\\approx$90\\,s & — \\\\
-TTCA ratio & — & {ttca_ratio:.2f}$\\times$ & $>{threshold:.1f}\\times$ threshold \\\\
-\\bottomrule
-\\end{{tabular}}
-\\end{{table}}
+\midrule
+Model params (active) & 32B & 3.3B (MoE) & --- \\\\
+GPU count & 2 $\times$ A100 & 2 $\times$ A100 & --- \\\\
+Latency P50 & {p1['p50_s']:.1f}s & {p50_new_intrinsic:.1f}s & $-{lat_delta:.0f}\%$ \\\\
+Energy / request & {p1['energy']:.0f}\,J & {p2e['energy']:.0f}\,J & $-{energy_delta:.0f}\%$ \\\\
+First-try accuracy & {p1['acc']:.0f}\% & {stats(rows2)['acc']:.0f}\% & $\approx$ \\\\
+Service interruption & --- & {errors1 + errors2} / {total_requests} errors & zero \\\\
+Migration time & --- & $\approx$90\,s & --- \\\\
+TTCA ratio & --- & {ttca_ratio:.2f}$\times$ & $>{threshold:.1f}\times$ threshold \\\\
+\bottomrule
+\end{{tabular}}
+\end{{table}}
 """
     print(table)
 
     # Also print a human-readable summary
-    print("  ── Summary ──────────────────────────────────────────────────")
+    print("  -- Summary ------------------------------------------------")
     print(f"  Phase 1 (coder-32b):       P50={p1['p50_s']:.1f}s  energy={p1['energy']:.0f}J/req  acc={p1['acc']:.0f}%")
-    print(f"  Phase 2 (qwen3-coder-30b): P50={p50_new_intrinsic:.1f}s (intrinsic)  energy={p2e['energy']:.0f}J/req  acc={stats(rows2)['acc']:.0f}%")
-    print(f"  Latency improvement : {lat_delta:.0f}% (pre-warm measurement, concurrency=5)")
+    print(f"  Phase 2 (qwen3-coder-30b): P50={p50_new_intrinsic:.1f}s ({p50_source})  energy={p2e['energy']:.0f}J/req  acc={stats(rows2)['acc']:.0f}%")
+    print(f"  Latency improvement : {lat_delta:.0f}% (source: {p50_source})")
     print(f"  Energy improvement  : {energy_delta:.0f}%")
     print(f"  Total errors        : {errors1 + errors2} / {total_requests}")
     print(f"  TTCA ratio          : {ttca_ratio:.2f}x (threshold {threshold:.1f}x)")
 
 
-# ── CLI ────────────────────────────────────────────────────────────────────────────────────
+# ── CLI ───────────────────────────────────────────────────────────────────────
 
 def main() -> None:
     parser = argparse.ArgumentParser(
