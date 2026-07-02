@@ -68,13 +68,13 @@ RESULTS_DIR="results/upgrade_test_${TS}"
 mkdir -p "\$RESULTS_DIR"
 
 echo "=================================================================="
-echo "  Model Upgrade Demo: coder-32b → qwen3-coder-30b   \$(date)"
+echo "  Model Upgrade Demo: coder-32b -> qwen3-coder-30b   \$(date)"
 echo "  NODE1 : \$NODE1"
 echo "  N_PHASE    : ${N_PHASE} requests per phase"
 echo "  CONCURRENCY: ${CONCURRENCY}"
 echo "=================================================================="
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# -- Helpers -------------------------------------------------------------------
 wait_router() {
     for i in \$(seq 1 60); do
         curl --noproxy '*' -sf "\$ROUTER_URL/router/health" > /dev/null 2>&1 && return 0
@@ -97,8 +97,8 @@ wait_models() {
 }
 wait_port_inference() {
     # Two-phase wait: (1) /health passes, (2) actual inference succeeds.
-    # Needed because vLLM reports healthy before CUDA graphs are compiled.
-    # Phase 1: wait up to 40 min for /health
+    # vLLM reports /health before CUDA graphs are compiled — inference
+    # can still fail for several minutes after /health passes.
     local PORT=\$1
     echo "  Waiting for port \$PORT /health (up to 40 min)..."
     for i in \$(seq 1 240); do
@@ -107,15 +107,15 @@ wait_port_inference() {
         sleep 10
     done
     echo "  /health OK. Verifying inference (CUDA graphs may still compile)..."
-    # Phase 2: wait up to 10 more min for real inference to succeed
     for i in \$(seq 1 60); do
         result=\$(python3 -c "
 import httpx, time, sys
 t0 = time.monotonic()
 try:
     r = httpx.post('http://localhost:\${PORT}/v1/chat/completions',
-        json={'model':'auto','messages':[{'role':'user','content':'Write a Python function to add two numbers.'}]},
-        timeout=60, transport=httpx.HTTPTransport(retries=0))
+        json={'model':'Qwen/Qwen3-Coder-30B-A3B-Instruct',
+              'messages':[{'role':'user','content':'Write a Python function to add two numbers.'}]},
+        timeout=60)
     lat = (time.monotonic()-t0)*1000
     print(f'OK:{r.status_code}:{lat:.0f}')
 except Exception as e:
@@ -125,7 +125,7 @@ except Exception as e:
         case "\$result" in OK:200:*) echo "  Port \$PORT inference verified."; return 0 ;; esac
         sleep 10
     done
-    echo "WARNING: port \$PORT inference not verified after 50 min total — proceeding"
+    echo "WARNING: port \$PORT inference not verified after 50 min total -- proceeding"
 }
 show_routing() {
     local path=\$1
@@ -143,14 +143,13 @@ print(f'  P50 lat  : {p50:.2f}s  P95: {p95:.2f}s')
 "
 }
 
-# ── Generate code workload (easy+medium for clear accuracy numbers) ─────────
+# -- Generate code workload ---------------------------------------------------
 echo ""
 echo "[0] Generating code workload (N=${N_PHASE}, easy+medium only)..."
 python3 -c "
 import json, random
 random.seed(42)
 data = json.load(open('${DATASET}'))
-# easy+medium code for cleaner accuracy (avoids code:hard scoring noise)
 code = [x for x in data if x.get('domain')=='code'
         and x.get('complexity') in ('easy','medium')]
 sample = random.sample(code, min(${N_PHASE}, len(code)))
@@ -160,7 +159,7 @@ print(f'  Workload: {len(sample)} code requests')
 print(f'  Complexity: {dict(Counter(x[\"complexity\"] for x in sample))}')
 "
 
-# ── Start router ──────────────────────────────────────────────────────────────
+# -- Start router -------------------------------------------------------------
 echo ""
 echo "[1] Starting router..."
 nohup uvicorn semantic_router.main:app \
@@ -168,11 +167,9 @@ nohup uvicorn semantic_router.main:app \
     > ~/vllm_logs/router_upgrade.log 2>&1 &
 sleep 8; wait_router; echo "  Router ready."
 
-# ── Phase 1: Start fleet with OLD coder (coder-32b) ──────────────────────────
+# -- Phase 1: OLD coder (coder-32b) ------------------------------------------
 echo ""
-echo "[2] Phase 1 fleet: qwen-7b(1GPU) + deepseek-r1-7b(1GPU) + coder-32b(2GPU)"
-echo "    GPU allocation: 0=qwen-7b, 1=deepseek-r1-7b, 2-3=coder-32b, 4-7=FREE"
-echo "    (equal GPUs for fair comparison: both coders on 2 GPUs)"
+echo "[2] Phase 1 fleet: qwen-7b(GPU0) + deepseek-r1-7b(GPU1) + coder-32b(GPU2,3)"
 PROV_START=\$(date +%s)
 nohup python provisioner/dynamic_provisioner.py \
     --router-url  "\$ROUTER_URL" \
@@ -183,16 +180,13 @@ nohup python provisioner/dynamic_provisioner.py \
     --initial-models "qwen-7b,deepseek-r1-7b,coder-32b" \
     > ~/vllm_logs/prov_upgrade_node1.log 2>&1 &
 
-echo ""
 echo "  Waiting for Phase 1 fleet (coder-32b takes ~15 min to load 65GB)..."
 wait_models 3
-
 echo ""
 echo "  Phase 1 models registered:"
 curl --noproxy '*' -sf "\$ROUTER_URL/v1/models" \
     | python3 -c "import sys,json; [print(f'    {m[\"id\"]}') for m in json.load(sys.stdin)['data']]"
 
-# ── Phase 1 workload ──────────────────────────────────────────────────────────
 echo ""
 echo "[3] Phase 1: ${N_PHASE} code requests with OLD coder (coder-32b)..."
 PHASE1_START=\$(date +%s)
@@ -208,18 +202,11 @@ PHASE1_WALL=\$((PHASE1_END - PHASE1_START))
 echo "  Phase 1 wall time: \${PHASE1_WALL}s"
 show_routing "\$RESULTS_DIR/phase1_old_coder.csv"
 
-# ── UPGRADE EVENT: start qwen3-coder-30b directly on free GPUs 4,5 ───────────
+# -- UPGRADE EVENT -----------------------------------------------------------
 echo ""
 echo "=================================================================="
 echo "  *** UPGRADE EVENT: Deploying qwen3-coder-30b on GPU 4,5 ***"
-echo "      MoE 30B (3.3B active), 2 GPUs — same GPU count as coder-32b"
-echo "      Method: direct vllm serve + router REST API registration"
-echo "      Provisioner will detect supersession via TTCA comparison"
-echo "      and retire coder-32b automatically after pre-warm."
 echo "=================================================================="
-
-# Launch vllm directly on the free GPUs (4 and 5)
-# coder-32b uses GPUs 2,3 (provisioner-allocated); 4,5,6,7 are free
 CUDA_VISIBLE_DEVICES=4,5 MASTER_PORT=29502 \
 nohup vllm serve Qwen/Qwen3-Coder-30B-A3B-Instruct \
     --port 8002 \
@@ -230,11 +217,9 @@ nohup vllm serve Qwen/Qwen3-Coder-30B-A3B-Instruct \
 UPGRADE_PID=\$!
 echo "  qwen3-coder-30b starting (PID=\$UPGRADE_PID)..."
 
-# Wait for the new model: /health + inference verified (up to 50 min total)
 echo "  Waiting for qwen3-coder-30b health + inference verify..."
 wait_port_inference 8002
 
-# Register with router via REST API
 echo "  Registering qwen3-coder-30b with router..."
 PRIORS_JSON=\$(python3 -c "
 import json
@@ -262,19 +247,12 @@ echo "  Models now registered (both coders available):"
 curl --noproxy '*' -sf "\$ROUTER_URL/v1/models" \
     | python3 -c "import sys,json; [print(f'    {m[\"id\"]}') for m in json.load(sys.stdin)['data']]"
 
-# Pre-warm qwen3-coder-30b for fair TTCA comparison.
-#
-# v3 bug: coder-32b EMA built from 300 real requests at concurrency=50 (Phase 1).
-# qwen3-coder-30b EMA came from timeout errors (model still loading) — unfair.
-#
-# Fix: Two-step pre-warm ensures qwen3-coder-30b is measured fairly.
-# Step A — Direct pre-warm (port 8002, bypasses router): warms CUDA graphs,
-#          verifies the model handles real inference before router comparison.
-# Step B — Router pre-warm (concurrency=10): router's reputation tracker gets
-#          real latency samples from actual qwen3-coder-30b responses.
+# -- Pre-warm: two steps for fair TTCA comparison ----------------------------
+# Step A: direct to port 8002 — warms CUDA graphs, verifies real inference
+#         Uses the real model name so vLLM accepts the request (not 'auto').
+# Step B: via router — populates reputation tracker EMA for qwen3-coder-30b.
 echo ""
-echo "  Step A: Direct pre-warm of qwen3-coder-30b (50 req → port 8002, concurrency=10)..."
-echo "  (same workload prompts as Phase 1; warms CUDA graphs before router comparison)"
+echo "  Step A: Direct pre-warm of qwen3-coder-30b (50 req, port 8002, concurrency=10)..."
 python3 << 'PREWARM_EOF'
 import httpx, json, time, asyncio, random
 
@@ -289,7 +267,8 @@ async def send_one(client, item, idx):
     t0 = time.monotonic()
     try:
         r = await client.post('http://localhost:8002/v1/chat/completions',
-            json={'model':'auto','messages':[{'role':'user','content':item['query']}]})
+            json={'model':'Qwen/Qwen3-Coder-30B-A3B-Instruct',
+                  'messages':[{'role':'user','content':item['query']}]})
         lat = (time.monotonic()-t0)*1000
         lats.append(lat)
         if idx % 10 == 0:
@@ -315,16 +294,15 @@ if lats:
     print(f'\n  Direct pre-warm: n={len(lats)} ok, {errors} errors')
     print(f'  P50={p50:.0f}ms  P95={p95:.0f}ms')
     if p50 < 20000:
-        print(f'  qwen3-coder-30b appears healthy (P50<20s)')
+        print(f'  qwen3-coder-30b healthy (P50<20s)')
     else:
-        print(f'  WARNING: qwen3-coder-30b still slow (P50={p50/1000:.1f}s) — may still be loading')
+        print(f'  WARNING: still slow (P50={p50/1000:.1f}s) -- may still be loading')
 else:
-    print(f'  WARNING: all {errors} direct pre-warm requests failed — model may not be ready')
+    print(f'  WARNING: all {errors} requests failed -- model not ready')
 PREWARM_EOF
 
 echo ""
-echo "  Step B: Router pre-warm (30 req, concurrency=10) to populate reputation tracker..."
-echo "  (router now knows qwen3-coder-30b is healthy → will route to it)"
+echo "  Step B: Router pre-warm (30 req, concurrency=10)..."
 python tests/load_test.py \
     --dataset     /tmp/upgrade_workload.json \
     --router      "\$ROUTER_URL" \
@@ -332,9 +310,8 @@ python tests/load_test.py \
     --requests    30 \
     --concurrency 10 \
     --output      /tmp/warmup_results.csv
-echo "  Pre-warm complete. Reputation tracker has latency data for both coders."
+echo "  Pre-warm complete."
 
-# Show measured TTCA scores after pre-warm
 echo ""
 echo "  Measured TTCA scores after pre-warm:"
 python3 -c "
@@ -351,14 +328,13 @@ if rows_p:
     print(f'    coder-32b:       acc={old_acc:.2f}, P50={old_lat/1000:.2f}s  TTCA={old_acc/old_lat:.7f}')
     if rows_w:
         ratio = (new_acc/new_lat) / (old_acc/old_lat) if (old_acc/old_lat) > 0 else float('inf')
-        print(f'    TTCA ratio: {ratio:.2f}x  (threshold=1.5x for supersession)')
+        print(f'    TTCA ratio: {ratio:.2f}x  (threshold=1.5x)')
 " 2>/dev/null || true
 
 echo ""
 echo "  Provisioner will detect supersession at next poll cycle (~30s)..."
-echo "  Watch for: SUPERSESSION_CHECK and SPIN DOWN coder-32b in provisioner log"
 
-# ── Phase 2 workload — SAME requests, TTCA should prefer new model ────────────
+# -- Phase 2 workload ---------------------------------------------------------
 echo ""
 echo "[4] Phase 2: ${N_PHASE} SAME code requests after upgrade..."
 PHASE2_START=\$(date +%s)
@@ -374,12 +350,11 @@ PHASE2_WALL=\$((PHASE2_END - PHASE2_START))
 echo "  Phase 2 wall time: \${PHASE2_WALL}s"
 show_routing "\$RESULTS_DIR/phase2_new_coder.csv"
 
-# ── Full comparison ───────────────────────────────────────────────────────────
+# -- Full comparison ----------------------------------------------------------
 echo ""
 echo "=================================================================="
 echo "  UPGRADE COMPARISON"
 echo "=================================================================="
-
 echo ""
 echo "=== Phase 1 (coder-32b) vs Phase 2 (qwen3-coder-30b) ===" \
     | tee "\$RESULTS_DIR/compare_upgrade.txt"
@@ -417,12 +392,10 @@ report('\$RESULTS_DIR/phase1_old_coder.csv', 'Phase 1', '2', 'dense 32B')
 report('\$RESULTS_DIR/phase2_new_coder.csv', 'Phase 2', '2', 'MoE 30B')
 " | tee -a "\$RESULTS_DIR/compare_upgrade.txt"
 
-# ── Wait for provisioner to retire coder-32b via supersession trigger ────────
+# -- Wait for coder-32b retirement -------------------------------------------
 echo ""
 echo "=================================================================="
 echo "  Waiting for provisioner to retire coder-32b (up to 3 min)..."
-echo "  The provisioner compares TTCA scores every 30s poll cycle."
-echo "  Once ratio >= 1.5x, it deregisters coder-32b and drains (60s)."
 echo "=================================================================="
 RETIRE_TIMEOUT=180
 RETIRED=0
@@ -433,7 +406,6 @@ for i in \$(seq 1 \$RETIRE_TIMEOUT); do
         echo "  coder-32b retired! GPUs 2,3 freed. (\${i}s after Phase 2)"
         break
     fi
-    # Also check for immediate deregister
     if grep -q "reason=superseded_by=qwen3-coder-30b" \
             ~/vllm_logs/prov_upgrade_node1.log 2>/dev/null && [ "\$i" -gt 60 ]; then
         RETIRED=1
@@ -442,22 +414,15 @@ for i in \$(seq 1 \$RETIRE_TIMEOUT); do
     fi
     sleep 1
 done
+[ "\$RETIRED" -eq 0 ] && echo "  WARNING: coder-32b not retired within \${RETIRE_TIMEOUT}s"
 
-if [ "\$RETIRED" -eq 0 ]; then
-    echo "  WARNING: coder-32b not retired within \${RETIRE_TIMEOUT}s"
-    echo "  Check provisioner log: ~/vllm_logs/prov_upgrade_node1.log"
-    echo "  Look for: SUPERSESSION_CHECK and SPIN DOWN coder-32b"
-fi
-
-# Show supersession log entries
 echo ""
 echo "  Supersession log:"
-grep -E "SUPERSESSION_CHECK|RETIRE|SPIN DOWN coder-32b|drain_complete" \
-    ~/vllm_logs/prov_upgrade_node1.log 2>/dev/null | tail -10 || echo "  (no entries yet)"
+grep -E "SUPERSESSION_CHECK|SPIN DOWN coder-32b|drain_complete" \
+    ~/vllm_logs/prov_upgrade_node1.log 2>/dev/null | tail -10 || echo "  (no entries)"
 
-# GPU energy from provisioner log
+# -- GPU energy ---------------------------------------------------------------
 echo ""
-echo "  GPU core-hours (node1 provisioner log):"
 TOTAL_WALL=\$((PHASE1_WALL + PHASE2_WALL))
 python3 tests/compute_gpu_energy.py \
     --log         ~/vllm_logs/prov_upgrade_node1.log \
@@ -466,7 +431,7 @@ python3 tests/compute_gpu_energy.py \
     --label       "Upgrade experiment" \
     | tee -a "\$RESULTS_DIR/compare_upgrade.txt"
 
-# ── Paper figure + LaTeX table ────────────────────────────────────────────────
+# -- Paper figure + LaTeX table ----------------------------------------------
 echo ""
 echo "=================================================================="
 echo "  Generating paper figure and LaTeX table..."
@@ -499,7 +464,6 @@ python3 tests/plot_upgrade.py \
 echo "  Figure: \$RESULTS_DIR/upgrade_figure.pdf"
 echo "  LaTeX:  \$RESULTS_DIR/upgrade_table.tex"
 
-# ── Done ──────────────────────────────────────────────────────────────────────
 echo ""
 echo "=================================================================="
 echo "  Upgrade test complete!  \$(date)"
@@ -507,15 +471,8 @@ echo "  Results: \$RESULTS_DIR/"
 echo "    phase1_old_coder.csv   Phase 1: coder-32b (dense 32B, 2 GPUs)"
 echo "    phase2_new_coder.csv   Phase 2: qwen3-coder-30b (MoE 30B, 2 GPUs)"
 echo "    compare_upgrade.txt    Full comparison"
-echo "    upgrade_figure.pdf     Paper figure (routing timeline + latency)"
-echo "    upgrade_table.tex      LaTeX table for paper"
-echo ""
-echo "  Expected result:"
-echo "    Phase 1: 100% traffic → coder-32b, P50~15s (32B dense, 2 GPU)"
-echo "    Pre-warm: qwen3-coder-30b P50 < coder-32b (MoE faster when warm)"
-echo "    TTCA ratio > 1.5x → supersession fires"
-echo "    Phase 2: 100% traffic → qwen3-coder-30b (coder-32b deregistered)"
-echo "    Zero downtime: 0 errors during upgrade event"
+echo "    upgrade_figure.pdf     Paper figure"
+echo "    upgrade_table.tex      LaTeX table"
 echo "=================================================================="
 PBSEOF
 
@@ -523,13 +480,8 @@ echo "Submitting model upgrade test..."
 echo "  N_PHASE    : $N_PHASE requests per phase"
 echo "  CONCURRENCY: $CONCURRENCY"
 echo "  Priors     : $PRIORS"
-echo "  Walltime   : 05:00:00 (extended for qwen3-coder-30b load + verify)"
+echo "  Walltime   : 05:00:00"
 echo "  Log dir    : $LOG_DIR/"
-echo ""
-echo "  Key fixes:"
-echo "    - wait_port_inference: 40 min health + inference verify (not just /health)"
-echo "    - Step A: 50 direct pre-warm requests to port 8002 (warms CUDA graphs)"
-echo "    - Step B: 30 router pre-warm at concurrency=10 (populates reputation EMA)"
 echo ""
 
 JOBID=$(qsub "$PBSSCRIPT")
