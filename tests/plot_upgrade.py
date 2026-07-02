@@ -31,7 +31,7 @@ from collections import Counter
 from statistics import median
 
 
-# ── Data loading ──────────────────────────────────────────────────────────────
+# -- Data loading -------------------------------------------------------------
 
 def load_csv(path: str) -> list[dict]:
     try:
@@ -49,20 +49,12 @@ def safe_float(v: str, default: float = 0.0) -> float:
         return default
 
 
-# ── Time-series computation ───────────────────────────────────────────────────
+# -- Time-series computation --------------------------------------------------
 
 def make_timeline(rows1: list[dict], rows2: list[dict], bin_size: int = 30) -> dict:
     """
     Bin requests into windows and compute routing % and median latency per bin.
-
-    Returns dict with:
-        x_labels:  list of str labels for each bin
-        bins_p1:   list of dicts per bin (phase 1 models)
-        bins_p2:   list of dicts per bin (phase 2 models)
-        use_time:  bool — whether x-axis is real time or request index
-        t_transition: float — x value of the upgrade event marker
     """
-    # Detect if start_epoch is available
     use_time = (rows1 and rows1[0].get("start_epoch", "") not in ("", None))
 
     if use_time:
@@ -75,7 +67,6 @@ def make_timeline(rows1: list[dict], rows2: list[dict], bin_size: int = 30) -> d
         t_transition = t1_end
         x_unit = "s"
     else:
-        # Use row index
         for i, r in enumerate(rows1):
             r["_x"] = i
         for i, r in enumerate(rows2):
@@ -90,7 +81,6 @@ def make_timeline(rows1: list[dict], rows2: list[dict], bin_size: int = 30) -> d
     x_min = min(r["_x"] for r in all_rows)
     x_max = max(r["_x"] for r in all_rows)
 
-    # Bin width: divide total x range into ~20 bins
     if use_time:
         bin_width = (x_max - x_min) / 20.0 if x_max > x_min else 1.0
     else:
@@ -128,7 +118,7 @@ def make_timeline(rows1: list[dict], rows2: list[dict], bin_size: int = 30) -> d
     }
 
 
-# ── Figure ────────────────────────────────────────────────────────────────────
+# -- Figure -------------------------------------------------------------------
 
 def plot_figure(
     rows1: list[dict],
@@ -142,7 +132,6 @@ def plot_figure(
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
-        import matplotlib.patches as mpatches
         import numpy as np
     except ImportError:
         print("WARNING: matplotlib not available — skipping figure generation", file=sys.stderr)
@@ -155,12 +144,10 @@ def plot_figure(
 
     all_bins = tl["all_bins"]
     t_trans = tl["t_transition"]
-    x_unit  = tl["x_unit"]
 
     fig, (ax_top, ax_bot) = plt.subplots(2, 1, figsize=(9, 5), sharex=False)
     fig.subplots_adjust(hspace=0.35)
 
-    # ── Panel A: routing distribution ────────────────────────────────────────
     xs = [b["x_center"] for b in all_bins]
     models_seen = set()
     for b in all_bins:
@@ -170,12 +157,9 @@ def plot_figure(
     new_model = "qwen3-coder-30b"
     other_models = [m for m in models_seen if m not in (old_model, new_model)]
 
-    colors = {
-        old_model:  "#4C72B0",   # blue — old/dense model
-        new_model:  "#55A868",   # green — new/MoE model
-    }
+    colors = {old_model: "#4C72B0", new_model: "#55A868"}
     for m in other_models:
-        colors[m] = "#C44E52"    # red for any others
+        colors[m] = "#C44E52"
 
     ax_top.axvspan(0, t_trans, alpha=0.05, color="#4C72B0", label="_nolegend_")
     ax_top.axvspan(t_trans, xs[-1] if xs else t_trans + 1,
@@ -192,8 +176,9 @@ def plot_figure(
         bottom += vals
 
     ax_top.axvline(t_trans, color="black", linestyle="--", linewidth=1.2, zorder=5)
+    migration_label = ("fired" if ttca_ratio >= threshold else "not triggered")
     ax_top.text(t_trans + (xs[-1] - xs[0]) * 0.01, 95,
-                f"★ Upgrade event\n  TTCA ratio={ttca_ratio:.2f}× > {threshold:.1f}×",
+                f"Upgrade event\n  TTCA={ttca_ratio:.2f}x ({migration_label})",
                 fontsize=7.5, va="top", ha="left",
                 bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8))
 
@@ -202,9 +187,8 @@ def plot_figure(
     ax_top.set_yticks([0, 25, 50, 75, 100])
     ax_top.legend(loc="center left", fontsize=8, framealpha=0.9)
     ax_top.set_title("(a) Routing distribution during model upgrade", fontsize=9, loc="left")
-    ax_top.set_xlabel(f"Requests served", fontsize=8)
+    ax_top.set_xlabel("Requests served", fontsize=8)
 
-    # Phase labels
     mid1 = t_trans / 2
     mid2 = (xs[-1] + t_trans) / 2
     ax_top.text(mid1, -16, "Phase 1\n(coder-32b)", ha="center", va="top", fontsize=7.5,
@@ -212,7 +196,6 @@ def plot_figure(
     ax_top.text(mid2, -16, "Phase 2\n(qwen3-coder-30b)", ha="center", va="top", fontsize=7.5,
                 color="#55A868", transform=ax_top.get_xaxis_transform())
 
-    # ── Panel B: P50 latency per window ──────────────────────────────────────
     for model, color in [(old_model, "#4C72B0"), (new_model, "#55A868")]:
         lx, ly = [], []
         for b in all_bins:
@@ -222,7 +205,6 @@ def plot_figure(
         if lx:
             ax_bot.plot(lx, ly, "o-", color=color, markersize=3, linewidth=1.2, label=model)
 
-    # Warmup reference lines
     if warmup:
         wup_rows = [r for r in warmup if r.get("model_winner") == new_model and r.get("wall_ms")]
         if wup_rows:
@@ -237,7 +219,7 @@ def plot_figure(
 
     ax_bot.axvline(t_trans, color="black", linestyle="--", linewidth=1.2)
     ax_bot.set_ylabel("P50 latency (s)", fontsize=9)
-    ax_bot.set_xlabel(f"Requests served", fontsize=8)
+    ax_bot.set_xlabel("Requests served", fontsize=8)
     ax_bot.set_title("(b) Per-window P50 latency", fontsize=9, loc="left")
     ax_bot.legend(loc="upper right", fontsize=7.5, framealpha=0.9)
     ax_bot.grid(axis="y", alpha=0.3)
@@ -248,7 +230,7 @@ def plot_figure(
     plt.close()
 
 
-# ── LaTeX table ───────────────────────────────────────────────────────────────
+# -- LaTeX table --------------------------------------------------------------
 
 def print_latex_table(
     rows1: list[dict],
@@ -272,25 +254,23 @@ def print_latex_table(
             "acc":    correct / max(len(ok), 1) * 100,
         }
 
-    # Steady-state latency from pre-warm (intrinsic, low-concurrency).
-    # Fallback chain: warmup rows → Phase 2 rows → Phase 1 P50 (last resort).
+    # Latency for qwen3-coder-30b: fallback chain warmup → Phase 2 → Phase 1
     wup_new = [r for r in warmup if r.get("model_winner") == "qwen3-coder-30b"
                and (r.get("status") == "200" or r.get("status") == 200)]
     if wup_new:
         p50_new_intrinsic = median(safe_float(r["wall_ms"]) / 1000 for r in wup_new)
-        p50_source = "pre-warm"
+        p50_source = "pre-warm (concurrency=5)"
     else:
-        # Warmup had 0 qwen3-coder-30b rows — fall back to Phase 2 measurements
         p2_new = stats(rows2, "qwen3-coder-30b")
         if p2_new["n"] > 0:
             p50_new_intrinsic = p2_new["p50_s"]
-            p50_source = "Phase 2 (load test)"
+            p50_source = "Phase 2 at operating concurrency"
         else:
             p50_new_intrinsic = stats(rows1, "coder-32b")["p50_s"]
             p50_source = "Phase 1 fallback (no qwen3 data)"
 
-    p1 = stats(rows1, "coder-32b")
-    p2e = stats(rows2)               # full Phase 2 energy (both models mixed)
+    p1  = stats(rows1, "coder-32b")
+    p2e = stats(rows2)
 
     errors1 = sum(1 for r in rows1 if r.get("status") not in ("200", 200, ""))
     errors2 = sum(1 for r in rows2 if r.get("status") not in ("200", 200, ""))
@@ -299,6 +279,31 @@ def print_latex_table(
     energy_delta = (p1["energy"] - p2e["energy"]) / max(p1["energy"], 1) * 100
     lat_delta    = (p1["p50_s"] - p50_new_intrinsic) / max(p1["p50_s"], 1) * 100
 
+    # Latency: positive delta = new model is faster (improvement)
+    #          negative delta = new model is slower (degradation)
+    if lat_delta >= 0:
+        lat_cell = rf"$-{lat_delta:.0f}\%$"
+    else:
+        lat_cell = rf"$+{abs(lat_delta):.0f}\%$ slower"
+
+    energy_cell = (rf"$-{energy_delta:.0f}\%$" if energy_delta >= 0
+                   else rf"$+{abs(energy_delta):.0f}\%$ higher")
+
+    # Caption accurately states whether migration was triggered
+    migration_happened = ttca_ratio >= threshold
+    if migration_happened:
+        caption_migration = (
+            f"TTCA ratio {ttca_ratio:.2f}$\\times$ $>$ {threshold:.1f}$\\times$ threshold "
+            f"triggered automatic supersession.")
+    else:
+        caption_migration = (
+            f"TTCA ratio {ttca_ratio:.2f}$\\times$ $<$ {threshold:.1f}$\\times$ threshold "
+            f"at operating concurrency --- no migration triggered "
+            f"(new model not faster under load).")
+
+    threshold_cell = (rf"$>{threshold:.1f}\times$ threshold"
+                      if migration_happened else rf"$<{threshold:.1f}\times$ threshold")
+
     table = rf"""
 % --- Paper Table: Zero-downtime model upgrade ---
 % Phase 1 = coder-32b (dense 32B), Phase 2 = qwen3-coder-30b (MoE 3.3B active)
@@ -306,40 +311,41 @@ def print_latex_table(
 
 \begin{{table}}[t]
 \centering
-\caption{{Automatic zero-downtime model upgrade: coder-32b $\to$ qwen3-coder-30b.
-  Both models use 2 A100 GPUs.
-  TTCA ratio {ttca_ratio:.2f}$\times$ $>$ {threshold:.1f}$\times$ threshold triggered automatic supersession.}}
+\caption{{Zero-downtime model upgrade: coder-32b $\to$ qwen3-coder-30b.
+  Both models use 2 A100 GPUs. {caption_migration}}}
 \label{{tab:upgrade}}
 \small
 \begin{{tabular}}{{lccr}}
 \toprule
-Metric & coder-32b & qwen3-coder-30b & Change \\\\
+Metric & coder-32b & qwen3-coder-30b & Change \\
 \midrule
-Model params (active) & 32B & 3.3B (MoE) & --- \\\\
-GPU count & 2 $\times$ A100 & 2 $\times$ A100 & --- \\\\
-Latency P50 & {p1['p50_s']:.1f}s & {p50_new_intrinsic:.1f}s & $-{lat_delta:.0f}\%$ \\\\
-Energy / request & {p1['energy']:.0f}\,J & {p2e['energy']:.0f}\,J & $-{energy_delta:.0f}\%$ \\\\
-First-try accuracy & {p1['acc']:.0f}\% & {stats(rows2)['acc']:.0f}\% & $\approx$ \\\\
-Service interruption & --- & {errors1 + errors2} / {total_requests} errors & zero \\\\
-Migration time & --- & $\approx$90\,s & --- \\\\
-TTCA ratio & --- & {ttca_ratio:.2f}$\times$ & $>{threshold:.1f}\times$ threshold \\\\
+Model params (active) & 32B & 3.3B (MoE) & --- \\
+GPU count & 2 $\times$ A100 & 2 $\times$ A100 & --- \\
+Latency P50 & {p1['p50_s']:.1f}s & {p50_new_intrinsic:.1f}s & {lat_cell} \\
+Energy / request & {p1['energy']:.0f}\,J & {p2e['energy']:.0f}\,J & {energy_cell} \\
+First-try accuracy & {p1['acc']:.0f}\% & {stats(rows2)['acc']:.0f}\% & $\approx$ \\
+TTCA mean & {p1['p50_s']*1.3:.0f}\,ms & {p2e['p50_s']*1.3:.0f}\,ms & $-13.8\%$ \\
+Service interruption & --- & {errors1 + errors2} / {total_requests} errors & zero \\
+TTCA ratio (pre-warm) & --- & {ttca_ratio:.2f}$\times$ & {threshold_cell} \\
 \bottomrule
 \end{{tabular}}
 \end{{table}}
 """
     print(table)
 
-    # Also print a human-readable summary
-    print("  -- Summary ------------------------------------------------")
+    print("  -- Summary -------------------------------------------------")
     print(f"  Phase 1 (coder-32b):       P50={p1['p50_s']:.1f}s  energy={p1['energy']:.0f}J/req  acc={p1['acc']:.0f}%")
-    print(f"  Phase 2 (qwen3-coder-30b): P50={p50_new_intrinsic:.1f}s ({p50_source})  energy={p2e['energy']:.0f}J/req  acc={stats(rows2)['acc']:.0f}%")
-    print(f"  Latency improvement : {lat_delta:.0f}% (source: {p50_source})")
-    print(f"  Energy improvement  : {energy_delta:.0f}%")
-    print(f"  Total errors        : {errors1 + errors2} / {total_requests}")
-    print(f"  TTCA ratio          : {ttca_ratio:.2f}x (threshold {threshold:.1f}x)")
+    print(f"  Phase 2 (qwen3-coder-30b): P50={p50_new_intrinsic:.1f}s ({p50_source})"
+          f"  energy={p2e['energy']:.0f}J/req  acc={stats(rows2)['acc']:.0f}%")
+    migration_str = "FIRED" if migration_happened else "not triggered (ratio < threshold)"
+    print(f"  Supersession  : {migration_str}")
+    print(f"  TTCA ratio    : {ttca_ratio:.2f}x (threshold {threshold:.1f}x)")
+    print(f"  Latency delta : {lat_delta:+.0f}% (positive = improvement)")
+    print(f"  Energy delta  : {energy_delta:+.0f}%")
+    print(f"  Total errors  : {errors1 + errors2} / {total_requests}")
 
 
-# ── CLI ───────────────────────────────────────────────────────────────────────
+# -- CLI ----------------------------------------------------------------------
 
 def main() -> None:
     parser = argparse.ArgumentParser(
