@@ -113,7 +113,7 @@ wait_port_inference() {
 import httpx, time, sys
 t0 = time.monotonic()
 try:
-    r = httpx.post('http://localhost:${PORT}/v1/chat/completions',
+    r = httpx.post('http://localhost:\${PORT}/v1/chat/completions',
         json={'model':'auto','messages':[{'role':'user','content':'Write a Python function to add two numbers.'}]},
         timeout=60, transport=httpx.HTTPTransport(retries=0))
     lat = (time.monotonic()-t0)*1000
