@@ -28,7 +28,7 @@ from statistics import mean, median
 import httpx
 
 # ---------------------------------------------------------------------------
-# 1000 diverse queries: 5 domains × 3 complexities × ~67 queries each
+# 1000 diverse queries: 5 domains x 3 complexities x ~67 queries each
 # ---------------------------------------------------------------------------
 
 QUERIES: dict[tuple[str, str], list[str]] = {
@@ -322,8 +322,6 @@ def build_request_list(n: int, dataset_path: str | None = None) -> list[dict]:
         with open(dataset_path) as f:
             items = _json.load(f)
         print(f"  Loaded {len(items)} items from {dataset_path}")
-        # Do NOT shuffle — req_id must match eval_all_models.py and round_robin_test.py
-        # so that eval_matrix lookups in compare_ttca.py find the correct question.
         if n > len(items):
             items += random.choices(items, k=n - len(items))
         return items[:n]
@@ -343,13 +341,10 @@ def build_request_list(n: int, dataset_path: str | None = None) -> list[dict]:
     return all_queries[:n]
 
 
-# Mix of router modes to test different behaviours
 MODES = ["cost", "eco", "accuracy", "custom"]
 MODE_WEIGHTS = [0.35, 0.25, 0.25, 0.15]
 
-# Set by --mode flag; overrides random selection when not None
 _FORCED_MODE: str | None = None
-# Set by --no-retry flag; disables cascade retry for single-shot comparison
 _NO_RETRY: bool = False
 
 
@@ -371,9 +366,6 @@ def random_router_params(item: dict | None = None) -> dict:
         else:
             params = {"mode": mode}
 
-    # Pass dataset labels as domain/complexity override so the router uses
-    # the correct category instead of potentially misclassifying structured
-    # benchmark queries (MMLU, GSM8K, HumanEval, LogiQA, etc.)
     if item and item.get("domain"):
         params["domain"] = item["domain"]
     if item and item.get("complexity"):
@@ -385,12 +377,6 @@ def random_router_params(item: dict | None = None) -> dict:
     return params
 
 
-# ---------------------------------------------------------------------------
-# Single request — non-streaming (router does not support SSE pass-through)
-# TTFT and ITL are derived from X-Router-* headers set by the router internally.
-# Wall time = end-to-end latency measured by the client.
-# ---------------------------------------------------------------------------
-
 async def send_request(
     client: httpx.AsyncClient,
     router_url: str,
@@ -398,8 +384,6 @@ async def send_request(
     item: dict,
 ) -> dict:
     params = random_router_params(item)
-    # NOTE: do NOT include "stream": True — the router's adapter.complete()
-    # calls resp.json() which fails on an SSE response, causing a 500 error.
     payload = {
         "model":    "auto",
         "messages": [{"role": "user", "content": item["query"]}],
@@ -417,8 +401,8 @@ async def send_request(
         "model_winner":      "",
         "bid_latency_ms":    "",
         "actual_latency_ms": "",
-        "ttft_ms":           "",   # not available without streaming; use actual_latency_ms
-        "itl_ms":            "",   # not available without streaming
+        "ttft_ms":           "",
+        "itl_ms":            "",
         "output_tokens":     "",
         "charged_usd":       "",
         "energy_j":          "",
@@ -427,9 +411,9 @@ async def send_request(
         "start_epoch":       "",
         "slo_ms":            "",
         "slo_violated":      "",
-        "retries":           "",   # X-Router-Attempt - 1 (0 = first model succeeded)
-        "gt_scored":         "",   # X-Router-GT-Scored
-        "gt_correct":        "",   # X-Router-GT-Correct
+        "retries":           "",
+        "gt_scored":         "",
+        "gt_correct":        "",
         "response_text":     "",
         "error":             "",
     }
@@ -485,10 +469,6 @@ async def send_request(
     return result
 
 
-# ---------------------------------------------------------------------------
-# Analysis
-# ---------------------------------------------------------------------------
-
 def analyse(rows: list[dict]) -> None:
     W = 62
     ok    = [r for r in rows if r["status"] == 200]
@@ -504,6 +484,9 @@ def analyse(rows: list[dict]) -> None:
     print(f"  Total requests : {len(rows)}")
     print(f"  Successful     : {len(ok)}  ({100*len(ok)//max(len(rows),1)}%)")
     print(f"  Errors/fallback: {len(errs)}")
+    slo_viol = [r for r in ok if r.get("slo_violated") == "true"]
+    if slo_viol:
+        print(f"  SLO violations : {len(slo_viol)} / {len(ok)}  ({100*len(slo_viol)//max(len(ok),1)}%)")
 
     if not ok:
         print("  No successful responses to analyse.")
@@ -522,7 +505,6 @@ def analyse(rows: list[dict]) -> None:
         pct = 100 * cnt // len(ok)
         print(f"  {model:<22} {bar:<30} {pct:3}%  ({cnt})")
 
-    # Wall latency (end-to-end including router overhead)
     wall_vals = [safe_float(r["wall_ms"]) for r in ok if safe_float(r["wall_ms"])]
     if wall_vals:
         wall_vals.sort()
@@ -535,21 +517,9 @@ def analyse(rows: list[dict]) -> None:
     print(f"\n{'='*W}\n")
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-
 async def run(router_url: str, n_requests: int, concurrency: int, output: str,
               dataset_path: str | None = None,
               rate: float | None = None) -> None:
-    """Run the load test.
-
-    Args:
-        rate: Optional target arrival rate in requests/second (open-loop).
-              None = closed-loop (fire as fast as concurrency allows).
-              When set, requests are dispatched at approximately this rate
-              using a token-bucket; concurrency still caps in-flight requests.
-    """
     requests_list = build_request_list(n_requests, dataset_path)
 
     os.makedirs(os.path.dirname(output) if os.path.dirname(output) else ".", exist_ok=True)
@@ -594,17 +564,12 @@ async def run(router_url: str, n_requests: int, concurrency: int, output: str,
         writer.writeheader()
 
         if rate is None:
-            # Closed-loop: dispatch all tasks immediately, semaphore limits concurrency
             await asyncio.gather(*[
                 bounded(i, requests_list[i], writer, f)
                 for i in range(n_requests)
             ])
         else:
-            # Open-loop: dispatch at target rate (token bucket), semaphore caps concurrency.
-            # Each request fires at t = i / rate seconds from start.
-            # If concurrency is saturated the request waits for a slot -- this models
-            # realistic queue build-up under overload rather than dropping requests.
-            interval = 1.0 / rate  # seconds between dispatches
+            interval = 1.0 / rate
             tasks = []
             for i in range(n_requests):
                 target_time = t0 + i * interval
