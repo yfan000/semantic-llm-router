@@ -2,7 +2,7 @@
 compare_all.py — Side-by-side comparison of all routing approaches.
 
 Produces a single unified table ranking every system by accuracy, latency,
-energy and cost — both overall and broken down by (domain, complexity).
+and cost — both overall and broken down by (domain, complexity).
 
 Usage:
     python tests/compare_all.py \\
@@ -68,7 +68,7 @@ def load_system(path: str, eval_index: dict) -> dict:
             if str(row.get("status")) == "200":
                 rows_ok.append(row)
 
-    # Per-category stats
+    # -- Per-category stats ---------------------------------------------------
     by_cat: dict[tuple, dict] = {}
     for cat in CATEGORIES:
         g = [r for r in rows_ok
@@ -96,6 +96,9 @@ def load_system(path: str, eval_index: dict) -> dict:
                     if ic:
                         correct += 1
 
+        slo_rows_g = [r for r in g if r.get("slo_violated") in ("true", "false")]
+        slo_viol_g = sum(1 for r in slo_rows_g if r.get("slo_violated") == "true")
+
         by_cat[cat] = {
             "n":            len(g),
             "accuracy":     correct / scored if scored > 0 else None,
@@ -108,9 +111,12 @@ def load_system(path: str, eval_index: dict) -> dict:
             "cost_total":   sum(costs)             if costs else None,
             "energy_mean":  mean(energy)           if energy else None,
             "energy_total": sum(energy)            if energy else None,
+            "slo_viol_n":   slo_viol_g,
+            "slo_total":    len(slo_rows_g),
+            "slo_viol_rate": slo_viol_g / len(slo_rows_g) if slo_rows_g else None,
         }
 
-    # ── Overall aggregates ────────────────────────────────────────────────────
+    # -- Overall aggregates ---------------------------------------------------
     all_lats   = [v for r in rows_ok
                   if (v := _safe_float(r.get("actual_latency_ms") or
                                        r.get("wall_ms"))) is not None]
@@ -119,8 +125,10 @@ def load_system(path: str, eval_index: dict) -> dict:
     all_energy = [v for r in rows_ok
                   if (v := _safe_float(r.get("energy_j"))) is not None]
 
-    tot_correct = sum(s["correct"] for s in by_cat.values())
-    tot_scored  = sum(s["scored"]  for s in by_cat.values())
+    tot_correct  = sum(s["correct"]    for s in by_cat.values())
+    tot_scored   = sum(s["scored"]     for s in by_cat.values())
+    tot_slo_viol = sum(s["slo_viol_n"] for s in by_cat.values())
+    tot_slo_rows = sum(s["slo_total"]  for s in by_cat.values())
 
     return {
         "n":            len(rows_ok),
@@ -132,11 +140,14 @@ def load_system(path: str, eval_index: dict) -> dict:
         "cost_total":   sum(all_costs)             if all_costs else None,
         "energy_mean":  mean(all_energy)           if all_energy else None,
         "energy_total": sum(all_energy)            if all_energy else None,
-        "by_cat":       by_cat,
+        "slo_viol_rate": tot_slo_viol / tot_slo_rows if tot_slo_rows > 0 else None,
+        "slo_viol_n":    tot_slo_viol,
+        "slo_total":     tot_slo_rows,
+        "by_cat":        by_cat,
     }
 
 
-# ── Formatting helpers ────────────────────────────────────────────────────────
+# -- Formatting helpers -------------------------------------------------------
 
 def _pct(v) -> str:
     return f"{v*100:.1f}%" if v is not None else "   -  "
@@ -160,44 +171,56 @@ def _pp(a, b) -> str:
 
 
 def print_summary(systems: list[tuple[str, dict]], ref_name: str | None = None) -> None:
-    """Print ranked summary table including accuracy, latency, energy and cost."""
+    """Print ranked summary table including accuracy, latency, energy, cost and SLO%."""
     ranked = sorted(systems, key=lambda x: x[1]["accuracy"] or 0, reverse=True)
     ref = next((s for n, s in systems if n == ref_name), None) if ref_name else None
 
-    W = 118
+    # Only show SLO column if any system has SLO data
+    any_slo = any(s.get("slo_total", 0) > 0 for _, s in systems)
+
+    W = 130 if any_slo else 118
     print(f"\n{'='*W}")
     print(f"  ALL SYSTEMS — OVERALL COMPARISON  (ranked by accuracy)")
     print(f"{'='*W}")
-    hdr_vs = f"vs {ref_name}" if ref_name else ""
+    hdr_vs  = f"vs {ref_name}" if ref_name else ""
+    slo_hdr = f"  {'SLO Viol%':>10}" if any_slo else ""
     print(f"\n  {'System':<22} {'Requests':>8} {'Accuracy':>9} {hdr_vs:>9}"
-          f"  {'Lat P50':>8}  {'Lat P95':>8}  {'Energy/req':>11}  {'Cost/req':>11}")
+          f"  {'Lat P50':>8}  {'Lat P95':>8}  {'Energy/req':>11}  {'Cost/req':>11}"
+          + slo_hdr)
     print(f"  {'-'*(W-2)}")
 
     for name, stats in ranked:
         vs = _pp(stats["accuracy"], ref["accuracy"]) if (ref and name != ref_name) else (
              "  [ref] " if (ref and name == ref_name) else "")
-        energy_mean = stats.get("energy_mean")
+        energy_vals = [s["energy_mean"] for s in stats["by_cat"].values()
+                       if s.get("energy_mean") is not None]
+        energy_mean = sum(energy_vals) / len(energy_vals) if energy_vals else None
+        slo_rate = stats.get("slo_viol_rate")
+        slo_col  = f"  {slo_rate*100:>9.1f}%" if (any_slo and slo_rate is not None) else (
+                   f"  {'  -':>10}"            if any_slo else "")
         print(f"  {name:<22} {stats['n']:>8} {_pct(stats['accuracy']):>9} {vs:>9}"
               f"  {_ms(stats['lat_p50']):>8}  {_ms(stats['lat_p95']):>8}"
-              f"  {_j(energy_mean):>11}  {_usd(stats['cost_mean']):>11}")
+              f"  {_j(energy_mean):>11}  {_usd(stats['cost_mean']):>11}"
+              + slo_col)
 
     if ref_name:
-        print(f"\n  Reference (Δ column): {ref_name}")
+        print(f"\n  Reference (delta column): {ref_name}")
+    print()
     print()
 
 
 def print_domain_breakdown(systems: list[tuple[str, dict]]) -> None:
-    """Print per-(domain, complexity) accuracy for all systems side by side."""
+    """Print per-(domain,complexity) accuracy and SLO violation rate."""
     names = [n for n, _ in systems]
-    col_w = max(10, max(len(n) for n in names) + 1)
+    col_w = max(10, max(len(n) for n in names) + 2)
 
-    W = 20 + col_w * len(names) + 4
+    W = 18 + col_w * len(names) + 4
     print(f"\n{'='*W}")
-    print(f"  ACCURACY BY DOMAIN x COMPLEXITY  (* = best in row)")
+    print(f"  ACCURACY BY DOMAIN x COMPLEXITY")
     print(f"{'='*W}")
-    print(f"  {'Category':<20}", end="")
+    print(f"  {'Category':<18}", end="")
     for name in names:
-        print(f"  {name[:col_w]:>{col_w}}", end="")
+        print(f"  {name[:col_w-2]:>{col_w-2}}", end="")
     print()
     print(f"  {'-'*(W-2)}")
 
@@ -208,62 +231,76 @@ def print_domain_breakdown(systems: list[tuple[str, dict]]) -> None:
             print()
         prev_domain = domain
 
-        label = f"{domain}:{complexity}"
-        accs = [(name, stats["by_cat"][cat]["accuracy"]) for name, stats in systems]
+        label    = f"{domain}:{complexity}"
+        accs     = [(name, stats["by_cat"][cat]["accuracy"])      for name, stats in systems]
+        slo_viol = [(name, stats["by_cat"][cat].get("slo_viol_rate")) for name, stats in systems]
+        any_cat_slo = any(r is not None for _, r in slo_viol)
+
         best = max((a for _, a in accs if a is not None), default=None)
 
-        print(f"  {label:<20}", end="")
+        print(f"  {label:<18}", end="")
         for name, acc in accs:
-            cell = _pct(acc)
-            marker = "*" if (acc is not None and best is not None
-                             and abs(acc - best) < 0.001) else " "
-            print(f"  {marker}{cell:>{col_w-1}}", end="")
+            cell   = _pct(acc)
+            marker = "*" if acc is not None and best is not None and abs(acc - best) < 0.001 else " "
+            print(f"  {marker}{cell:>{col_w-2}}", end="")
+        if any_cat_slo:
+            print(f"  {'SLO%':>{col_w}}", end="")
+            for _, rate in slo_viol:
+                cell = f"{rate*100:.0f}%" if rate is not None else "-"
+                print(f"  {cell:>{col_w}}", end="")
         print()
+
     print()
 
 
 def save_csv(systems: list[tuple[str, dict]], output: str) -> None:
-    """Save unified comparison to a CSV for downstream analysis / plotting."""
+    """Save unified comparison to CSV for downstream analysis."""
     os.makedirs(os.path.dirname(output) if os.path.dirname(output) else ".", exist_ok=True)
-
-    def _safe(name: str) -> str:
-        return name.replace(" ", "_").replace("+", "plus").replace("/", "_")
 
     fields = ["category", "domain", "complexity"]
     for name, _ in systems:
-        s = _safe(name)
-        fields += [f"{s}_n", f"{s}_accuracy_pct",
-                   f"{s}_lat_p50_ms", f"{s}_lat_p95_ms",
-                   f"{s}_energy_mean_j", f"{s}_cost_mean_usd"]
+        safe = name.replace(" ", "_").replace("+", "plus").replace("/", "_")
+        fields += [
+            f"{safe}_n",
+            f"{safe}_accuracy_pct",
+            f"{safe}_lat_p50_ms",
+            f"{safe}_lat_p95_ms",
+            f"{safe}_cost_mean_usd",
+            f"{safe}_slo_viol_pct",
+        ]
 
     with open(output, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
         w.writeheader()
 
-        def _row(cat_label: str, domain: str, complexity: str, getter) -> dict:
-            row: dict = {"category": cat_label, "domain": domain,
-                         "complexity": complexity}
-            for name, stats in systems:
-                s = _safe(name)
-                st = getter(stats)
-                row[f"{s}_n"]              = st.get("n", "")
-                acc = st.get("accuracy")
-                row[f"{s}_accuracy_pct"]   = round(acc * 100, 2) if acc is not None else ""
-                p50 = st.get("lat_p50")
-                row[f"{s}_lat_p50_ms"]     = round(p50, 0) if p50 else ""
-                p95 = st.get("lat_p95")
-                row[f"{s}_lat_p95_ms"]     = round(p95, 0) if p95 else ""
-                em  = st.get("energy_mean")
-                row[f"{s}_energy_mean_j"]  = f"{em:.3f}" if em else ""
-                cm  = st.get("cost_mean")
-                row[f"{s}_cost_mean_usd"]  = f"{cm:.8f}" if cm else ""
-            return row
+        # Overall row
+        row: dict = {"category": "OVERALL", "domain": "", "complexity": ""}
+        for name, stats in systems:
+            safe = name.replace(" ", "_").replace("+", "plus").replace("/", "_")
+            row[f"{safe}_n"]             = stats["n"]
+            row[f"{safe}_accuracy_pct"]  = round(stats["accuracy"] * 100, 2) if stats["accuracy"] is not None else ""
+            row[f"{safe}_lat_p50_ms"]    = round(stats["lat_p50"],  0) if stats["lat_p50"]  else ""
+            row[f"{safe}_lat_p95_ms"]    = round(stats["lat_p95"],  0) if stats["lat_p95"]  else ""
+            row[f"{safe}_cost_mean_usd"] = f"{stats['cost_mean']:.8f}" if stats["cost_mean"] else ""
+            slo_r = stats.get("slo_viol_rate")
+            row[f"{safe}_slo_viol_pct"]  = round(slo_r * 100, 1) if slo_r is not None else ""
+        w.writerow(row)
 
-        w.writerow(_row("OVERALL", "", "", lambda st: st))
+        # Per-category rows
         for cat in CATEGORIES:
             domain, complexity = cat
-            w.writerow(_row(f"{domain}:{complexity}", domain, complexity,
-                            lambda st, c=cat: st["by_cat"][c]))
+            row = {"category": f"{domain}:{complexity}", "domain": domain, "complexity": complexity}
+            for name, stats in systems:
+                safe = name.replace(" ", "_").replace("+", "plus").replace("/", "_")
+                s = stats["by_cat"][cat]
+                row[f"{safe}_n"]             = s["n"]
+                row[f"{safe}_accuracy_pct"]  = round(s["accuracy"] * 100, 2) if s["accuracy"] is not None else ""
+                row[f"{safe}_lat_p50_ms"]    = round(s["lat_p50"],  0) if s["lat_p50"]  else ""
+                row[f"{safe}_lat_p95_ms"]    = round(s["lat_p95"],  0) if s["lat_p95"]  else ""
+                row[f"{safe}_cost_mean_usd"] = f"{s['cost_mean']:.8f}" if s["cost_mean"] else ""
+                slo_cat = s.get("slo_viol_rate")
+                row[f"{safe}_slo_viol_pct"]  = round(slo_cat * 100, 1) if slo_cat is not None else ""
+            w.writerow(row)
 
     print(f"  Saved: {output}")
 
@@ -272,14 +309,14 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--system",      action="append", default=[],
                         metavar="NAME:PATH",
-                        help="System to compare — repeat for each system. "
+                        help="System to compare. Repeat for each system. "
                              "Format: 'DisplayName:path/to/results.csv'")
     parser.add_argument("--eval-matrix", default="",
-                        help="eval_matrix.csv for accuracy lookup (optional but recommended)")
+                        help="eval_matrix.csv for accuracy lookup (optional)")
     parser.add_argument("--output",      default="",
                         help="Path to save unified CSV (optional)")
     parser.add_argument("--ref",         default=None,
-                        help="System name to use as reference for the Δ accuracy column. "
+                        help="System name to use as reference for delta accuracy column. "
                              "Defaults to the first --system.")
     args = parser.parse_args()
 
@@ -308,8 +345,9 @@ def main() -> None:
     for name, path in parsed:
         stats = load_system(path, eval_index)
         systems.append((name, stats))
-        print(f"    {name:<24} {stats['n']:5} requests  acc={_pct(stats['accuracy'])}"
-              f"  energy={_j(stats.get('energy_mean'))}  cost={_usd(stats.get('cost_mean'))}")
+        slo_r = stats.get("slo_viol_rate")
+        slo_str = f"  slo={slo_r*100:.0f}%" if slo_r is not None else ""
+        print(f"    {name:<22} {stats['n']:5} requests  acc={_pct(stats['accuracy'])}{slo_str}")
 
     ref_name = args.ref or parsed[0][0]
 
