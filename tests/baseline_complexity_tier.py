@@ -105,11 +105,11 @@ FIELDNAMES = [
     "req_id", "domain", "complexity", "query", "ground_truth", "mode",
     "status", "model_winner", "bid_latency_ms", "actual_latency_ms",
     "ttft_ms", "output_tokens", "charged_usd", "energy_j", "load",
-    "wall_ms", "slo_ms", "slo_violated", "response_text", "error",
+    "wall_ms", "slo_ms", "slo_violated", "retries", "response_text", "error",
 ]
 
 
-_DYNAMIC_TIER_MAP: dict[str, str] = {}
+_DYNAMIC_TIER_MAP: dict[tuple[str, str], str] = {}
 
 
 def pick_model(domain: str, complexity: str) -> str:
@@ -149,6 +149,7 @@ async def send_one(client: httpx.AsyncClient, req_id: int, item: dict) -> dict:
         "wall_ms":           "",
         "slo_ms":            "",
         "slo_violated":      "",
+        "retries":           "0",
         "response_text":     "",
         "error":             "",
     }
@@ -256,7 +257,7 @@ def main() -> None:
     parser.add_argument("--tier-map",     default=None,
                         help="JSON file from build_optimal_tier.py. Overrides hardcoded TIER_MAP.")
     parser.add_argument("--tier-variant", default="accuracy_optimal",
-                        choices=["accuracy_optimal", "ttca_optimal", "cost_optimal"],
+                        choices=["accuracy_optimal", "ttca_optimal"],
                         help="Which variant to use from --tier-map (default: accuracy_optimal)")
     args = parser.parse_args()
 
