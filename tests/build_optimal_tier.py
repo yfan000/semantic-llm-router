@@ -25,14 +25,14 @@ import json
 from collections import defaultdict
 from pathlib import Path
 
-# Cost rates (USD per token) and energy efficiency — must match baseline_complexity_tier.py
+# Market-rate cost tables (USD per token) — matches dynamic_provisioner.py and baseline_cost_optimal.py
 COST_RATES: dict[str, dict] = {
-    "qwen-7b":         {"input": 3e-7, "output": 6e-7, "eff": 13.0},
-    "deepseek-r1-7b":  {"input": 3e-7, "output": 6e-7, "eff": 13.0},
-    "qwen3-coder-30b": {"input": 7e-7, "output": 14e-7, "eff": 12.0},
-    "gemma-3-27b":     {"input": 8e-7, "output": 16e-7, "eff": 5.0},
-    "deepseek-r1-14b": {"input": 5e-7, "output": 10e-7, "eff": 6.0},
-    "llama4-scout":    {"input": 10e-7, "output": 20e-7, "eff": 3.0},
+    "qwen-7b":         {"input": 5e-8,  "output": 1e-7,   "eff": 13.0},  # $0.05/$0.10 per 1M
+    "deepseek-r1-7b":  {"input": 6e-8,  "output": 1.4e-7, "eff": 13.0},  # $0.06/$0.14
+    "qwen3-coder-30b": {"input": 1.5e-7,"output": 6e-7,   "eff": 12.0},  # $0.15/$0.60
+    "gemma-3-27b":     {"input": 8e-8,  "output": 1.6e-7, "eff": 5.0},   # $0.08/$0.16
+    "deepseek-r1-14b": {"input": 1e-7,  "output": 2.5e-7, "eff": 6.0},   # $0.10/$0.25
+    "llama4-scout":    {"input": 1e-7,  "output": 3e-7,   "eff": 3.0},   # $0.10/$0.30
 }
 
 
@@ -47,6 +47,7 @@ def build_maps(eval_matrix: str, alpha: float, beta: float) -> dict:
     # Accumulators: key=(domain, complexity, model_id)
     acc_sum:   dict[tuple, float] = defaultdict(float)
     ttca_sum:  dict[tuple, float] = defaultdict(float)
+    cost_sum:  dict[tuple, float] = defaultdict(float)
     counts:    dict[tuple, int]   = defaultdict(int)
 
     with open(eval_matrix, newline="", encoding="utf-8") as f:
@@ -73,6 +74,7 @@ def build_maps(eval_matrix: str, alpha: float, beta: float) -> dict:
 
             acc_sum[key]  += correct
             ttca_sum[key] += ttca_score
+            cost_sum[key] += cost
             counts[key]   += 1
 
     # Compute per-cell means
@@ -82,12 +84,14 @@ def build_maps(eval_matrix: str, alpha: float, beta: float) -> dict:
         cells[cell_key][model_id] = {
             "accuracy":   acc_sum[(domain, complexity, model_id)] / n,
             "ttca_score": ttca_sum[(domain, complexity, model_id)] / n,
+            "cost_mean":  cost_sum[(domain, complexity, model_id)] / n,
             "n":          n,
         }
 
     # Pick best model per cell for each objective
     accuracy_optimal: dict[str, str] = {}
     ttca_optimal:     dict[str, str] = {}
+    cost_optimal:     dict[str, str] = {}
     summary_rows: list[dict] = []
 
     for (domain, complexity), models in sorted(cells.items()):
@@ -95,9 +99,16 @@ def build_maps(eval_matrix: str, alpha: float, beta: float) -> dict:
 
         best_acc  = max(models, key=lambda m: models[m]["accuracy"])
         best_ttca = max(models, key=lambda m: models[m]["ttca_score"])
+        # Cost-optimal: highest-accuracy model that uses the fewest tokens on average.
+        # Among models with accuracy within 5pp of the cell winner, pick cheapest.
+        max_acc_cell = models[best_acc]["accuracy"]
+        acc_threshold = max_acc_cell - 0.05
+        eligible_cost = {m: v for m, v in models.items() if v["accuracy"] >= acc_threshold}
+        best_cost = min(eligible_cost, key=lambda m: eligible_cost[m]["cost_mean"])
 
         accuracy_optimal[cell_str] = best_acc
         ttca_optimal[cell_str]     = best_ttca
+        cost_optimal[cell_str]     = best_cost
 
         # Summary row
         for model_id, stats in sorted(models.items()):
@@ -107,14 +118,17 @@ def build_maps(eval_matrix: str, alpha: float, beta: float) -> dict:
                 "model_id":    model_id,
                 "accuracy":    round(stats["accuracy"], 4),
                 "ttca_score":  round(stats["ttca_score"], 6),
+                "cost_mean":   round(stats["cost_mean"], 8),
                 "n":           stats["n"],
                 "best_acc":    model_id == best_acc,
                 "best_ttca":   model_id == best_ttca,
+                "best_cost":   model_id == best_cost,
             })
 
     return {
         "accuracy_optimal": accuracy_optimal,
         "ttca_optimal":     ttca_optimal,
+        "cost_optimal":     cost_optimal,
         "alpha":            alpha,
         "beta":             beta,
         "summary":          summary_rows,
@@ -124,26 +138,29 @@ def build_maps(eval_matrix: str, alpha: float, beta: float) -> dict:
 def print_table(maps: dict) -> None:
     acc_map  = maps["accuracy_optimal"]
     ttca_map = maps["ttca_optimal"]
+    cost_map = maps.get("cost_optimal", {})
     summary  = {(r["domain"], r["complexity"], r["model_id"]): r for r in maps["summary"]}
 
     cells = sorted({tuple(k.split(":")) for k in acc_map})
 
-    print(f"\n  {'Cell':<20} {'Accuracy-Optimal':<22} {'acc':>6}  {'TTCA-Optimal':<22} {'ttca':>10}")
-    print(f"  {'-'*82}")
+    print(f"\n  {'Cell':<20} {'Acc-Optimal':<22} {'acc':>6}  {'TTCA-Optimal':<22} {'ttca':>10}  {'Cost-Optimal':<22} {'cost':>11}")
+    print(f"  {'-'*100}")
     for domain, complexity in cells:
         cell_str = f"{domain}:{complexity}"
         am = acc_map.get(cell_str, "-")
         tm = ttca_map.get(cell_str, "-")
+        cm = cost_map.get(cell_str, "-")
         am_acc   = summary.get((domain, complexity, am),  {}).get("accuracy",   0)
         tm_ttca  = summary.get((domain, complexity, tm),  {}).get("ttca_score", 0)
-        print(f"  {cell_str:<20} {am:<22} {am_acc:>6.3f}  {tm:<22} {tm_ttca:>10.4f}")
+        cm_cost  = summary.get((domain, complexity, cm),  {}).get("cost_mean",  0)
+        print(f"  {cell_str:<20} {am:<22} {am_acc:>6.3f}  {tm:<22} {tm_ttca:>10.4f}  {cm:<22} ${cm_cost:>10.6f}")
 
     print()
     if acc_map == ttca_map:
         print("  Note: accuracy-optimal and TTCA-optimal maps are identical for these settings.")
     else:
         diffs = [(k, acc_map[k], ttca_map[k]) for k in acc_map if acc_map[k] != ttca_map[k]]
-        print(f"  Cells where optimal model differs: {len(diffs)}")
+        print(f"  Cells where accuracy vs TTCA optimum differs: {len(diffs)}")
         for cell, am, tm in diffs:
             print(f"    {cell}: accuracy→{am}  ttca→{tm}")
 
@@ -171,7 +188,8 @@ def main() -> None:
         json.dump(maps, f, indent=2)
     print(f"  Saved: {args.output}")
     print(f"    accuracy_optimal: {len(maps['accuracy_optimal'])} cells")
-    print(f"    ttca_optimal:     {len(maps['ttca_optimal'])} cells\n")
+    print(f"    ttca_optimal:     {len(maps['ttca_optimal'])} cells")
+    print(f"    cost_optimal:     {len(maps.get('cost_optimal', {}))} cells\n")
 
 
 if __name__ == "__main__":

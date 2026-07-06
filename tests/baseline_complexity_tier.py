@@ -14,13 +14,6 @@ Usage:
         --output    results/baseline_tier.csv \\
         --concurrency 50 \\
         --node2-host sophia-gpu-09
-
-    # Data-driven optimal tier (from build_optimal_tier.py):
-    python tests/baseline_complexity_tier.py \\
-        --dataset      datasets/hf_1500.json \\
-        --tier-map     results/optimal_tier_maps.json \\
-        --tier-variant accuracy_optimal \\
-        --output       results/baseline_tier_optimal_acc.csv
 """
 from __future__ import annotations
 import argparse
@@ -66,37 +59,37 @@ BACKENDS: dict[str, dict] = {
     "qwen-7b": {
         "model_name": "Qwen/Qwen2.5-7B-Instruct",
         "base_url":   "http://localhost:8000",
-        "input_rate":  0.0000003, "output_rate": 0.0000006,
+        "input_rate":  5e-8,   "output_rate": 1e-7,    # $0.05/$0.10 per 1M
         "eff_tok_per_j": 13.0,
     },
     "deepseek-r1-7b": {
         "model_name": "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B",
         "base_url":   "http://localhost:8001",
-        "input_rate":  0.0000003, "output_rate": 0.0000006,
+        "input_rate":  6e-8,   "output_rate": 1.4e-7,  # $0.06/$0.14
         "eff_tok_per_j": 13.0,
     },
     "qwen3-coder-30b": {
         "model_name": "Qwen/Qwen3-Coder-30B-A3B-Instruct",
         "base_url":   "http://localhost:8002",
-        "input_rate":  0.0000007, "output_rate": 0.0000014,
+        "input_rate":  1.5e-7, "output_rate": 6e-7,    # $0.15/$0.60
         "eff_tok_per_j": 12.0,
     },
     "gemma-3-27b": {
         "model_name": "google/gemma-3-27b-it",
         "base_url":   "http://localhost:8003",
-        "input_rate":  0.0000008, "output_rate": 0.0000016,
+        "input_rate":  8e-8,   "output_rate": 1.6e-7,  # $0.08/$0.16
         "eff_tok_per_j": 5.0,
     },
     "deepseek-r1-14b": {
         "model_name": "deepseek-ai/DeepSeek-R1-Distill-Qwen-14B",
         "base_url":   "http://localhost:8004",
-        "input_rate":  0.0000005, "output_rate": 0.0000010,
+        "input_rate":  1e-7,   "output_rate": 2.5e-7,  # $0.10/$0.25
         "eff_tok_per_j": 6.0,
     },
     "llama4-scout": {
         "model_name": "meta-llama/Llama-4-Scout-17B-16E-Instruct",
         "base_url":   "",  # filled in via --node2-host
-        "input_rate":  0.0000010, "output_rate": 0.0000020,
+        "input_rate":  1e-7,   "output_rate": 3e-7,    # $0.10/$0.30
         "eff_tok_per_j": 3.0,
     },
 }
@@ -115,7 +108,7 @@ FIELDNAMES = [
     "wall_ms", "slo_ms", "slo_violated", "response_text", "error",
 ]
 
-# Populated from --tier-map JSON when provided; keys are "domain:complexity"
+
 _DYNAMIC_TIER_MAP: dict[str, str] = {}
 
 
@@ -204,15 +197,9 @@ async def run(dataset_path: str, output: str, concurrency: int) -> None:
     print(f"\n  [Complexity-Tier] {n} requests, concurrency={concurrency}")
     print(f"  Output: {output}\n")
 
-    # Show active routing table
-    if _DYNAMIC_TIER_MAP:
-        print("  Data-driven tier map:")
-        for k, m in sorted(_DYNAMIC_TIER_MAP.items()):
-            print(f"    {k:<20} → {m}")
-    else:
-        print("  Hardcoded tier map:")
-        for (d, c), m in sorted(TIER_MAP.items()):
-            print(f"    {d:<12} {c:<8} → {m}")
+    # Show routing table
+    for (d, c), m in sorted(TIER_MAP.items()):
+        print(f"    {d:<12} {c:<8} → {m}")
     print()
 
     sem  = asyncio.Semaphore(concurrency)
@@ -233,6 +220,7 @@ async def run(dataset_path: str, output: str, concurrency: int) -> None:
                 print(f"\r  [{bar:<40}] {done}/{n}  {done/elapsed:.1f} req/s",
                       end="", flush=True)
 
+    results = []
     with open(output, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=FIELDNAMES, extrasaction="ignore")
         writer.writeheader()
@@ -268,12 +256,13 @@ def main() -> None:
     parser.add_argument("--tier-map",     default=None,
                         help="JSON file from build_optimal_tier.py. Overrides hardcoded TIER_MAP.")
     parser.add_argument("--tier-variant", default="accuracy_optimal",
-                        choices=["accuracy_optimal", "ttca_optimal"],
+                        choices=["accuracy_optimal", "ttca_optimal", "cost_optimal"],
                         help="Which variant to use from --tier-map (default: accuracy_optimal)")
     args = parser.parse_args()
 
     if args.tier_map:
-        data = json.load(open(args.tier_map))
+        import json as _json
+        data = _json.load(open(args.tier_map))
         variant = data.get(args.tier_variant, {})
         if not variant:
             raise SystemExit(f"ERROR: variant '{args.tier_variant}' not found in {args.tier_map}")
@@ -290,8 +279,7 @@ def main() -> None:
 
     if not args.output:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        variant_tag = f"_{args.tier_variant}" if args.tier_map else ""
-        args.output = f"results/baseline_tier{variant_tag}_{ts}.csv"
+        args.output = f"results/baseline_tier_{ts}.csv"
 
     asyncio.run(run(args.dataset, args.output, args.concurrency))
 

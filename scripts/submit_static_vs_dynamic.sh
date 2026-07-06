@@ -85,7 +85,7 @@ echo "  Dataset     : ${DATASET}  (seed=${SEED})"
 echo "  Metrics     : accuracy, latency, energy/req, cost/req"
 echo "=================================================================="
 
-# ── Generate fixed workload (same for both modes) ─────────────────────────────────────────────
+# ── Generate fixed workload (same for both modes) ─────────────────────────────────────────────────────────────────────────────
 echo ""
 echo "[0] Generating fixed workload (N=${N_REQUESTS}, seed=${SEED})..."
 python3 -c "
@@ -103,7 +103,7 @@ print(f'  By domain    : {dict(sorted(by_domain.items()))}')
 print(f'  By complexity: {dict(sorted(by_complex.items()))}')
 "
 
-# ── Helper ──────────────────────────────────────────────────────────────────────────────
+# ── Helper ─────────────────────────────────────────────────────────────────────────────────────────────
 wait_router() {
     for i in \$(seq 1 60); do
         curl --noproxy '*' -sf "\$ROUTER_URL/router/health" > /dev/null 2>&1 && return 0
@@ -186,6 +186,40 @@ echo ""
 echo "[S3] Waiting for all 6 models..."
 wait_models 6
 
+# Pre-evaluate all models on the workload (runs while static models are loaded)
+echo ""
+echo "[S3b] Pre-evaluating all 6 models on workload → eval_matrix.csv"
+echo "      (Enables Tier-Optimal-Acc and Tier-Optimal-Cost oracle baselines)"
+echo "      This takes ~20-40 min while models are warm. Running concurrently."
+python tests/eval_all_models.py \
+    --dataset     /tmp/svd_workload.json \
+    --output      "\$RESULTS_DIR/eval_matrix.csv" \
+    --concurrency 20
+echo "  eval_matrix.csv done."
+
+echo ""
+echo "[S3c] Building optimal tier maps from eval_matrix..."
+python tests/build_optimal_tier.py \
+    --eval-matrix "\$RESULTS_DIR/eval_matrix.csv" \
+    --output      "\$RESULTS_DIR/optimal_tier_maps.json" \
+    --alpha 1.0 --beta 0.0
+echo "  optimal_tier_maps.json done."
+
+echo ""
+echo "[S3d] Building Tier-Optimal-Cost oracle CSV..."
+python tests/baseline_cost_optimal.py \
+    --eval-matrix "\$RESULTS_DIR/eval_matrix.csv" \
+    --output      "\$RESULTS_DIR/baseline_cost_optimal.csv"
+
+echo ""
+echo "[S3e] Running Tier-Optimal-Acc oracle (complexity-tier with accuracy_optimal map)..."
+python tests/baseline_complexity_tier.py \
+    --dataset     /tmp/svd_workload.json \
+    --tier-map    "\$RESULTS_DIR/optimal_tier_maps.json" \
+    --tier-variant accuracy_optimal \
+    --concurrency ${CONCURRENCY} \
+    --output      "\$RESULTS_DIR/baseline_tier_acc_optimal.csv"
+
 echo ""
 echo "[S4] Running workload in STATIC mode (${N_REQUESTS} requests, rate=${RATE:-closed-loop})..."
 STATIC_START=\$(date +%s)
@@ -252,7 +286,7 @@ echo ""
 echo "[D3] Waiting for seed models (4 — qwen-7b + deepseek-r1-7b + qwen3-coder-30b + llama4-scout)..."
 wait_models 4
 
-# ── Warm-up phase: populate reputation tracker with real latency data ──────────────────
+# ── Warm-up phase: populate reputation tracker with real latency data ────────────────────────
 echo ""
 echo "[D3b] Warm-up: 50 easy requests to measure real model latencies..."
 echo "  (Without warm-up, TTCA uses catalog estimates which can be wildly off)"
@@ -294,7 +328,7 @@ DYNAMIC_SPINUPS=\$(grep "SPIN UP" ~/vllm_logs/prov_svd_dynamic_node1.log 2>/dev/
     | grep -v "reason=initial" | awk '{print \$3}' | sort -u | tr '\n' ',' | sed 's/,$//')
 echo "  Models dynamically spun up: \${DYNAMIC_SPINUPS:-none}"
 
-# ── Baselines: Cascade + RouteLLM ─────────────────────────────────────────────────────────────────
+# ── Baselines: Cascade + RouteLLM ────────────────────────────────────────────────────────────────────────────────────────────
 # NOTE: run BEFORE kill_all_models — baselines hit live vLLM endpoints
 echo ""
 echo "=================================================================="
@@ -353,13 +387,18 @@ echo "  Load test only:"
 echo "    Static : \${LOAD_TEST_WALL_STATIC}s"
 echo "    Dynamic: \${LOAD_TEST_WALL_DYNAMIC}s"
 
-# Build --system list dynamically (include RouteLLM only if file exists)
+# Build --system list dynamically (include RouteLLM and oracle baselines only if files exist)
 COMPARE_SYSTEMS=""
+COMPARE_SYSTEMS="\$COMPARE_SYSTEMS --system \"Round-Robin:results/rr_baseline.csv\""
 COMPARE_SYSTEMS="\$COMPARE_SYSTEMS --system \"Cascade:\$RESULTS_DIR/baseline_cascade.csv\""
 [ -f "\$RESULTS_DIR/baseline_routellm.csv" ] && \
   COMPARE_SYSTEMS="\$COMPARE_SYSTEMS --system \"RouteLLM:\$RESULTS_DIR/baseline_routellm.csv\""
 COMPARE_SYSTEMS="\$COMPARE_SYSTEMS --system \"Static (TTCA):\$RESULTS_DIR/static_results.csv\""
 COMPARE_SYSTEMS="\$COMPARE_SYSTEMS --system \"Dynamic (TTCA):\$RESULTS_DIR/dynamic_results.csv\""
+[ -f "\$RESULTS_DIR/baseline_tier_acc_optimal.csv" ] && \
+  COMPARE_SYSTEMS="\$COMPARE_SYSTEMS --system \"Tier-Opt-Acc:\$RESULTS_DIR/baseline_tier_acc_optimal.csv\""
+[ -f "\$RESULTS_DIR/baseline_cost_optimal.csv" ] && \
+  COMPARE_SYSTEMS="\$COMPARE_SYSTEMS --system \"Tier-Opt-Cost:\$RESULTS_DIR/baseline_cost_optimal.csv\""
 
 echo ""
 eval python tests/compare_all.py \
@@ -369,7 +408,7 @@ eval python tests/compare_all.py \
     --output "\$RESULTS_DIR/compare_all_systems.csv" \
     | tee "\$RESULTS_DIR/compare_all_systems.txt"
 
-# ── Per-source breakdown ──────────────────────────────────────────────────────────────────────────────
+# ── Per-source breakdown ───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 echo ""
 echo "  Per-source energy/cost breakdown:"
 python3 -c "
@@ -404,7 +443,7 @@ summarize('\$RESULTS_DIR/static_results.csv',  'Static ')
 summarize('\$RESULTS_DIR/dynamic_results.csv', 'Dynamic')
 "
 
-# ── GPU energy comparison (idle + serving, from provisioner logs) ────────────────────────────
+# ── GPU energy comparison (idle + serving, from provisioner logs) ────────────────────────────────────────────────
 echo ""
 echo "=================================================================="
 echo "  GPU ENERGY COMPARISON (includes idle GPU power)"
@@ -420,23 +459,29 @@ python3 tests/compute_gpu_energy.py \
     --dynamic-start-epoch \$DYNAMIC_PROV_START \
     | tee "\$RESULTS_DIR/gpu_energy_comparison.txt"
 
-# ── Done ───────────────────────────────────────────────────────────────────────────────────────
+# ── Done ─────────────────────────────────────────────────────────────────────────────────────────────────────────
 echo "=================================================================="
 echo "  Comparison complete!  \$(date)"
 echo "  Results: \$RESULTS_DIR/"
-echo "    static_results.csv          Static TTCA load test"
-echo "    dynamic_results.csv         Dynamic TTCA load test"
-echo "    baseline_cascade.csv        Cascade baseline (threshold=0.80)"
-echo "    baseline_routellm.csv       RouteLLM MF router baseline"
-echo "    compare_all_systems.csv     All systems side-by-side (CSV)"
-echo "    compare_all_systems.txt     All systems side-by-side (human readable)"
-echo "    gpu_energy_comparison.txt   GPU-hours including idle energy"
+echo "    static_results.csv            Static TTCA load test"
+echo "    dynamic_results.csv           Dynamic TTCA load test"
+echo "    baseline_cascade.csv          Cascade baseline (threshold=0.80)"
+echo "    baseline_routellm.csv         RouteLLM MF router baseline"
+echo "    eval_matrix.csv               All models × all requests (ground truth)"
+echo "    optimal_tier_maps.json        Accuracy/TTCA/Cost optimal tier maps"
+echo "    baseline_tier_acc_optimal.csv Tier-Optimal-Acc oracle (upper bound)"
+echo "    baseline_cost_optimal.csv     Tier-Optimal-Cost oracle (lower bound)"
+echo "    compare_all_systems.csv       All systems side-by-side (CSV)"
+echo "    compare_all_systems.txt       All systems side-by-side (human readable)"
+echo "    gpu_energy_comparison.txt     GPU-hours including idle energy"
 echo ""
 echo "  Routing strategy comparison:"
-echo "    Cascade   : prior-threshold binary routing (weak vs strong)"
-echo "    RouteLLM  : learned binary routing (MF router, GPT-4/Haiku trained)"
-echo "    Static    : domain-aware TTCA, full fleet always loaded"
-echo "    Dynamic   : domain-aware TTCA, fleet scales with demand"
+echo "    Cascade           : prior-threshold binary routing (weak vs strong)"
+echo "    RouteLLM          : learned binary routing (MF router, GPT-4/Haiku trained)"
+echo "    Static (TTCA)     : domain-aware TTCA, full fleet always loaded"
+echo "    Dynamic (TTCA)    : domain-aware TTCA, fleet scales with demand"
+echo "    Tier-Opt-Acc      : oracle upper bound on accuracy (best model per cell)"
+echo "    Tier-Opt-Cost     : oracle lower bound on cost (cheapest correct per request)"
 echo "=================================================================="
 PBSEOF
 
