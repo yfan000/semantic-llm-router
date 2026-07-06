@@ -63,15 +63,15 @@ BACKENDS: dict[str, dict] = {
     "qwen-7b": {
         "model_name":    "Qwen/Qwen2.5-7B-Instruct",
         "base_url":      "http://localhost:8000",
-        "input_rate":    0.0000003,
-        "output_rate":   0.0000006,
+        "input_rate":    5e-8,   # $0.05/M — market rate for commoditized 7B/8B
+        "output_rate":   1e-7,   # $0.10/M
         "eff_tok_per_j": 13.0,
     },
     "llama4-scout": {
         "model_name":    "meta-llama/Llama-4-Scout-17B-16E-Instruct",
         "base_url":      "http://localhost:8008",   # node2
-        "input_rate":    0.0000015,
-        "output_rate":   0.0000020,
+        "input_rate":    1e-7,   # $0.10/M — efficient MoE, aggressively priced
+        "output_rate":   3e-7,   # $0.30/M
         "eff_tok_per_j": 3.0,
     },
 }
@@ -87,7 +87,7 @@ FIELDNAMES = [
     "req_id", "domain", "complexity", "query", "ground_truth", "mode",
     "status", "model_winner", "bid_latency_ms", "actual_latency_ms",
     "ttft_ms", "output_tokens", "charged_usd", "energy_j", "load",
-    "wall_ms", "slo_ms", "slo_violated", "response_text", "error",
+    "wall_ms", "slo_ms", "slo_violated", "retries", "response_text", "error",
     "routellm_score",
 ]
 
@@ -192,6 +192,7 @@ async def send_one(
         "wall_ms":           "",
         "slo_ms":            "",
         "slo_violated":      "",
+        "retries":           "0",
         "response_text":     "",
         "error":             "",
         "routellm_score":    f"{routellm_score:.4f}",
