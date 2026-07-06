@@ -198,8 +198,8 @@ python tests/load_test.py \
     ${RATE_FLAG} \
     --output      "\$RESULTS_DIR/static_results.csv"
 STATIC_END=\$(date +%s)
-STATIC_WALL=\$((STATIC_END - STATIC_START))
-echo "  Static wall time: \${STATIC_WALL}s"
+STATIC_WALL=\$((STATIC_END - STATIC_PROV_START))
+echo "  Static total experiment time: \${STATIC_WALL}s (provisioner start → load test end)"
 
 # Count models that were registered during the run
 STATIC_MODELS=\$(curl --noproxy '*' -sf "\$ROUTER_URL/v1/models" \
@@ -286,8 +286,8 @@ python tests/load_test.py \
     ${RATE_FLAG} \
     --output      "\$RESULTS_DIR/dynamic_results.csv"
 DYNAMIC_END=\$(date +%s)
-DYNAMIC_WALL=\$((DYNAMIC_END - DYNAMIC_START))
-echo "  Dynamic wall time: \${DYNAMIC_WALL}s"
+DYNAMIC_WALL=\$((DYNAMIC_END - DYNAMIC_PROV_START))
+echo "  Dynamic total experiment time: \${DYNAMIC_WALL}s (provisioner start → load test end)"
 
 # Show what models were spun up during dynamic run
 DYNAMIC_SPINUPS=\$(grep "SPIN UP" ~/vllm_logs/prov_svd_dynamic_node1.log 2>/dev/null \
@@ -336,13 +336,14 @@ echo "  COMPARISON: Static vs Dynamic"
 echo "══════════════════════════════════════════════════════════════════"
 
 echo ""
-echo "  Wall time:"
-echo "    Static : \${STATIC_WALL}s  (all models pre-loaded)"
-echo "    Dynamic: \${DYNAMIC_WALL}s  (cold start for first hard requests)"
-WALL_DIFF=\$((DYNAMIC_WALL - STATIC_WALL))
-[ "\$WALL_DIFF" -gt 0 ] && \
-    echo "    Dynamic overhead: +\${WALL_DIFF}s (cold start penalty)" || \
-    echo "    Dynamic is faster by: \${WALL_DIFF#-}s"
+echo "  Total experiment time (provisioner start → load test end):"
+echo "    Static : \${STATIC_WALL}s  (includes ~10-20min model loading + workload)"
+echo "    Dynamic: \${DYNAMIC_WALL}s  (includes seed model loading + workload)"
+LOAD_TEST_WALL_STATIC=\$((STATIC_END - STATIC_START))
+LOAD_TEST_WALL_DYNAMIC=\$((DYNAMIC_END - DYNAMIC_START))
+echo "  Load test only:"
+echo "    Static : \${LOAD_TEST_WALL_STATIC}s"
+echo "    Dynamic: \${LOAD_TEST_WALL_DYNAMIC}s"
 
 echo ""
 python tests/compare_all.py \
