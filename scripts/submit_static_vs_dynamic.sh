@@ -85,7 +85,7 @@ echo "  Dataset     : ${DATASET}  (seed=${SEED})"
 echo "  Metrics     : accuracy, latency, energy/req, cost/req"
 echo "=================================================================="
 
-# ── Generate fixed workload (same for both modes) ─────────────────────────────
+# ── Generate fixed workload (same for both modes) ─────────────────────────────────────────────
 echo ""
 echo "[0] Generating fixed workload (N=${N_REQUESTS}, seed=${SEED})..."
 python3 -c "
@@ -103,7 +103,7 @@ print(f'  By domain    : {dict(sorted(by_domain.items()))}')
 print(f'  By complexity: {dict(sorted(by_complex.items()))}')
 "
 
-# ── Helper ────────────────────────────────────────────────────────────────────
+# ── Helper ──────────────────────────────────────────────────────────────────────────────
 wait_router() {
     for i in \$(seq 1 60); do
         curl --noproxy '*' -sf "\$ROUTER_URL/router/health" > /dev/null 2>&1 && return 0
@@ -143,9 +143,9 @@ for m in json.load(sys.stdin).get('data', []):
     echo "  All models stopped."
 }
 
-# ════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════
 # MODE 1: STATIC — all 6 models pre-loaded
-# ════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════
 echo ""
 echo "══════════════════════════════════════════════════════════════════"
 echo "  MODE 1: STATIC (all 6 models pre-loaded)"
@@ -211,9 +211,9 @@ echo "[S5] Tearing down static mode..."
 kill_all_models
 sleep 5
 
-# ════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════
 # MODE 2: DYNAMIC — start with 2 seed models, others spin up
-# ════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════
 echo ""
 echo "══════════════════════════════════════════════════════════════════"
 echo "  MODE 2: DYNAMIC (qwen-7b + deepseek-r1-7b seeds)"
@@ -252,7 +252,7 @@ echo ""
 echo "[D3] Waiting for seed models (4 — qwen-7b + deepseek-r1-7b + qwen3-coder-30b + llama4-scout)..."
 wait_models 4
 
-# ── Warm-up phase: populate reputation tracker with real latency data ─────────
+# ── Warm-up phase: populate reputation tracker with real latency data ──────────────────
 echo ""
 echo "[D3b] Warm-up: 50 easy requests to measure real model latencies..."
 echo "  (Without warm-up, TTCA uses catalog estimates which can be wildly off)"
@@ -294,45 +294,53 @@ DYNAMIC_SPINUPS=\$(grep "SPIN UP" ~/vllm_logs/prov_svd_dynamic_node1.log 2>/dev/
     | grep -v "reason=initial" | awk '{print \$3}' | sort -u | tr '\n' ',' | sed 's/,$//')
 echo "  Models dynamically spun up: \${DYNAMIC_SPINUPS:-none}"
 
-# ── TTCA comparison: Dynamic vs Cascade baseline ───────────────────────────────
-# NOTE: run BEFORE kill_all_models — cascade hits the live router URL
+# ── Baselines: Cascade + RouteLLM ─────────────────────────────────────────────────────────────────
+# NOTE: run BEFORE kill_all_models — baselines hit live vLLM endpoints
 echo ""
 echo "=================================================================="
-echo "  TTCA: Dynamic mode vs Cascade/RouteLLM baseline"
-echo "  (Fair apple-to-apple: both start with limited models)"
+echo "  BASELINES: Cascade and RouteLLM (run on same workload)"
 echo "=================================================================="
+
+echo ""
+echo "  [Baseline 1/2] Cascade (threshold=0.80)..."
 python tests/baseline_cascade.py \
     --dataset     /tmp/svd_workload.json \
     --priors      "${PRIORS}" \
     --threshold   0.80 \
     --concurrency ${CONCURRENCY} \
-    --output      "\$RESULTS_DIR/dynamic_baseline_cascade.csv"
+    --output      "\$RESULTS_DIR/baseline_cascade.csv"
 
 echo ""
-echo "=== Dynamic mode vs Cascade/RouteLLM ===" | tee "\$RESULTS_DIR/compare_dynamic_vs_cascade.txt"
-python tests/compare_ttca.py \
-    --router      "\$RESULTS_DIR/dynamic_results.csv" \
-    --baseline    "\$RESULTS_DIR/dynamic_baseline_cascade.csv" \
-    --eval-matrix "\$RESULTS_DIR/eval_matrix.csv" \
-    | tee -a "\$RESULTS_DIR/compare_dynamic_vs_cascade.txt"
-echo ""
-python tests/compare_categories.py \
-    --router      "\$RESULTS_DIR/dynamic_results.csv" \
-    --baseline    "\$RESULTS_DIR/dynamic_baseline_cascade.csv" \
-    --eval-matrix "\$RESULTS_DIR/eval_matrix.csv" \
-    --output      "\$RESULTS_DIR/compare_dynamic_vs_cascade.csv" \
-    | tee -a "\$RESULTS_DIR/compare_dynamic_vs_cascade.txt"
+echo "  [Baseline 2/2] RouteLLM MF router..."
+echo "  (Calibrating threshold to match cascade strong-model usage rate)"
+# First calibrate to find the threshold that gives ~30% strong-model usage
+# (matching the cascade baseline for fair comparison)
+python tests/baseline_routellm.py \
+    --dataset     /tmp/svd_workload.json \
+    --calibrate \
+    2>&1 | tee "\$RESULTS_DIR/routellm_calibration.txt" || true
+
+# Run with default threshold=0.5 (routes ~20-30% to strong).
+# Adjust ROUTELLM_THRESHOLD based on calibration output above.
+ROUTELLM_THRESHOLD=\${ROUTELLM_THRESHOLD:-0.5}
+echo "  Using threshold=\${ROUTELLM_THRESHOLD} (set ROUTELLM_THRESHOLD env var to override)"
+python tests/baseline_routellm.py \
+    --dataset     /tmp/svd_workload.json \
+    --threshold   \${ROUTELLM_THRESHOLD} \
+    --concurrency ${CONCURRENCY} \
+    --output      "\$RESULTS_DIR/baseline_routellm.csv" \
+    || echo "  WARNING: RouteLLM baseline failed (pip install routellm to enable)"
 
 echo ""
 echo "[D5] Tearing down dynamic mode..."
 kill_all_models
 
-# ════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════
 # COMPARISON
-# ════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════
 echo ""
 echo "══════════════════════════════════════════════════════════════════"
-echo "  COMPARISON: Static vs Dynamic"
+echo "  COMPARISON: All systems"
 echo "══════════════════════════════════════════════════════════════════"
 
 echo ""
@@ -345,15 +353,23 @@ echo "  Load test only:"
 echo "    Static : \${LOAD_TEST_WALL_STATIC}s"
 echo "    Dynamic: \${LOAD_TEST_WALL_DYNAMIC}s"
 
-echo ""
-python tests/compare_all.py \
-    --system "Static:\$RESULTS_DIR/static_results.csv" \
-    --system "Dynamic:\$RESULTS_DIR/dynamic_results.csv" \
-    --ref    "Static" \
-    --output "\$RESULTS_DIR/static_vs_dynamic.csv" \
-    | tee "\$RESULTS_DIR/static_vs_dynamic.txt"
+# Build --system list dynamically (include RouteLLM only if file exists)
+COMPARE_SYSTEMS=""
+COMPARE_SYSTEMS="\$COMPARE_SYSTEMS --system \"Cascade:\$RESULTS_DIR/baseline_cascade.csv\""
+[ -f "\$RESULTS_DIR/baseline_routellm.csv" ] && \
+  COMPARE_SYSTEMS="\$COMPARE_SYSTEMS --system \"RouteLLM:\$RESULTS_DIR/baseline_routellm.csv\""
+COMPARE_SYSTEMS="\$COMPARE_SYSTEMS --system \"Static (TTCA):\$RESULTS_DIR/static_results.csv\""
+COMPARE_SYSTEMS="\$COMPARE_SYSTEMS --system \"Dynamic (TTCA):\$RESULTS_DIR/dynamic_results.csv\""
 
-# ── Per-source breakdown ───────────────────────────────────────────────────────
+echo ""
+eval python tests/compare_all.py \
+    \$COMPARE_SYSTEMS \
+    --ref    "Static (TTCA)" \
+    --eval-matrix "\$RESULTS_DIR/eval_matrix.csv" \
+    --output "\$RESULTS_DIR/compare_all_systems.csv" \
+    | tee "\$RESULTS_DIR/compare_all_systems.txt"
+
+# ── Per-source breakdown ──────────────────────────────────────────────────────────────────────────────
 echo ""
 echo "  Per-source energy/cost breakdown:"
 python3 -c "
@@ -388,7 +404,7 @@ summarize('\$RESULTS_DIR/static_results.csv',  'Static ')
 summarize('\$RESULTS_DIR/dynamic_results.csv', 'Dynamic')
 "
 
-# ── GPU energy comparison (idle + serving, from provisioner logs) ──────────────
+# ── GPU energy comparison (idle + serving, from provisioner logs) ────────────────────────────
 echo ""
 echo "=================================================================="
 echo "  GPU ENERGY COMPARISON (includes idle GPU power)"
@@ -404,21 +420,23 @@ python3 tests/compute_gpu_energy.py \
     --dynamic-start-epoch \$DYNAMIC_PROV_START \
     | tee "\$RESULTS_DIR/gpu_energy_comparison.txt"
 
-# ── Done ───────────────────────────────────────────────────────────────────────
+# ── Done ───────────────────────────────────────────────────────────────────────────────────────
 echo "=================================================================="
 echo "  Comparison complete!  \$(date)"
 echo "  Results: \$RESULTS_DIR/"
-echo "    static_results.csv              Static mode load test"
-echo "    dynamic_results.csv             Dynamic mode load test"
-echo "    static_vs_dynamic.csv           Side-by-side accuracy/latency/energy"
-echo "    static_vs_dynamic.txt           Human-readable comparison"
-echo "    gpu_energy_comparison.txt        GPU-hours including idle (key energy metric)"
-echo "    dynamic_baseline_cascade.csv    Cascade baseline on same dynamic workload"
-echo "    compare_dynamic_vs_cascade.txt  Dynamic vs Cascade TTCA comparison"
+echo "    static_results.csv          Static TTCA load test"
+echo "    dynamic_results.csv         Dynamic TTCA load test"
+echo "    baseline_cascade.csv        Cascade baseline (threshold=0.80)"
+echo "    baseline_routellm.csv       RouteLLM MF router baseline"
+echo "    compare_all_systems.csv     All systems side-by-side (CSV)"
+echo "    compare_all_systems.txt     All systems side-by-side (human readable)"
+echo "    gpu_energy_comparison.txt   GPU-hours including idle energy"
 echo ""
-echo "  Key insight: Static has zero cold-start latency but wastes GPU energy"
-echo "  on idle models. Dynamic saves energy but pays a penalty for first"
-echo "  requests to uncached domains."
+echo "  Routing strategy comparison:"
+echo "    Cascade   : prior-threshold binary routing (weak vs strong)"
+echo "    RouteLLM  : learned binary routing (MF router, GPT-4/Haiku trained)"
+echo "    Static    : domain-aware TTCA, full fleet always loaded"
+echo "    Dynamic   : domain-aware TTCA, fleet scales with demand"
 echo "=================================================================="
 PBSEOF
 
