@@ -66,7 +66,7 @@ FIELDNAMES = [
     "req_id", "domain", "complexity", "query", "ground_truth", "mode",
     "status", "model_winner", "bid_latency_ms", "actual_latency_ms",
     "ttft_ms", "output_tokens", "charged_usd", "energy_j", "load",
-    "wall_ms", "slo_ms", "slo_violated", "response_text", "error",
+    "wall_ms", "slo_ms", "slo_violated", "retries", "response_text", "error",
 ]
 
 
@@ -145,6 +145,7 @@ def build_oracle(eval_matrix: str) -> list[dict]:
             "wall_ms":           wall_ms_val,
             "slo_ms":            "",
             "slo_violated":      "",
+            "retries":           "0",
             "response_text":     resp_text[:500] if resp_text else "",
             "error":             "",
         })
@@ -195,7 +196,7 @@ def main() -> None:
         print(f"  Energy: total={sum(energy):.1f}J  avg={mean(energy):.2f}J/req")
 
     print(f"\n  Saved: {args.output}")
-    print(f'  (Pass to compare_all.py as --system "Tier-Opt-Cost:{args.output}")\n')
+    print(f"  (Pass to compare_all.py as --system \"Tier-Opt-Cost:{args.output}\")\n")
 
 
 if __name__ == "__main__":
