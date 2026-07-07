@@ -112,7 +112,7 @@ print(f'  By complexity: {dict(sorted(by_complex.items()))}')
 "
 
 
-# ── Helper ────────────────────────────────────────────────────────────────────
+# ── Helper ──────────────────────────────────────────────────────────────────────────
 wait_router() {
     for i in \$(seq 1 60); do
         curl --noproxy '*' -sf "\$ROUTER_URL/router/health" > /dev/null 2>&1 && return 0
@@ -152,9 +152,9 @@ for m in json.load(sys.stdin).get('data', []):
     echo "  All models stopped."
 }
 
-# ════════════════════════════════════════════════════════════════════
+# ╔══════════════════════════════════════════════════════════════════
 # MODE 1: STATIC — all 6 models pre-loaded
-# ════════════════════════════════════════════════════════════════════
+# ╔══════════════════════════════════════════════════════════════════
 echo ""
 echo "══════════════════════════════════════════════════════════════════"
 echo "  MODE 1: STATIC (all 6 models pre-loaded)"
@@ -230,6 +230,26 @@ python tests/baseline_complexity_tier.py \
     --output      "\$RESULTS_DIR/baseline_tier_acc_optimal.csv"
 
 echo ""
+echo "[S3f] CARROT baseline (Somerstep et al. 2025, arXiv:2502.03261, mu=0.3)..."
+python tests/baseline_carrot.py \
+    --dataset     /tmp/svd_workload.json \
+    --eval-matrix "\$RESULTS_DIR/eval_matrix.csv" \
+    --mu          0.3 \
+    --concurrency ${CONCURRENCY} \
+    --node2-host  "\$NODE2" \
+    --output      "\$RESULTS_DIR/baseline_carrot.csv"
+
+echo ""
+echo "[S3g] OmniRouter baseline (Mei et al. 2025, arXiv:2502.20576, alpha=0.75)..."
+python tests/baseline_omni_router.py \
+    --dataset     /tmp/svd_workload.json \
+    --eval-matrix "\$RESULTS_DIR/eval_matrix.csv" \
+    --alpha       0.75 \
+    --concurrency ${CONCURRENCY} \
+    --node2-host  "\$NODE2" \
+    --output      "\$RESULTS_DIR/baseline_omni_router.csv"
+
+echo ""
 echo "[S4] Running workload in STATIC mode (${N_REQUESTS} requests, rate=${RATE:-closed-loop})..."
 STATIC_START=\$(date +%s)
 python tests/load_test.py \
@@ -254,9 +274,9 @@ echo "[S5] Tearing down static mode..."
 kill_all_models
 sleep 5
 
-# ════════════════════════════════════════════════════════════════════
+# ╔══════════════════════════════════════════════════════════════════
 # MODE 2: DYNAMIC — start with 2 seed models, others spin up
-# ════════════════════════════════════════════════════════════════════
+# ╔══════════════════════════════════════════════════════════════════
 echo ""
 echo "══════════════════════════════════════════════════════════════════"
 echo "  MODE 2: DYNAMIC (qwen-7b + deepseek-r1-7b seeds)"
@@ -338,7 +358,6 @@ DYNAMIC_SPINUPS=\$(grep "SPIN UP" ~/vllm_logs/prov_svd_dynamic_node1.log 2>/dev/
 echo "  Models dynamically spun up: \${DYNAMIC_SPINUPS:-none}"
 
 # ── Baselines: Cascade + RouteLLM ─────────────────────────────────────────────
-# NOTE: run BEFORE kill_all_models — baselines hit live vLLM endpoints
 echo ""
 echo "=================================================================="
 echo "  BASELINES: Cascade and RouteLLM (run on same workload)"
@@ -378,9 +397,9 @@ echo ""
 echo "[D5] Tearing down dynamic mode..."
 kill_all_models
 
-# ════════════════════════════════════════════════════════════════════
+# ╔══════════════════════════════════════════════════════════════════
 # COMPARISON
-# ════════════════════════════════════════════════════════════════════
+# ╔══════════════════════════════════════════════════════════════════
 echo ""
 echo "══════════════════════════════════════════════════════════════════"
 echo "  COMPARISON: All systems"
@@ -402,6 +421,10 @@ COMPARE_SYSTEMS="\$COMPARE_SYSTEMS --system \"Round-Robin:results/rr_baseline.cs
 COMPARE_SYSTEMS="\$COMPARE_SYSTEMS --system \"Cascade:\$RESULTS_DIR/baseline_cascade.csv\""
 [ -f "\$RESULTS_DIR/baseline_routellm.csv" ] && \
   COMPARE_SYSTEMS="\$COMPARE_SYSTEMS --system \"RouteLLM:\$RESULTS_DIR/baseline_routellm.csv\""
+[ -f "\$RESULTS_DIR/baseline_carrot.csv" ] && \
+  COMPARE_SYSTEMS="\$COMPARE_SYSTEMS --system \"CARROT:\$RESULTS_DIR/baseline_carrot.csv\""
+[ -f "\$RESULTS_DIR/baseline_omni_router.csv" ] && \
+  COMPARE_SYSTEMS="\$COMPARE_SYSTEMS --system \"OmniRouter:\$RESULTS_DIR/baseline_omni_router.csv\""
 COMPARE_SYSTEMS="\$COMPARE_SYSTEMS --system \"Static (TTCA):\$RESULTS_DIR/static_results.csv\""
 COMPARE_SYSTEMS="\$COMPARE_SYSTEMS --system \"Dynamic (TTCA):\$RESULTS_DIR/dynamic_results.csv\""
 [ -f "\$RESULTS_DIR/baseline_tier_acc_optimal.csv" ] && \
@@ -417,7 +440,7 @@ eval python tests/compare_all.py \
     --output "\$RESULTS_DIR/compare_all_systems.csv" \
     | tee "\$RESULTS_DIR/compare_all_systems.txt"
 
-# ── Per-source breakdown ───────────────────────────────────────────────────────
+# ── Per-source breakdown ────────────────────────────────────────────────────────────
 echo ""
 echo "  Per-source energy/cost breakdown:"
 python3 -c "
@@ -468,7 +491,7 @@ python3 tests/compute_gpu_energy.py \
     --dynamic-start-epoch \$DYNAMIC_PROV_START \
     | tee "\$RESULTS_DIR/gpu_energy_comparison.txt"
 
-# ── Done ───────────────────────────────────────────────────────────────────────
+# ── Done ──────────────────────────────────────────────────────────────────────────────
 echo "=================================================================="
 echo "  Comparison complete!  \$(date)"
 echo "  Results: \$RESULTS_DIR/"
@@ -476,6 +499,8 @@ echo "    static_results.csv            Static TTCA load test"
 echo "    dynamic_results.csv           Dynamic TTCA load test"
 echo "    baseline_cascade.csv          Cascade baseline (threshold=0.80)"
 echo "    baseline_routellm.csv         RouteLLM MF router baseline"
+echo "    baseline_carrot.csv           CARROT (Somerstep et al. 2025, arXiv:2502.03261)"
+echo "    baseline_omni_router.csv      OmniRouter (Mei et al. 2025, arXiv:2502.20576)"
 echo "    eval_matrix.csv               All models × all requests (ground truth)"
 echo "    optimal_tier_maps.json        Accuracy/TTCA/Cost optimal tier maps"
 echo "    baseline_tier_acc_optimal.csv Tier-Optimal-Acc oracle (upper bound)"
@@ -487,6 +512,8 @@ echo ""
 echo "  Routing strategy comparison:"
 echo "    Cascade           : prior-threshold binary routing (weak vs strong)"
 echo "    RouteLLM          : learned binary routing (MF router, GPT-4/Haiku trained)"
+echo "    CARROT            : argmax (1-mu)*P_acc - mu*cost, trained on eval_matrix"
+echo "    OmniRouter        : Lagrangian batch optimizer, alpha=0.75 accuracy target"
 echo "    Static (TTCA)     : domain-aware TTCA, full fleet always loaded"
 echo "    Dynamic (TTCA)    : domain-aware TTCA, fleet scales with demand"
 echo "    Tier-Opt-Acc      : oracle upper bound on accuracy (best model per cell)"
