@@ -328,37 +328,38 @@ at equal accuracy.
   }
   \label{tab:routing_breakdown}
   \small
-  \setlength{\tabcolsep}{4pt}
-  \begin{tabular}{llrrrrr}
+  \setlength{\tabcolsep}{3pt}
+  \resizebox{\columnwidth}{!}{%
+  \begin{tabular}{llrrrrrrr}
     \toprule
-    & & \multicolumn{5}{c}{Accuracy\,/\,Cost per request (\$)} \\
-    \cmidrule(lr){3-7}
-    Domain & Cmplx & RR & Cascade & RouteLLM & T-Opt-Acc & \sysname \\
+    & & \multicolumn{7}{c}{Accuracy\,/\,Cost per request (\$)} \\
+    \cmidrule(lr){3-9}
+    Domain & Cmplx & RR & Cascade & RouteLLM & CARROT & OmniR. & T-Opt-Acc & \sysname \\
     \midrule
     \multirow{3}{*}{Factual}
-      & Easy   & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} \\
-      & Medium & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} \\
-      & Hard   & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} \\
+      & Easy   & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} \\
+      & Medium & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} \\
+      & Hard   & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} \\
     \midrule
     \multirow{3}{*}{Math}
-      & Easy   & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} \\
-      & Medium & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} \\
-      & Hard   & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} \\
+      & Easy   & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} \\
+      & Medium & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} \\
+      & Hard   & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} \\
     \midrule
     \multirow{3}{*}{Code}
-      & Easy   & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} \\
-      & Medium & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} \\
-      & Hard   & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} \\
+      & Easy   & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} \\
+      & Medium & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} \\
+      & Hard   & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} \\
     \midrule
     \multirow{3}{*}{Reasoning}
-      & Easy   & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} \\
-      & Medium & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} \\
-      & Hard   & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} \\
+      & Easy   & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} \\
+      & Medium & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} \\
+      & Hard   & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} \\
     \midrule
     \multicolumn{2}{l}{\textbf{Overall}}
-      & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \result{97.1\%\,/\,\$\todo{X}} \\
+      & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \result{97.1\%\,/\,\$\todo{X}} \\
     \bottomrule
-  \end{tabular}
+  \end{tabular}}
 \end{table}
 
 \paragraph{RouteLLM vs.\ \sysname.}
@@ -521,7 +522,7 @@ Despite no supersession, Phase~2 \ttca\ improved by
 The router reduces retries to DeepSeek-R1-7B (P50$\approx$40\,s)
 by routing code requests to Qwen3-Coder-30B when concurrency allows.
 
-% ── 4.5 Sensitivity Study ────────────────────────────────────────────────────────
+% ── 4.5 Sensitivity Study ───────────────────────────────────────────────────────
 \subsection{Sensitivity to \ttca\ Parameters}
 \label{sec:eval:ablation}
 
