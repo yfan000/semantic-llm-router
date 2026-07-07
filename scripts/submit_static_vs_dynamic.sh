@@ -40,6 +40,10 @@ QUEUE=${QUEUE:-by-node}
 DATASET=${DATASET:-"datasets/hf_3000.json"}
 PRIORS=${PRIORS:-"results/priors_all5.json"}
 SEED=${SEED:-42}
+# DOMAIN_FILTER: restrict workload to a single domain (e.g. "code").
+# Leave empty for all domains (default).
+# Example: DOMAIN_FILTER=code N_REQUESTS=1200 bash scripts/submit_static_vs_dynamic.sh
+DOMAIN_FILTER=${DOMAIN_FILTER:-""}
 
 TS=$(date +%Y%m%d_%H%M%S)
 LOG_DIR="$HOME/vllm_logs/static_vs_dynamic_${TS}"
@@ -85,14 +89,18 @@ echo "  Dataset     : ${DATASET}  (seed=${SEED})"
 echo "  Metrics     : accuracy, latency, energy/req, cost/req"
 echo "=================================================================="
 
-# ── Generate fixed workload (same for both modes) ─────────────────────────────────────────────────────────────────────────────
+# ── Generate fixed workload (same for both modes) ─────────────────────────────
 echo ""
-echo "[0] Generating fixed workload (N=${N_REQUESTS}, seed=${SEED})..."
+DOMAIN_LABEL="${DOMAIN_FILTER:-all}"
+echo "[0] Generating fixed workload (N=${N_REQUESTS}, seed=${SEED}, domain=${DOMAIN_LABEL})..."
 python3 -c "
 import json, random
 random.seed(${SEED})
 data = json.load(open('${DATASET}'))
-# Balanced mix: easy/medium/hard across all domains
+domain_filter = '${DOMAIN_FILTER}'
+if domain_filter:
+    data = [x for x in data if x.get('domain') == domain_filter]
+    print(f'  Domain filter: {domain_filter} ({len(data)} items available)')
 sample = random.sample(data, min(${N_REQUESTS}, len(data)))
 json.dump(sample, open('/tmp/svd_workload.json', 'w'))
 from collections import Counter
@@ -103,7 +111,8 @@ print(f'  By domain    : {dict(sorted(by_domain.items()))}')
 print(f'  By complexity: {dict(sorted(by_complex.items()))}')
 "
 
-# ── Helper ─────────────────────────────────────────────────────────────────────────────────────────────
+
+# ── Helper ────────────────────────────────────────────────────────────────────
 wait_router() {
     for i in \$(seq 1 60); do
         curl --noproxy '*' -sf "\$ROUTER_URL/router/health" > /dev/null 2>&1 && return 0
@@ -143,9 +152,9 @@ for m in json.load(sys.stdin).get('data', []):
     echo "  All models stopped."
 }
 
-# ══════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════
 # MODE 1: STATIC — all 6 models pre-loaded
-# ══════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════
 echo ""
 echo "══════════════════════════════════════════════════════════════════"
 echo "  MODE 1: STATIC (all 6 models pre-loaded)"
@@ -245,9 +254,9 @@ echo "[S5] Tearing down static mode..."
 kill_all_models
 sleep 5
 
-# ══════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════
 # MODE 2: DYNAMIC — start with 2 seed models, others spin up
-# ══════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════
 echo ""
 echo "══════════════════════════════════════════════════════════════════"
 echo "  MODE 2: DYNAMIC (qwen-7b + deepseek-r1-7b seeds)"
@@ -286,7 +295,7 @@ echo ""
 echo "[D3] Waiting for seed models (4 — qwen-7b + deepseek-r1-7b + qwen3-coder-30b + llama4-scout)..."
 wait_models 4
 
-# ── Warm-up phase: populate reputation tracker with real latency data ────────────────────────
+# ── Warm-up phase: populate reputation tracker with real latency data ─────────
 echo ""
 echo "[D3b] Warm-up: 50 easy requests to measure real model latencies..."
 echo "  (Without warm-up, TTCA uses catalog estimates which can be wildly off)"
@@ -328,7 +337,7 @@ DYNAMIC_SPINUPS=\$(grep "SPIN UP" ~/vllm_logs/prov_svd_dynamic_node1.log 2>/dev/
     | grep -v "reason=initial" | awk '{print \$3}' | sort -u | tr '\n' ',' | sed 's/,$//')
 echo "  Models dynamically spun up: \${DYNAMIC_SPINUPS:-none}"
 
-# ── Baselines: Cascade + RouteLLM ────────────────────────────────────────────────────────────────────────────────────────────
+# ── Baselines: Cascade + RouteLLM ─────────────────────────────────────────────
 # NOTE: run BEFORE kill_all_models — baselines hit live vLLM endpoints
 echo ""
 echo "=================================================================="
@@ -369,9 +378,9 @@ echo ""
 echo "[D5] Tearing down dynamic mode..."
 kill_all_models
 
-# ══════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════
 # COMPARISON
-# ══════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════
 echo ""
 echo "══════════════════════════════════════════════════════════════════"
 echo "  COMPARISON: All systems"
@@ -408,7 +417,7 @@ eval python tests/compare_all.py \
     --output "\$RESULTS_DIR/compare_all_systems.csv" \
     | tee "\$RESULTS_DIR/compare_all_systems.txt"
 
-# ── Per-source breakdown ───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+# ── Per-source breakdown ───────────────────────────────────────────────────────
 echo ""
 echo "  Per-source energy/cost breakdown:"
 python3 -c "
@@ -443,7 +452,7 @@ summarize('\$RESULTS_DIR/static_results.csv',  'Static ')
 summarize('\$RESULTS_DIR/dynamic_results.csv', 'Dynamic')
 "
 
-# ── GPU energy comparison (idle + serving, from provisioner logs) ────────────────────────────────────────────────
+# ── GPU energy comparison (idle + serving, from provisioner logs) ──────────────
 echo ""
 echo "=================================================================="
 echo "  GPU ENERGY COMPARISON (includes idle GPU power)"
@@ -459,7 +468,7 @@ python3 tests/compute_gpu_energy.py \
     --dynamic-start-epoch \$DYNAMIC_PROV_START \
     | tee "\$RESULTS_DIR/gpu_energy_comparison.txt"
 
-# ── Done ─────────────────────────────────────────────────────────────────────────────────────────────────────────
+# ── Done ───────────────────────────────────────────────────────────────────────
 echo "=================================================================="
 echo "  Comparison complete!  \$(date)"
 echo "  Results: \$RESULTS_DIR/"

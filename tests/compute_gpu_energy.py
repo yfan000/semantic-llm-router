@@ -160,6 +160,14 @@ def print_comparison(static: dict, dynamic: dict) -> None:
     s_wh  = static["total_wh"]
     d_wh  = dynamic["total_wh"]
 
+    # Node2: llama4-scout (8 GPUs) runs full wall time in both modes.
+    # Energy is pure wall-time × TDP — no log parsing needed.
+    NODE2_GPUS = 8
+    s_node2_wh = (static["wall_time_s"]  * NODE2_GPUS * GPU_TDP_W) / 3600
+    d_node2_wh = (dynamic["wall_time_s"] * NODE2_GPUS * GPU_TDP_W) / 3600
+    s_total_wh = s_wh + s_node2_wh
+    d_total_wh = d_wh + d_node2_wh
+
     print(f"\n  {'='*70}")
     print(f"  GPU CORE-HOURS COMPARISON: Static vs Dynamic")
     print(f"  {'='*70}")
@@ -177,10 +185,33 @@ def print_comparison(static: dict, dynamic: dict) -> None:
           f"{d_wh:>12.1f}  "
           f"{s_wh-d_wh:>+12.1f}  ({(s_wh-d_wh)/max(s_wh,1)*100:.1f}% saved)")
     print(f"  {'-'*68}")
-    print(f"  Note: node2 (llama4-scout, 8 GPUs) runs identically in both modes.")
-    print(f"        The difference above is entirely from node1 provisioning decisions.")
-    print(f"\n  Dynamic mode saves {saved:.3f} GPU-hours ({pct:.1f}%) on node1")
-    print(f"  by only loading models when needed (idle models consume no power).")
+    # Node2 breakdown
+    s_node2_gh = (static["wall_time_s"]  * NODE2_GPUS) / 3600
+    d_node2_gh = (dynamic["wall_time_s"] * NODE2_GPUS) / 3600
+    print(f"  {'Node2: llama4-scout (8 GPUs)':<32}")
+    print(f"  {'  GPU-hours (node2)':<32} {s_node2_gh:>12.3f}  "
+          f"{d_node2_gh:>12.3f}  "
+          f"{s_node2_gh-d_node2_gh:>+12.3f}  ({(s_node2_gh-d_node2_gh)/max(s_node2_gh,1)*100:.1f}% saved)")
+    print(f"  {'  Energy (Wh, node2)':<32} {s_node2_wh:>12.1f}  "
+          f"{d_node2_wh:>12.1f}  "
+          f"{s_node2_wh-d_node2_wh:>+12.1f}")
+    print(f"  {'-'*68}")
+    # Combined totals
+    total_saved_wh  = s_total_wh - d_total_wh
+    total_saved_pct = total_saved_wh / max(s_total_wh, 1e-9) * 100
+    s_total_gh = s_gh + s_node2_gh
+    d_total_gh = d_gh + d_node2_gh
+    print(f"  {'TOTAL (node1 + node2)':<32} {'':>12}  {'':>12}")
+    print(f"  {'  Total GPU-hours (both)':<32} {s_total_gh:>12.3f}  "
+          f"{d_total_gh:>12.3f}  "
+          f"{s_total_gh-d_total_gh:>+12.3f}  ({(s_total_gh-d_total_gh)/max(s_total_gh,1)*100:.1f}% saved)")
+    print(f"  {'  Total energy (Wh, both)':<32} {s_total_wh:>12.1f}  "
+          f"{d_total_wh:>12.1f}  "
+          f"{total_saved_wh:>+12.1f}  ({total_saved_pct:.1f}% saved)")
+    print(f"  {'-'*68}")
+    print(f"\n  Node1 savings: {pct:.1f}% (from dynamic provisioning decisions)")
+    print(f"  Node2 savings: wall-time reduction only ({(s_node2_wh-d_node2_wh)/max(s_node2_wh,1)*100:.1f}%)")
+    print(f"  Combined:      dynamic saves {total_saved_pct:.1f}% total GPU energy (both nodes)")
     print(f"  {'='*70}\n")
 
 

@@ -77,13 +77,13 @@ DRAIN_GRACE_S:               float = 60.0  # keep vllm process alive after dereg
 
 HF_HOME = "/eagle/UIC-HPC/yuping/hf_cache"
 
-# SLO targets per domain (ms) — same as config.py
+# SLO targets per domain (ms) — must match config.py values
 LATENCY_SLO_MS = {
-    "factual:easy":    1000, "factual:medium":   2000, "factual:hard":   4000,
-    "math:easy":       1000, "math:medium":      3000, "math:hard":      6000,
-    "code:easy":       1500, "code:medium":      4000, "code:hard":      8000,
-    "reasoning:easy":  1000, "reasoning:medium": 3000, "reasoning:hard": 6000,
-    "creative:easy":   1500, "creative:medium":  5000, "creative:hard":  8000,
+    "factual:easy":     8_000, "factual:medium":   15_000, "factual:hard":   20_000,
+    "math:easy":       14_000, "math:medium":      12_000, "math:hard":      50_000,
+    "code:easy":       14_000, "code:medium":      16_000, "code:hard":      22_000,
+    "reasoning:easy":  28_000, "reasoning:medium": 20_000, "reasoning:hard":  5_000,
+    "creative:easy":   14_000, "creative:medium":  20_000, "creative:hard":  25_000,
 }
 
 # ---------------------------------------------------------------------------
@@ -104,6 +104,11 @@ class ModelSpec:
     # when the model has never been run (no historical data in reputation tracker).
     # Set from benchmarks or prior runs. More accurate than GPU-count lookup.
     expected_tokens_per_sec: float = 1000.0
+    # Per-token cost rates (USD). Based on GPU allocation cost on Sophia A100s,
+    # proportional to GPU count and compute per token.
+    # Reference: 1 A100 node-hour ≈ $4 allocation cost; rates scaled by GPU fraction.
+    input_rate_usd_per_token:  float = 1e-6
+    output_rate_usd_per_token: float = 2e-6
     # Cap context length (tokens). Required for large models on fewer GPUs to keep
     # KV cache within VRAM. 0 = let vLLM choose its default.
     max_model_len: int = 0
@@ -120,6 +125,8 @@ MODEL_CATALOG: dict[str, ModelSpec] = {
         min_accuracy_capability={"factual": 0.70, "creative": 0.70, "reasoning": 0.68},
         efficiency_tokens_per_joule=13.0,
         expected_tokens_per_sec=2800.0,
+        input_rate_usd_per_token=5e-8,   # $0.05/M — market rate for commoditized 7B/8B
+        output_rate_usd_per_token=1e-7,  # $0.10/M
     ),
     "deepseek-r1-7b": ModelSpec(
         model_id="deepseek-r1-7b", model_name="deepseek-ai/DeepSeek-R1-Distill-Qwen-7B",
@@ -128,6 +135,8 @@ MODEL_CATALOG: dict[str, ModelSpec] = {
         min_accuracy_capability={"math": 0.82, "reasoning": 0.80, "code": 0.75},
         efficiency_tokens_per_joule=13.0,
         expected_tokens_per_sec=1200.0,
+        input_rate_usd_per_token=6e-8,   # $0.06/M — distilled reasoning 7B, slight output premium
+        output_rate_usd_per_token=1.4e-7, # $0.14/M — long CoT chains increase output volume
     ),
     "qwen3-coder-30b": ModelSpec(
         model_id="qwen3-coder-30b", model_name="Qwen/Qwen3-Coder-30B-A3B-Instruct",
@@ -136,6 +145,8 @@ MODEL_CATALOG: dict[str, ModelSpec] = {
         min_accuracy_capability={"code": 0.91, "math": 0.88, "reasoning": 0.87},
         efficiency_tokens_per_joule=12.0,  # MoE 3.3B active ≈ 3× more efficient than dense 32B
         expected_tokens_per_sec=2500.0,    # 3.3B active params → ~3.5× faster than dense 32B
+        input_rate_usd_per_token=1.5e-7,  # $0.15/M — MoE lowers active-param cost despite 30B total
+        output_rate_usd_per_token=6e-7,   # $0.60/M
         max_model_len=8192,               # 60GB weights on 2×40GB; 20GB left for KV cache
         extra_vllm_args=["--trust-remote-code"],
     ),
@@ -146,6 +157,8 @@ MODEL_CATALOG: dict[str, ModelSpec] = {
         min_accuracy_capability={"_default": 0.83},
         efficiency_tokens_per_joule=5.0,
         expected_tokens_per_sec=1000.0,   # ~1000 tok/s on 2 A100s (54GB weights)
+        input_rate_usd_per_token=8e-8,   # $0.08/M — Gemma-3 priced aggressively (e.g. DeepInfra)
+        output_rate_usd_per_token=1.6e-7, # $0.16/M
         max_model_len=4096,               # 54GB weights leaves ~26GB KV cache on 2×40GB
         extra_vllm_args=["--trust-remote-code"],
     ),
@@ -156,6 +169,8 @@ MODEL_CATALOG: dict[str, ModelSpec] = {
         min_accuracy_capability={"math": 0.90, "reasoning": 0.88, "code": 0.82},
         efficiency_tokens_per_joule=6.0,
         expected_tokens_per_sec=900.0,    # 14B with reasoning, 28GB weights → fast on 2×40GB
+        input_rate_usd_per_token=1e-7,   # $0.10/M — roughly 2× the 7B distill baseline
+        output_rate_usd_per_token=2.5e-7, # $0.25/M
         max_model_len=8192,
     ),
     # ── For upgrade experiment only: old coder model (dense 32B) ────────────────
@@ -168,6 +183,8 @@ MODEL_CATALOG: dict[str, ModelSpec] = {
         min_accuracy_capability={"code": 0.91, "math": 0.88},
         efficiency_tokens_per_joule=3.5,
         expected_tokens_per_sec=350.0,  # 32B dense on 2×A100: ~350 tok/s measured
+        input_rate_usd_per_token=2e-7,   # $0.20/M — dense 32B, ~2× R1-14B rate
+        output_rate_usd_per_token=5e-7,  # $0.50/M
         # max_model_len=4096: 32B bf16 = 64GB weights; 2×40GB = 80GB total;
         # only 16GB headroom → must reduce context from default to fit KV cache.
         max_model_len=4096,
@@ -183,6 +200,8 @@ MODEL_CATALOG: dict[str, ModelSpec] = {
         # Observed P50=9.1s at 100 req/s; 500 tok/s was decode-only and far too optimistic.
         # At 100 tok/s the TTCA cold-start estimate is ~3s, preventing llama4-scout from
         # winning routing unfairly before the reputation tracker has real measurements.
+        input_rate_usd_per_token=1e-7,   # $0.10/M — efficient MoE, aggressively priced
+        output_rate_usd_per_token=3e-7,  # $0.30/M
         max_model_len=8192,
         extra_vllm_args=["--trust-remote-code"],
     ),
@@ -610,7 +629,9 @@ class DynamicProvisioner:
             "domains":    spec.domains,
             "min_accuracy_capability": spec.min_accuracy_capability,
             "accuracy_priors":         model_priors,
-            "efficiency_tokens_per_joule": spec.efficiency_tokens_per_joule,
+            "efficiency_tokens_per_joule":  spec.efficiency_tokens_per_joule,
+            "input_rate_usd_per_token":     spec.input_rate_usd_per_token,
+            "output_rate_usd_per_token":    spec.output_rate_usd_per_token,
             "skip_calibration": True,
         }
         try:
