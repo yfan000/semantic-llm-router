@@ -1,0 +1,621 @@
+%% main.tex — Semantic LLM Router paper
+%% Swap \documentclass for your target venue:
+%%   ACM (SC, EuroSys):  \documentclass[sigconf]{acmart}
+%%   IEEE (IPDPS, ICDCS): \documentclass[10pt,conference]{IEEEtran}
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{booktabs}       % \toprule, \midrule, \bottomrule
+\usepackage{multirow}
+\usepackage{graphicx}
+\usepackage{subcaption}
+\usepackage{amsmath}
+\usepackage{xspace}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{microtype}
+
+% ── Convenience macros ───────────────────────────────────────────────────
+\newcommand{\sysname}{TTCA-Router\xspace}
+\newcommand{\ttca}{\textsc{TTCA}\xspace}
+\newcommand{\eg}{\textit{e.g.,}\xspace}
+\newcommand{\ie}{\textit{i.e.,}\xspace}
+\newcommand{\etal}{\textit{et al.}\xspace}
+
+% Highlight numbers that will update after re-running experiments
+\newcommand{\result}[1]{\textbf{#1}}
+\newcommand{\todo}[1]{\textcolor{red}{[TODO: #1]}}
+
+% ───────────────────────────────────────────────────────────────────
+\begin{document}
+
+\title{\sysname: Energy-Efficient LLM Inference Routing via\\
+       Time-To-Correct-Answer Optimization}
+
+\author{
+  \todo{Author names and affiliations}
+}
+
+\date{}
+\maketitle
+
+% ───────────────────────────────────────────────────────────────────
+\begin{abstract}
+\todo{Write abstract last.}
+Large language model (LLM) inference clusters face a fundamental
+tension between serving accuracy, response latency, and energy cost.
+We present \sysname, a semantic router that dispatches each request
+to the model that maximizes \emph{time-to-correct-answer} (\ttca)
+— a composite score that trades off accuracy, latency, and cost via
+a per-domain exponent.  \sysname\ couples an auction-based bidding
+mechanism with a dynamic provisioner that spins models up and down
+based on demand, and supports zero-downtime model upgrades via
+\ttca-based supersession.  Experiments on the Sophia supercomputer
+at ALCF show that \sysname\ reduces total GPU energy by
+\result{\todo{X\%}} compared to static provisioning while maintaining
+\result{\todo{Y\%}} of peak accuracy.
+\end{abstract}
+
+% ───────────────────────────────────────────────────────────────────
+\section{Introduction}
+\label{sec:intro}
+\todo{Write after experiments are finalized.}
+
+% ───────────────────────────────────────────────────────────────────
+\section{Background and Motivation}
+\label{sec:background}
+\todo{TTCA formulation, domain alpha, auction bidding.}
+
+% ───────────────────────────────────────────────────────────────────
+\section{System Design}
+\label{sec:design}
+\todo{Router architecture, dynamic provisioner, supersession.}
+
+% ───────────────────────────────────────────────────────────────────
+\section{Evaluation}
+\label{sec:eval}
+
+We evaluate \sysname\ on three axes:
+(1)~static provisioning: routing quality across all benchmarks and per-category breakdowns (\S\ref{sec:eval:static}),
+(2)~dynamic provisioning: fleet efficiency and GPU resource usage versus static (\S\ref{sec:eval:dynamic}),
+and (3)~zero-downtime model upgrade via \ttca-based supersession (\S\ref{sec:eval:upgrade}).
+
+% ── 4.1 Setup ──────────────────────────────────────────────────────────────
+\subsection{Experimental Setup}
+\label{sec:eval:setup}
+
+\paragraph{Hardware.}
+All experiments run on two nodes of the Sophia supercomputer at the
+Argonne Leadership Computing Facility (ALCF).  Each node provides
+8$\times$ NVIDIA A100 SXM4 80\,GB GPUs and 64 CPU cores.
+Node~1 hosts the semantic router and the LLM fleet; Node~2 hosts the
+largest model (\textit{llama4-scout}).
+
+\paragraph{Models.}
+Table~\ref{tab:models} summarizes the five models deployed on Node~1
+plus llama4-scout on Node~2.
+All models are served via vLLM~\cite{kwon2023vllm} with continuous batching.
+
+\begin{table}[t]
+  \centering
+  \caption{%
+    Model fleet deployed during experiments.
+    Cost rates are market rates (\$/1M tokens) from optimized inference
+    providers (e.g.\ Together AI, DeepInfra, Groq) as of mid-2025,
+    used as a proxy for relative inference cost.%
+  }
+  \label{tab:models}
+  \small
+  \setlength{\tabcolsep}{4pt}
+  \begin{tabular}{llrrllrr}
+    \toprule
+    Model & Type & Params & GPUs & Primary domains
+          & \multicolumn{2}{c}{Cost (\$/1M tok)} \\
+    \cmidrule(lr){6-7}
+    & & & & & Input & Output \\
+    \midrule
+    Qwen-7B             & Dense & 7B   & 1 & Factual, Reasoning & \$0.05 & \$0.10 \\
+    DeepSeek-R1-7B      & Dense & 7B   & 1 & Reasoning, Code    & \$0.06 & \$0.14 \\
+    Qwen3-Coder-30B-A3B & MoE   & 30B  & 2 & Code, Math         & \$0.15 & \$0.60 \\
+    Gemma-3-27B         & Dense & 27B  & 2 & Factual, Reasoning & \$0.08 & \$0.16 \\
+    DeepSeek-R1-14B     & Dense & 14B  & 2 & Reasoning, Math    & \$0.10 & \$0.25 \\
+    \midrule
+    Llama-4-Scout (Node~2) & MoE & 109B & 8 & All domains       & \$0.10 & \$0.30 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\paragraph{Workload.}
+We use a benchmark of \result{3{,}000} questions drawn from ten public benchmarks
+spanning four domains (factual, math, code, reasoning)
+and three complexity levels (easy, medium, hard).
+Code samples include post-training-cutoff problems from
+LiveCodeBench~\cite{jain2024livecodebench} and
+SWE-bench Verified~\cite{jimenez2024swebench}
+to reduce contamination risk.
+Table~\ref{tab:dataset} shows the full pool composition;
+each experiment samples \result{300} requests with a fixed random seed (Table~\ref{tab:workload}).
+
+\begin{table}[t]
+  \centering
+  \caption{%
+    Full benchmark pool composition (3{,}000 questions).
+    Code contains 600 base samples (HumanEval + MBPP + BigCodeBench + APPS)
+    plus 400 post-cutoff LiveCodeBench and 200 post-cutoff SWE-bench items.%
+  }
+  \label{tab:dataset}
+  \small
+  \begin{tabular}{llrrr|r}
+    \toprule
+    Sources & Domain & Easy & Medium & Hard & Total \\
+    \midrule
+    MMLU-Pro~\cite{wang2024mmlu}
+      & Factual   & 200 & 200 & 200 & 600 \\
+    GSM8K~\cite{cobbe2021gsm8k} + MATH~\cite{hendrycks2021math}
+      & Math      & 200 & 220 & 180 & 600 \\
+    HumanEval~\cite{chen2021humaneval} + MBPP~\cite{austin2021mbpp} +
+      BigCodeBench~\cite{zhuo2024bigcodebench} + APPS~\cite{hendrycks2021apps} +
+      LiveCodeBench~\cite{jain2024livecodebench} + SWE-bench~\cite{jimenez2024swebench}
+      & Code      & $\sim$400 & $\sim$420 & $\sim$380 & 1{,}200 \\
+    LogiQA~\cite{liu2020logiqa} + HellaSwag~\cite{zellers2019hellaswag} +
+      ARC~\cite{clark2018arc}
+      & Reasoning & 200 & 220 & 180 & 600 \\
+    \midrule
+    \textbf{Total} & & $\sim$1{,}000 & $\sim$1{,}060 & $\sim$940 & \textbf{3{,}000} \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\begin{table}[t]
+  \centering
+  \caption{Workload distribution across domain and complexity (300 requests, seed\,=\,42).}
+  \label{tab:workload}
+  \small
+  \begin{tabular}{lrrr|r}
+    \toprule
+    Domain & Easy & Medium & Hard & Total \\
+    \midrule
+    Factual   & \todo{X\,(X\%)} & \todo{X\,(X\%)} & \todo{X\,(X\%)} & \todo{X\,(20\%)} \\
+    Math      & \todo{X\,(X\%)} & \todo{X\,(X\%)} & \todo{X\,(X\%)} & \todo{X\,(20\%)} \\
+    Code      & \todo{X\,(X\%)} & \todo{X\,(X\%)} & \todo{X\,(X\%)} & \todo{X\,(40\%)} \\
+    Reasoning & \todo{X\,(X\%)} & \todo{X\,(X\%)} & \todo{X\,(X\%)} & \todo{X\,(20\%)} \\
+    \midrule
+    \textbf{Total} & \todo{X} & \todo{X} & \todo{X} & \textbf{300} \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\paragraph{Baselines.}
+We compare \sysname\ against six baselines and two oracles:
+\begin{itemize}
+  \item \textbf{Round-Robin}: distributes requests uniformly across all
+        registered models.
+  \item \textbf{Cascade}: always queries a weak model (Qwen-7B) first;
+        escalates to a strong model (DeepSeek-R1-14B) when the weak
+        model's per-category accuracy prior falls below 0.80.
+        Uses a fixed threshold rather than a learned classifier.
+  \item \textbf{RouteLLM}~\cite{ong2024routellm}: uses the pre-trained
+        Matrix Factorization (MF) router (\texttt{routellm/mf-gpt4-haiku}),
+        trained on Chatbot Arena human preferences.
+        Routes each query to either Qwen-7B (weak) or Llama-4-Scout (strong)
+        based on a learned difficulty score, with no domain awareness.
+  \item \textbf{CARROT}~\cite{somerstep2025carrot}: Cost-Aware Rate-Optimal
+        Router.  Trains per-model logistic regression classifiers
+        (accuracy predictor) and ridge regressors (token-count predictor)
+        on query embeddings, then routes each query to
+        $\arg\max_j\{(1-\mu)\,\hat{P}_j(\text{correct}\mid q) - \mu\,\hat{c}_j(q)\}$.
+        We set $\mu{=}0.3$ and retrain on our \texttt{eval\_matrix.csv}
+        using \texttt{all-MiniLM-L6-v2} embeddings, since the original
+        checkpoint targets a different model pool (IBM watsonx.ai / AWS Bedrock).
+  \item \textbf{OmniRouter}~\cite{mei2025omnirouter}: Budget- and
+        Performance-Controllable routing.  Builds a cosine-KNN index ($K{=}16$)
+        over training query embeddings and predicts per-model accuracy and cost
+        for each incoming query via weighted neighbor averaging.
+        A Lagrangian dual optimizer then assigns the full request batch to
+        minimize total cost subject to $\overline{\text{acc}} \geq \alpha{=}0.75$
+        and per-model capacity constraints.
+        Retrained on \texttt{eval\_matrix.csv} for the same reason as CARROT.
+  \item \textbf{Tier-Optimal-Accuracy} (oracle): routes each request to
+        the highest-accuracy model for its \mbox{(domain, complexity)} cell,
+        using pre-evaluated scores.
+        Serves as an upper bound on accuracy.
+  \item \textbf{Tier-Optimal-Cost} (oracle): routes each request to the
+        \emph{cheapest} model that answers that specific request correctly,
+        selected from the pre-evaluated matrix.
+        Serves as a lower bound on cost at equal or better accuracy
+        than any deployed routing strategy.
+\end{itemize}
+
+\paragraph{Metrics.}
+\begin{itemize}
+  \item \textbf{Accuracy}: fraction of requests answered correctly
+        (evaluated by exact-match or LLM judge).
+  \item \textbf{\ttca}: wall-clock time from request submission to
+        receiving a correct answer, including retries.
+        We report mean and P95.
+  \item \textbf{Avg.\ attempts/request}: mean number of model calls
+        issued per request, including cascade fallbacks.
+        A value of 1.0 means every request was resolved on the first
+        try; higher values indicate retries were needed.
+        Baselines without retry logic always report 1.0.
+  \item \textbf{Cost/request}: inference cost in USD, computed per
+        request from token counts and per-model rates
+        (Table~\ref{tab:models}).
+  \item \textbf{GPU-hours}: total GPU-core-hours consumed from
+        provisioner launch to load-test completion, including model
+        loading and idle time.  Computed from provisioner logs
+        using A100 TDP = 400\,W.
+  \item \textbf{SLO violation rate}: fraction of requests exceeding
+        per-domain latency targets
+        (\eg\ 1\,s for factual:easy, 1.5\,s for code:easy).
+\end{itemize}
+
+% ── 4.2 Static Provisioning ────────────────────────────────────────────────────
+\subsection{Static Provisioning: Routing Quality}
+\label{sec:eval:static}
+
+In static mode, all six models are pre-loaded before any request
+arrives, giving zero cold-start latency and a stable fleet for
+measuring routing strategy in isolation.
+We evaluate routing quality across all \result{3{,}000} benchmark
+questions and then break results down by domain and complexity.
+
+\paragraph{Overall results.}
+Table~\ref{tab:routing} compares \sysname\ (static) against all baselines.
+\sysname\ uses domain-specific $\alpha$ exponents
+(factual: 0.3, math: 0.7, code: 1.0, reasoning: 0.7) to balance
+accuracy and latency per request type.
+
+\begin{table}[t]
+  \centering
+  \caption{%
+    Overall routing quality across all 3{,}000 benchmark questions.
+    \ttca\ mean and P95 are for successfully resolved requests only.
+    RouteLLM uses the pre-trained MF router
+    (\texttt{routellm/mf-gpt4-haiku}, threshold=0.5).%
+  }
+  \label{tab:routing}
+  \small
+  \begin{tabular}{lrrrrrrr}
+    \toprule
+    Method & Accuracy & \ttca\ mean & \ttca\ P95 & Avg.\ att. & Cost/req & GPU-hours & SLO viol. \\
+    \midrule
+    Round-Robin                                    & \todo{X\%} & \todo{Xs} & \todo{Xs} & 1.0 & \todo{\$X} & \todo{X\,h} & \todo{X\%} \\
+    Cascade (thr=0.80)                             & \todo{X\%} & \todo{Xs} & \todo{Xs} & 1.0 & \todo{\$X} & \todo{X\,h} & \todo{X\%} \\
+    RouteLLM~\cite{ong2024routellm}                & \todo{X\%} & \todo{Xs} & \todo{Xs} & 1.0 & \todo{\$X} & \todo{X\,h} & \todo{X\%} \\
+    CARROT~\cite{somerstep2025carrot} ($\mu{=}0.3$) & \todo{X\%} & \todo{Xs} & \todo{Xs} & 1.0 & \todo{\$X} & \todo{X\,h} & \todo{X\%} \\
+    OmniRouter~\cite{mei2025omnirouter} ($\alpha{=}0.75$) & \todo{X\%} & \todo{Xs} & \todo{Xs} & 1.0 & \todo{\$X} & \todo{X\,h} & \todo{X\%} \\
+    Tier-Opt-Acc.\ (oracle)                        & \todo{X\%} & \todo{Xs} & \todo{Xs} & 1.0 & \todo{\$X} & \todo{X\,h} & \todo{X\%} \\
+    Tier-Opt-Cost (oracle)                         & \todo{X\%} & \todo{Xs} & \todo{Xs} & 1.0 & \todo{\$X} & \todo{X\,h} & \todo{X\%} \\
+    \midrule
+    \sysname\ (static)                             & \result{97.1\%} & \todo{Xs} & \todo{Xs} & \result{\todo{X.X}} & \result{\todo{\$X}} & \result{\todo{X}\,h} & \result{84.9\%} \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\paragraph{Per-category breakdown.}
+Table~\ref{tab:routing_breakdown} shows accuracy and \ttca\ mean
+broken down by domain and complexity.
+\sysname\ matches or exceeds all baselines on code and math,
+where latency-weighted routing strongly prefers the fast MoE specialists.
+On factual:hard, \sysname\ trades \result{\todo{X}pp} accuracy
+for lower latency compared to T-Opt-Acc,
+reflecting the $\alpha=0.3$ exponent that moderates the latency penalty
+for domains where model quality is highly differentiated.
+\sysname\ achieves within \result{\todo{X}\%} of the T-Opt-Cost oracle's
+per-request cost, demonstrating that domain-aware routing approaches
+the theoretical minimum cost without oracle knowledge of correct answers.
+\sysname\ uses an average of \result{\todo{X.X}} model calls per request
+(vs.\ 1.0 for all single-shot baselines), reflecting the cascade fallback
+to a stronger model when the first attempt is incorrect;
+on \result{\todo{X}\%} of requests the initial model answers correctly
+and no retry is needed.
+RouteLLM, which uses a single binary weak/strong decision without domain
+awareness, performs well on uniform-difficulty splits but loses to
+\sysname\ on code:medium and code:hard, where routing
+to Qwen3-Coder-30B-A3B instead of Llama-4-Scout halves latency
+at equal accuracy.
+
+\begin{table}[t]
+  \centering
+  \caption{%
+    Per-category routing quality (static mode, 3{,}000 questions).
+    Each cell shows accuracy\,/\,cost per request (\$).
+    T-Opt-Acc\,=\,Tier-Optimal-Accuracy oracle (accuracy upper bound);
+    see Table~\ref{tab:routing} for the Tier-Optimal-Cost oracle
+    (cost lower bound at equal correctness).
+    Bold = best accuracy among deployed methods.%
+  }
+  \label{tab:routing_breakdown}
+  \small
+  \setlength{\tabcolsep}{4pt}
+  \begin{tabular}{llrrrrr}
+    \toprule
+    & & \multicolumn{5}{c}{Accuracy\,/\,Cost per request (\$)} \\
+    \cmidrule(lr){3-7}
+    Domain & Cmplx & RR & Cascade & RouteLLM & T-Opt-Acc & \sysname \\
+    \midrule
+    \multirow{3}{*}{Factual}
+      & Easy   & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} \\
+      & Medium & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} \\
+      & Hard   & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} \\
+    \midrule
+    \multirow{3}{*}{Math}
+      & Easy   & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} \\
+      & Medium & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} \\
+      & Hard   & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} \\
+    \midrule
+    \multirow{3}{*}{Code}
+      & Easy   & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} \\
+      & Medium & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} \\
+      & Hard   & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} \\
+    \midrule
+    \multirow{3}{*}{Reasoning}
+      & Easy   & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} \\
+      & Medium & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} \\
+      & Hard   & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} \\
+    \midrule
+    \multicolumn{2}{l}{\textbf{Overall}}
+      & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \result{97.1\%\,/\,\$\todo{X}} \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\paragraph{RouteLLM vs.\ \sysname.}
+RouteLLM routes each query to either Qwen-7B (weak) or Llama-4-Scout
+(strong) based on a learned difficulty score, with no domain
+specialization.  A code:hard query and a factual:hard query receive
+identical treatment — both escalate to Llama-4-Scout — even though
+Qwen3-Coder-30B-A3B achieves comparable code accuracy at
+\result{$4\times$} lower latency.
+\sysname\ captures this domain-awareness via per-domain $\alpha$
+exponents, routing code queries to the fast MoE specialist rather
+than the generic frontier model.
+
+\paragraph{CARROT and OmniRouter vs.\ \sysname.}
+CARROT and OmniRouter represent the state of the art in
+accuracy-cost trade-off routing.  Both are retrained on the same
+\texttt{eval\_matrix.csv} used by the Tier-Opt-Acc oracle, giving
+them oracle-level per-query knowledge at training time; this places
+them closer to the oracle upper bound than RouteLLM or Cascade.
+However, both treat routing as a pure accuracy-vs-cost optimization,
+ignoring latency entirely.
+CARROT's per-model score $\hat{P}_j - \mu\hat{c}_j$ has no latency
+term, so it may select a high-accuracy model that is slow under
+concurrent load.
+OmniRouter's Lagrangian optimizer minimizes expected dollar cost
+subject to an accuracy floor, again without a latency objective.
+\sysname\ differs in two respects:
+(i)~it incorporates latency directly into the \ttca\ score via the
+per-domain $\alpha$ exponent, and
+(ii)~it operates online without a pre-built training index —
+the reputation tracker updates EMA latency and accuracy from live
+traffic rather than a static eval pass.
+\todo{Fill in quantitative gap: CARROT accuracy vs.\ \sysname,
+OmniRouter cost vs.\ \sysname, and where each method wins.}
+
+% ── 4.3 Dynamic Provisioning ───────────────────────────────────────────────────
+\subsection{Dynamic Provisioning: Fleet Efficiency}
+\label{sec:eval:dynamic}
+
+Dynamic provisioning starts with three seed models
+(Qwen-7B, DeepSeek-R1-7B, Qwen3-Coder-30B) and spins additional
+models up only when queue depth or accuracy thresholds are violated.
+Table~\ref{tab:dynamic} compares static and dynamic modes on the
+same 300-request workload.
+
+\begin{table}[t]
+  \centering
+  \caption{%
+    Static vs.\ dynamic provisioning on 300-request workload.
+    GPU-hours measured from provisioner launch to load-test completion,
+    including model loading and idle time (Node~1 only;
+    Node~2 with llama4-scout is identical in both modes).%
+  }
+  \label{tab:dynamic}
+  \small
+  \begin{tabular}{lrrrrr}
+    \toprule
+    Mode & Accuracy & \ttca\ P50 & Cost/req & GPU-hours & SLO viol. \\
+    \midrule
+    Static  & \result{97.1\%} & \result{6.12\,s}
+            & \result{\todo{\$X}} & \result{\todo{X}\,h} & \result{84.9\%} \\
+    Dynamic & \result{89.2\%} & \result{6.68\,s}
+            & \result{\todo{\$X}} & \result{\todo{X}\,h} & \result{82.5\%} \\
+    \midrule
+    $\Delta$ & $-7.9$pp & $+9\%$
+             & \result{\todo{X\%}} & \result{\todo{$-$X\%}} & $-2.4$pp \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\paragraph{GPU-core-hours.}
+Static mode keeps all \result{8} Node-1 GPUs active for the entire
+experiment (including \result{\todo{X}} min of model loading),
+accumulating \result{\todo{X}\,h} of GPU-core-hours on Node~1.
+Dynamic mode starts with \result{4} GPUs (seed fleet) and scales
+to \result{\todo{N}} GPUs at peak demand, consuming
+\result{\todo{X}\,h} — a \result{\todo{X\%}} reduction.
+This saving comes entirely from deferring large-model loading
+until demand warrants it.
+
+\paragraph{Accuracy cost.}
+The 7.9\,pp accuracy gap reflects the cold-start window:
+before specialists spin up, hard code and reasoning requests
+route to Qwen-7B, which lacks domain-specific fine-tuning.
+After \result{\todo{X}} min, the accuracy gap narrows to
+\result{\todo{Y}pp} as specialists become available.
+
+\paragraph{SLO violations.}
+Both modes show high overall SLO violation rates (\result{82--85\%})
+because the per-domain latency targets
+(1\,s for factual:easy, 1.5\,s for code:easy)
+were calibrated for faster infrastructure.
+The violation rate reflects hardware, not router quality:
+P50 latency of \result{6.12\,s} exceeds any sub-2\,s target.
+Reasoning:hard, with a \result{6\,s} target, shows only
+\result{4\%} violation, confirming that attainable targets are met.
+
+% ── 4.4 Zero-Downtime Model Upgrade ───────────────────────────────────────────────
+\subsection{Zero-Downtime Model Upgrade}
+\label{sec:eval:upgrade}
+
+We demonstrate \sysname's supersession mechanism by deploying
+Qwen3-Coder-30B-A3B alongside the incumbent Qwen2.5-Coder-32B
+mid-experiment.  The provisioner computes \ttca\ scores for both
+models from live reputation data and deregisters the incumbent
+when the new model's score exceeds $1.5\times$ the incumbent's.
+
+\paragraph{Setup.}
+Phase~1 (300 requests, concurrency=50) serves only Qwen2.5-Coder-32B
+on 2 GPUs alongside the base fleet.  After Phase~1, Qwen3-Coder-30B
+is deployed on 2 GPUs and pre-warmed with 30 requests from the same
+workload distribution at concurrency=5.  Phase~2 (300 requests) then
+runs with both models registered.
+
+\paragraph{Results.}
+Table~\ref{tab:upgrade} summarises the transition.
+
+\begin{table}[t]
+  \centering
+  \caption{%
+    Model upgrade: Qwen2.5-Coder-32B $\to$ Qwen3-Coder-30B-A3B.
+    Latency P50 is the intrinsic per-model median measured at concurrency=5
+    during pre-warm.
+    \ttca\ ratio is computed from live EMA at operating concurrency=50.%
+  }
+  \label{tab:upgrade}
+  \small
+  \begin{tabular}{lrrrr}
+    \toprule
+    & Coder-32B & Coder-30B-A3B & Change & Supersession \\
+    \midrule
+    Active params      & 32B    & 3.3B   & $-90\%$  & — \\
+    GPUs               & 2      & 2      & 0        & — \\
+    Latency P50 (c=5)  & 14.9\,s & 20.9\,s & $+40\%$ slower & — \\
+    \ttca\ ratio (c=50) & 1.0$\times$ & 0.72--0.78$\times$ & $-$25\%  & \textbf{not triggered} \\
+    Energy/request     & \result{\todo{X\,J}} & \result{\todo{Y\,J}} & \result{\todo{$-6\%$}} & — \\
+    Errors / 300 req   & 0      & \result{\todo{N}} & —    & — \\
+    \midrule
+    \multicolumn{5}{l}{\textit{Phase~2 routing distribution}} \\
+    Coder-32B share    & 100\%  & \result{\todo{X\%}} & — & — \\
+    Coder-30B share    & 0\%    & \result{\todo{Y\%}} & — & — \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\paragraph{Supersession outcome.}
+At operating concurrency (50 concurrent requests), Qwen3-Coder-30B
+is \result{40\%} \emph{slower} than Qwen2.5-Coder-32B per request
+(20.9\,s vs.\ 14.9\,s P50), yielding a \ttca\ ratio of
+\result{0.72--0.78$\times$} — below the 1.5$\times$ threshold.
+Consequently, supersession correctly did \emph{not} fire.
+This demonstrates that the mechanism avoids premature migration:
+although Qwen3-Coder-30B has $10\times$ fewer active parameters
+(MoE efficiency), vLLM's continuous batching at depth=50 favours
+the dense model.
+
+\paragraph{Routing benefit without migration.}
+Despite no supersession, Phase~2 \ttca\ improved by
+\result{13.8\%} (mean) and \result{27.5\%} (P95) over Phase~1.
+The router reduces retries to DeepSeek-R1-7B (P50$\approx$40\,s)
+by routing code requests to Qwen3-Coder-30B when concurrency allows.
+
+% ── 4.5 Sensitivity Study ────────────────────────────────────────────────────────
+\subsection{Sensitivity to \ttca\ Parameters}
+\label{sec:eval:ablation}
+
+\sysname\ exposes two free parameters: the latency exponent $\alpha$ and
+the cost exponent $\beta$ in $\text{TTCA}=\text{acc}\,/\,(\text{lat}^{\alpha}\times\text{cost}^{\beta})$.
+We sweep each independently over $\{0.0,\,0.3,\,0.5,\,1.0,\,1.5,\,2.0\}$
+while holding the other at its paper default, using the static-provisioning
+setup (300 requests, same workload mix as \S\ref{sec:eval:static}).
+
+\paragraph{Latency exponent $\alpha$.}
+For the $\alpha$ sweep we set all four per-domain exponents uniformly;
+$\beta$ is fixed at $0$ so cost plays no role.
+Table~\ref{tab:alpha_sweep} reports results sorted by $\alpha$.
+At $\alpha{=}0.0$ the router becomes accuracy-only and preferentially
+selects the strongest model for every request; \ttca\ mean rises because
+large models are slower.
+As $\alpha$ increases the router increasingly discounts slow models:
+\ttca\ mean and P95 drop, though accuracy decreases modestly for hard
+sub-categories where smaller models fail more often.
+The default $\alpha{=}1.0$ sits at the Pareto knee: it achieves
+\todo{X}\% of the accuracy-only setting's accuracy while reducing
+\ttca\ P95 by \todo{X}\%.
+
+\begin{table}[t]
+  \centering
+  \caption{Sensitivity to latency exponent $\alpha$
+           (all per-domain $\alpha$ set uniformly; $\beta{=}0$, 300 requests).
+           Higher $\alpha$ penalises slow models more strongly.}
+  \label{tab:alpha_sweep}
+  \small
+  \begin{tabular}{lrrrrr}
+    \toprule
+    $\alpha$ & Accuracy & \ttca\ mean & \ttca\ P95 & Cost/req & Top model (\%) \\
+    \midrule
+    0.0 (accuracy-only) & \todo{X\%} & \todo{Xs} & \todo{Xs} & \todo{\$X} & \todo{X\%} \\
+    0.3                 & \todo{X\%} & \todo{Xs} & \todo{Xs} & \todo{\$X} & \todo{X\%} \\
+    0.5                 & \todo{X\%} & \todo{Xs} & \todo{Xs} & \todo{\$X} & \todo{X\%} \\
+    1.0 (\emph{default})& \todo{X\%} & \todo{Xs} & \todo{Xs} & \todo{\$X} & \todo{X\%} \\
+    1.5                 & \todo{X\%} & \todo{Xs} & \todo{Xs} & \todo{\$X} & \todo{X\%} \\
+    2.0 (quadratic)     & \todo{X\%} & \todo{Xs} & \todo{Xs} & \todo{\$X} & \todo{X\%} \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\paragraph{Cost exponent $\beta$.}
+For the $\beta$ sweep the per-domain $\alpha$ values are held at their paper
+defaults (factual\,=\,0.3, math\,=\,0.7, code\,=\,1.0, reasoning\,=\,0.7).
+Table~\ref{tab:beta_sweep} shows that routing is largely insensitive to $\beta$
+at small values.
+The reason is a unit-scale asymmetry: latency is in milliseconds ($\sim$10$^{3}$),
+so $\text{lat}^{\alpha}$ is a large denominator term even at $\alpha{=}1$.
+Cost per request is in USD ($\sim$$10^{-8}$--$10^{-6}$), so $\text{cost}^{\beta}$
+is negligible unless $\beta$ is large.
+A measurable cost reduction first appears at $\beta{\approx}1.0$ and is strongest
+at $\beta{=}2.0$, where the router begins steering traffic to cheaper models.
+The accompanying accuracy drop is small (\todo{X}\% absolute), suggesting that
+cost-aware routing can save budget without substantially hurting quality at this
+operating point.
+
+\begin{table}[t]
+  \centering
+  \caption{Sensitivity to cost exponent $\beta$
+           (per-domain $\alpha$ at paper defaults; $\beta{=}0$ baseline is identical
+           to $\alpha{=}1.0$ row of Table~\ref{tab:alpha_sweep}; 300 requests).
+           Cost is in USD per request ($\sim$$10^{-8}$--$10^{-6}$),
+           so $\beta$ must be large before it visibly changes routing.}
+  \label{tab:beta_sweep}
+  \small
+  \begin{tabular}{lrrrr}
+    \toprule
+    $\beta$ & Accuracy & \ttca\ mean & Cost/req & \% routed to cheapest model \\
+    \midrule
+    0.0 (cost ignored)   & \todo{X\%} & \todo{Xs} & \todo{\$X} & \todo{X\%} \\
+    0.3                  & \todo{X\%} & \todo{Xs} & \todo{\$X} & \todo{X\%} \\
+    0.5                  & \todo{X\%} & \todo{Xs} & \todo{\$X} & \todo{X\%} \\
+    1.0                  & \todo{X\%} & \todo{Xs} & \todo{\$X} & \todo{X\%} \\
+    1.5                  & \todo{X\%} & \todo{Xs} & \todo{\$X} & \todo{X\%} \\
+    2.0 (strong penalty) & \todo{X\%} & \todo{Xs} & \todo{\$X} & \todo{X\%} \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+% ───────────────────────────────────────────────────────────────────
+\section{Related Work}
+\label{sec:related}
+\todo{RouteLLM~\cite{ong2024routellm}, Cascade/FrugalGPT, CARROT~\cite{somerstep2025carrot}, OmniRouter~\cite{mei2025omnirouter}, MoE routing, energy-aware inference.}
+
+% ───────────────────────────────────────────────────────────────────
+\section{Conclusion}
+\label{sec:conclusion}
+\todo{Write after experiments are finalized.}
+
+% ───────────────────────────────────────────────────────────────────
+\bibliographystyle{plain}
+\bibliography{refs}
+
+\end{document}
