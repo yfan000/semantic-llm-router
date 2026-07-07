@@ -15,7 +15,7 @@
 \usepackage{hyperref}
 \usepackage{microtype}
 
-% ── Convenience macros ───────────────────────────────────────────────────
+% ── Convenience macros ─────────────────────────────────────────────
 \newcommand{\sysname}{TTCA-Router\xspace}
 \newcommand{\ttca}{\textsc{TTCA}\xspace}
 \newcommand{\eg}{\textit{e.g.,}\xspace}
@@ -25,6 +25,10 @@
 % Highlight numbers that will update after re-running experiments
 \newcommand{\result}[1]{\textbf{#1}}
 \newcommand{\todo}[1]{\textcolor{red}{[TODO: #1]}}
+\newcommand{\figplaceholder}[2][5cm]{%
+  \framebox[\columnwidth]{%
+    \parbox[c][#1][c]{\dimexpr\columnwidth-2\fboxsep-2\fboxrule\relax}%
+      {\centering\small\textit{#2}}}}
 
 % ───────────────────────────────────────────────────────────────────
 \begin{document}
@@ -80,7 +84,7 @@ We evaluate \sysname\ on three axes:
 (2)~dynamic provisioning: fleet efficiency and GPU resource usage versus static (\S\ref{sec:eval:dynamic}),
 and (3)~zero-downtime model upgrade via \ttca-based supersession (\S\ref{sec:eval:upgrade}).
 
-% ── 4.1 Setup ──────────────────────────────────────────────────────────────
+% ── 4.1 Setup ──────────────────────────────────────────────────────
 \subsection{Experimental Setup}
 \label{sec:eval:setup}
 
@@ -250,7 +254,7 @@ We compare \sysname\ against six baselines and two oracles:
         (\eg\ 1\,s for factual:easy, 1.5\,s for code:easy).
 \end{itemize}
 
-% ── 4.2 Static Provisioning ────────────────────────────────────────────────────
+% ── 4.2 Static Provisioning ────────────────────────────────────────
 \subsection{Static Provisioning: Routing Quality}
 \label{sec:eval:static}
 
@@ -395,7 +399,7 @@ traffic rather than a static eval pass.
 \todo{Fill in quantitative gap: CARROT accuracy vs.\ \sysname,
 OmniRouter cost vs.\ \sysname, and where each method wins.}
 
-% ── 4.3 Dynamic Provisioning ───────────────────────────────────────────────────
+% ── 4.3 Dynamic Provisioning ───────────────────────────────────────
 \subsection{Dynamic Provisioning: Fleet Efficiency}
 \label{sec:eval:dynamic}
 
@@ -457,7 +461,7 @@ P50 latency of \result{6.12\,s} exceeds any sub-2\,s target.
 Reasoning:hard, with a \result{6\,s} target, shows only
 \result{4\%} violation, confirming that attainable targets are met.
 
-% ── 4.4 Zero-Downtime Model Upgrade ───────────────────────────────────────────────
+% ── 4.4 Zero-Downtime Model Upgrade ───────────────────────────────
 \subsection{Zero-Downtime Model Upgrade}
 \label{sec:eval:upgrade}
 
@@ -522,7 +526,7 @@ Despite no supersession, Phase~2 \ttca\ improved by
 The router reduces retries to DeepSeek-R1-7B (P50$\approx$40\,s)
 by routing code requests to Qwen3-Coder-30B when concurrency allows.
 
-% ── 4.5 Sensitivity Study ───────────────────────────────────────────────────────
+% ── 4.5 Sensitivity Study ───────────────────────────────────────────
 \subsection{Sensitivity to \ttca\ Parameters}
 \label{sec:eval:ablation}
 
@@ -531,6 +535,42 @@ the cost exponent $\beta$ in $\text{TTCA}=\text{acc}\,/\,(\text{lat}^{\alpha}\ti
 We sweep each independently over $\{0.0,\,0.3,\,0.5,\,1.0,\,1.5,\,2.0\}$
 while holding the other at its paper default, using the static-provisioning
 setup (300 requests, same workload mix as \S\ref{sec:eval:static}).
+Figure~\ref{fig:sensitivity} visualises both sweeps;
+Tables~\ref{tab:alpha_sweep}--\ref{tab:beta_sweep} report exact values.
+
+\begin{figure}[t]
+  \centering
+  \begin{subfigure}[b]{0.48\columnwidth}
+    \centering
+    \figplaceholder[5.5cm]{%
+      \textbf{Generate:}
+      \texttt{python tests/analyze\_sensitivity.py}
+      \texttt{~~~~--sweep-param alpha}\\[6pt]
+      Line plot: accuracy (\%) and \ttca\ mean (s) vs.\ $\alpha$
+      (dual y-axis).  Mark $\alpha{=}1.0$ default with~$\star$.}
+    \caption{Accuracy and \ttca\ mean vs.\ $\alpha$ ($\beta{=}0$).}
+    \label{fig:alpha_sweep}
+  \end{subfigure}
+  \hfill
+  \begin{subfigure}[b]{0.48\columnwidth}
+    \centering
+    \figplaceholder[5.5cm]{%
+      \textbf{Generate:}
+      \texttt{python tests/analyze\_sensitivity.py}
+      \texttt{~~~~--sweep-param beta}\\[6pt]
+      Line plot: cost/req (\$) and accuracy (\%) vs.\ $\beta$
+      (dual y-axis).  Mark $\beta{=}0.0$ default with~$\star$.}
+    \caption{Cost/req and accuracy vs.\ $\beta$ ($\alpha$ at defaults).}
+    \label{fig:beta_sweep}
+  \end{subfigure}
+  \caption{%
+    Parameter sensitivity: latency exponent $\alpha$ (left) and cost exponent
+    $\beta$ (right), each swept over $\{0.0,\,0.3,\,0.5,\,1.0,\,1.5,\,2.0\}$
+    while the other is held at its paper default.
+    The default operating point is marked with~$\star$.
+    Exact numbers are in Tables~\ref{tab:alpha_sweep}--\ref{tab:beta_sweep}.}
+  \label{fig:sensitivity}
+\end{figure}
 
 \paragraph{Latency exponent $\alpha$.}
 For the $\alpha$ sweep we set all four per-domain exponents uniformly;
