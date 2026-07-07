@@ -44,6 +44,7 @@ SEED=${SEED:-42}
 # Leave empty for all domains (default).
 # Example: DOMAIN_FILTER=code N_REQUESTS=1200 bash scripts/submit_static_vs_dynamic.sh
 DOMAIN_FILTER=${DOMAIN_FILTER:-""}
+DOMAIN_LABEL="${DOMAIN_FILTER:-all}"
 
 TS=$(date +%Y%m%d_%H%M%S)
 LOG_DIR="$HOME/vllm_logs/static_vs_dynamic_${TS}"
@@ -91,7 +92,6 @@ echo "=================================================================="
 
 # ── Generate fixed workload (same for both modes) ─────────────────────────────
 echo ""
-DOMAIN_LABEL="${DOMAIN_FILTER:-all}"
 echo "[0] Generating fixed workload (N=${N_REQUESTS}, seed=${SEED}, domain=${DOMAIN_LABEL})..."
 python3 -c "
 import json, random
