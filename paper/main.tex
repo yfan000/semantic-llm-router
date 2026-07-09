@@ -415,23 +415,26 @@ same 300-request workload.
     Static vs.\ dynamic provisioning on 300-request workload.
     GPU-hours measured from provisioner launch to load-test completion,
     including model loading and idle time (Node~1 only;
-    Node~2 with llama4-scout is identical in both modes).%
+    Node~2 with llama4-scout is identical in both modes).
+    Avg.\ att.\ = average model calls per request (retries included).%
   }
   \label{tab:dynamic}
   \small
-  \begin{tabular}{lrrrrr}
+  \setlength{\tabcolsep}{4pt}
+  \resizebox{\columnwidth}{!}{%
+  \begin{tabular}{lrrrrrrr}
     \toprule
-    Mode & Accuracy & \ttca\ P50 & Cost/req & GPU-hours & SLO viol. \\
+    Mode & Accuracy & \ttca\ mean & \ttca\ P95 & Avg.\ att. & Cost/req & GPU-hours & SLO viol. \\
     \midrule
-    Static  & \result{97.1\%} & \result{6.12\,s}
-            & \result{\todo{\$X}} & \result{\todo{X}\,h} & \result{84.9\%} \\
-    Dynamic & \result{89.2\%} & \result{6.68\,s}
-            & \result{\todo{\$X}} & \result{\todo{X}\,h} & \result{82.5\%} \\
+    Static  & \result{97.1\%} & \result{\todo{X\,s}} & \result{\todo{X\,s}}
+            & \result{\todo{X.X}} & \result{\todo{\$X}} & \result{\todo{X}\,h} & \result{84.9\%} \\
+    Dynamic & \result{89.2\%} & \result{\todo{X\,s}} & \result{\todo{X\,s}}
+            & \result{\todo{X.X}} & \result{\todo{\$X}} & \result{\todo{X}\,h} & \result{82.5\%} \\
     \midrule
-    $\Delta$ & $-7.9$pp & $+9\%$
-             & \result{\todo{X\%}} & \result{\todo{$-$X\%}} & $-2.4$pp \\
+    $\Delta$ & $-7.9$pp & \todo{$\pm$X\%} & \todo{$\pm$X\%}
+             & \todo{$\pm$X.X} & \result{\todo{X\%}} & \result{\todo{$-$X\%}} & $-2.4$pp \\
     \bottomrule
-  \end{tabular}
+  \end{tabular}}
 \end{table}
 
 \paragraph{GPU-core-hours.}
@@ -457,7 +460,7 @@ because the per-domain latency targets
 (1\,s for factual:easy, 1.5\,s for code:easy)
 were calibrated for faster infrastructure.
 The violation rate reflects hardware, not router quality:
-P50 latency of \result{6.12\,s} exceeds any sub-2\,s target.
+\ttca\ mean of \result{\todo{X\,s}} and P50 latency of \result{\todo{X\,s}} exceed any sub-2\,s target.
 Reasoning:hard, with a \result{6\,s} target, shows only
 \result{4\%} violation, confirming that attainable targets are met.
 
