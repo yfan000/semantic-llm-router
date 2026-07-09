@@ -112,7 +112,7 @@ print(f'  By complexity: {dict(sorted(by_complex.items()))}')
 "
 
 
-# ── Helper ──────────────────────────────────────────────────────────────────────────
+# ── Helper ────────────────────────────────────────────────────────────────────
 wait_router() {
     for i in \$(seq 1 60); do
         curl --noproxy '*' -sf "\$ROUTER_URL/router/health" > /dev/null 2>&1 && return 0
@@ -136,6 +136,8 @@ wait_models() {
 kill_all_models() {
     echo "  Stopping all vLLM processes..."
     pkill -f "vllm serve" 2>/dev/null || true
+    # Kill node2 vllm too — pkill only affects the local node
+    ssh "\$NODE2" "pkill -f 'vllm serve' 2>/dev/null || true" </dev/null 2>/dev/null || true
     sleep 10
     # Deregister from router
     curl --noproxy '*' -sf "\$ROUTER_URL/v1/models" \
@@ -151,10 +153,34 @@ for m in json.load(sys.stdin).get('data', []):
 " 2>/dev/null || true
     echo "  All models stopped."
 }
+wait_node2_gpus_free() {
+    echo "  Waiting for node2 GPU memory to free up after static teardown..."
+    for i in \$(seq 1 24); do
+        USED=\$(ssh "\$NODE2" \
+            "nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null \
+             | awk '{s+=\$1}END{print s}'" </dev/null 2>/dev/null || echo 999999)
+        echo "  [\${i}x5s] Node2 GPU memory used: \${USED}MB"
+        [ "\$USED" -lt 5000 ] && echo "  Node2 GPUs free." && return 0
+        sleep 5
+    done
+    echo "  WARNING: Node2 GPU memory may not be fully freed — continuing anyway"
+}
+wait_llama4_scout() {
+    echo "  Waiting for llama4-scout on \$NODE2:8005 (timeout 90 min)..."
+    for i in \$(seq 1 360); do
+        if curl --noproxy '*' -sf "http://\$NODE2:8005/health" > /dev/null 2>&1; then
+            echo "  llama4-scout ready! (\$((i*15))s elapsed)"
+            return 0
+        fi
+        [ \$((i % 8)) -eq 0 ] && echo "  [\$((i*15))s] Still waiting for llama4-scout..."
+        sleep 15
+    done
+    echo "WARNING: llama4-scout not ready after 90 min — continuing anyway"
+}
 
-# ╔══════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════
 # MODE 1: STATIC — all 6 models pre-loaded
-# ╔══════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════
 echo ""
 echo "══════════════════════════════════════════════════════════════════"
 echo "  MODE 1: STATIC (all 6 models pre-loaded)"
@@ -203,7 +229,8 @@ echo "      This takes ~20-40 min while models are warm. Running concurrently."
 python tests/eval_all_models.py \
     --dataset     /tmp/svd_workload.json \
     --output      "\$RESULTS_DIR/eval_matrix.csv" \
-    --concurrency 20
+    --concurrency 20 \
+    --node2-host  "\$NODE2"
 echo "  eval_matrix.csv done."
 
 echo ""
@@ -269,14 +296,49 @@ STATIC_MODELS=\$(curl --noproxy '*' -sf "\$ROUTER_URL/v1/models" \
     | python3 -c "import sys,json; ids=[m['id'] for m in json.load(sys.stdin)['data']]; print(len(ids), ','.join(sorted(ids)))" 2>/dev/null || echo "? unknown")
 echo "  Models loaded during static run: \$STATIC_MODELS"
 
+# ── Baselines: Cascade + RouteLLM ─────────────────────────────────────────────
+# Runs while all 6 static models are alive — deepseek-r1-14b must be reachable.
+# (Moved here from dynamic phase: in dynamic mode deepseek-r1-14b is not running.)
+echo ""
+echo "=================================================================="
+echo "  BASELINES: Cascade and RouteLLM (all 6 models alive)"
+echo "=================================================================="
+
+echo ""
+echo "  [Baseline 1/2] Cascade (threshold=0.80)..."
+python tests/baseline_cascade.py \
+    --dataset     /tmp/svd_workload.json \
+    --priors      "${PRIORS}" \
+    --threshold   0.80 \
+    --concurrency ${CONCURRENCY} \
+    --output      "\$RESULTS_DIR/baseline_cascade.csv"
+
+echo ""
+echo "  [Baseline 2/2] RouteLLM MF router..."
+echo "  (Calibrating threshold to match cascade strong-model usage rate)"
+python tests/baseline_routellm.py \
+    --dataset     /tmp/svd_workload.json \
+    --calibrate \
+    2>&1 | tee "\$RESULTS_DIR/routellm_calibration.txt" || true
+
+ROUTELLM_THRESHOLD=\${ROUTELLM_THRESHOLD:-0.5}
+echo "  Using threshold=\${ROUTELLM_THRESHOLD} (set ROUTELLM_THRESHOLD env var to override)"
+python tests/baseline_routellm.py \
+    --dataset     /tmp/svd_workload.json \
+    --threshold   \${ROUTELLM_THRESHOLD} \
+    --concurrency ${CONCURRENCY} \
+    --output      "\$RESULTS_DIR/baseline_routellm.csv" \
+    || echo "  WARNING: RouteLLM baseline failed (pip install routellm to enable)"
+
 echo ""
 echo "[S5] Tearing down static mode..."
 kill_all_models
+wait_node2_gpus_free
 sleep 5
 
-# ╔══════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════
 # MODE 2: DYNAMIC — start with 2 seed models, others spin up
-# ╔══════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════
 echo ""
 echo "══════════════════════════════════════════════════════════════════"
 echo "  MODE 2: DYNAMIC (qwen-7b + deepseek-r1-7b seeds)"
@@ -312,12 +374,15 @@ ssh "\$NODE2" "
 " </dev/null
 
 echo ""
-echo "[D3] Waiting for seed models (4 — qwen-7b + deepseek-r1-7b + qwen3-coder-30b + llama4-scout)..."
-wait_models 4
+echo "[D3] Waiting for node1 seed models (3 — qwen-7b + deepseek-r1-7b + qwen3-coder-30b)..."
+wait_models 3
+echo ""
+echo "[D3b] Waiting for llama4-scout on \$NODE2 via direct health check (90 min timeout)..."
+wait_llama4_scout
 
 # ── Warm-up phase: populate reputation tracker with real latency data ─────────
 echo ""
-echo "[D3b] Warm-up: 50 easy requests to measure real model latencies..."
+echo "[D3c] Warm-up: 50 easy requests to measure real model latencies..."
 echo "  (Without warm-up, TTCA uses catalog estimates which can be wildly off)"
 python3 -c "
 import json, random
@@ -357,49 +422,13 @@ DYNAMIC_SPINUPS=\$(grep "SPIN UP" ~/vllm_logs/prov_svd_dynamic_node1.log 2>/dev/
     | grep -v "reason=initial" | awk '{print \$3}' | sort -u | tr '\n' ',' | sed 's/,$//')
 echo "  Models dynamically spun up: \${DYNAMIC_SPINUPS:-none}"
 
-# ── Baselines: Cascade + RouteLLM ─────────────────────────────────────────────
-echo ""
-echo "=================================================================="
-echo "  BASELINES: Cascade and RouteLLM (run on same workload)"
-echo "=================================================================="
-
-echo ""
-echo "  [Baseline 1/2] Cascade (threshold=0.80)..."
-python tests/baseline_cascade.py \
-    --dataset     /tmp/svd_workload.json \
-    --priors      "${PRIORS}" \
-    --threshold   0.80 \
-    --concurrency ${CONCURRENCY} \
-    --output      "\$RESULTS_DIR/baseline_cascade.csv"
-
-echo ""
-echo "  [Baseline 2/2] RouteLLM MF router..."
-echo "  (Calibrating threshold to match cascade strong-model usage rate)"
-# First calibrate to find the threshold that gives ~30% strong-model usage
-# (matching the cascade baseline for fair comparison)
-python tests/baseline_routellm.py \
-    --dataset     /tmp/svd_workload.json \
-    --calibrate \
-    2>&1 | tee "\$RESULTS_DIR/routellm_calibration.txt" || true
-
-# Run with default threshold=0.5 (routes ~20-30% to strong).
-# Adjust ROUTELLM_THRESHOLD based on calibration output above.
-ROUTELLM_THRESHOLD=\${ROUTELLM_THRESHOLD:-0.5}
-echo "  Using threshold=\${ROUTELLM_THRESHOLD} (set ROUTELLM_THRESHOLD env var to override)"
-python tests/baseline_routellm.py \
-    --dataset     /tmp/svd_workload.json \
-    --threshold   \${ROUTELLM_THRESHOLD} \
-    --concurrency ${CONCURRENCY} \
-    --output      "\$RESULTS_DIR/baseline_routellm.csv" \
-    || echo "  WARNING: RouteLLM baseline failed (pip install routellm to enable)"
-
 echo ""
 echo "[D5] Tearing down dynamic mode..."
 kill_all_models
 
-# ╔══════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════
 # COMPARISON
-# ╔══════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════
 echo ""
 echo "══════════════════════════════════════════════════════════════════"
 echo "  COMPARISON: All systems"
@@ -440,7 +469,7 @@ eval python tests/compare_all.py \
     --output "\$RESULTS_DIR/compare_all_systems.csv" \
     | tee "\$RESULTS_DIR/compare_all_systems.txt"
 
-# ── Per-source breakdown ────────────────────────────────────────────────────────────
+# ── Per-source breakdown ───────────────────────────────────────────────────────
 echo ""
 echo "  Per-source energy/cost breakdown:"
 python3 -c "
@@ -491,7 +520,7 @@ python3 tests/compute_gpu_energy.py \
     --dynamic-start-epoch \$DYNAMIC_PROV_START \
     | tee "\$RESULTS_DIR/gpu_energy_comparison.txt"
 
-# ── Done ──────────────────────────────────────────────────────────────────────────────
+# ── Done ───────────────────────────────────────────────────────────────────────
 echo "=================================================================="
 echo "  Comparison complete!  \$(date)"
 echo "  Results: \$RESULTS_DIR/"
