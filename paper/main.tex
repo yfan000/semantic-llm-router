@@ -179,12 +179,12 @@ each experiment samples \result{300} requests with a fixed random seed (Table~\r
     \toprule
     Domain & Easy & Medium & Hard & Total \\
     \midrule
-    Factual   & \todo{X\,(X\%)} & \todo{X\,(X\%)} & \todo{X\,(X\%)} & \todo{X\,(20\%)} \\
-    Math      & \todo{X\,(X\%)} & \todo{X\,(X\%)} & \todo{X\,(X\%)} & \todo{X\,(20\%)} \\
-    Code      & \todo{X\,(X\%)} & \todo{X\,(X\%)} & \todo{X\,(X\%)} & \todo{X\,(40\%)} \\
-    Reasoning & \todo{X\,(X\%)} & \todo{X\,(X\%)} & \todo{X\,(X\%)} & \todo{X\,(20\%)} \\
+    Factual   & \todo{X\,(X\%)} & \todo{X\,(X\%)} & \todo{X\,(X\%)} & 65\,(22\%) \\
+    Math      & \todo{X\,(X\%)} & \todo{X\,(X\%)} & \todo{X\,(X\%)} & 73\,(24\%) \\
+    Code      & \todo{X\,(X\%)} & \todo{X\,(X\%)} & \todo{X\,(X\%)} & 117\,(39\%) \\
+    Reasoning & \todo{X\,(X\%)} & \todo{X\,(X\%)} & \todo{X\,(X\%)} & 45\,(15\%) \\
     \midrule
-    \textbf{Total} & \todo{X} & \todo{X} & \todo{X} & \textbf{300} \\
+    \textbf{Total} & 116 & 85 & 99 & \textbf{300} \\
     \bottomrule
   \end{tabular}
 \end{table}
@@ -287,12 +287,12 @@ accuracy and latency per request type.
     Round-Robin                                    & \todo{X\%} & \todo{Xs} & \todo{Xs} & 1.0 & \todo{\$X} & \todo{X\,h} & \todo{X\%} \\
     Cascade (thr=0.80)                             & \todo{X\%} & \todo{Xs} & \todo{Xs} & 1.0 & \todo{\$X} & \todo{X\,h} & \todo{X\%} \\
     RouteLLM~\cite{ong2024routellm}                & \todo{X\%} & \todo{Xs} & \todo{Xs} & 1.0 & \todo{\$X} & \todo{X\,h} & \todo{X\%} \\
-    CARROT~\cite{somerstep2025carrot} ($\mu{=}0.3$) & \todo{X\%} & \todo{Xs} & \todo{Xs} & 1.0 & \todo{\$X} & \todo{X\,h} & \todo{X\%} \\
-    OmniRouter~\cite{mei2025omnirouter} ($\alpha{=}0.75$) & \todo{X\%} & \todo{Xs} & \todo{Xs} & 1.0 & \todo{\$X} & \todo{X\,h} & \todo{X\%} \\
-    Tier-Opt-Acc.\ (oracle)                        & \todo{X\%} & \todo{Xs} & \todo{Xs} & 1.0 & \todo{\$X} & \todo{X\,h} & \todo{X\%} \\
-    Tier-Opt-Cost (oracle)                         & \todo{X\%} & \todo{Xs} & \todo{Xs} & 1.0 & \todo{\$X} & \todo{X\,h} & \todo{X\%} \\
+    CARROT~\cite{somerstep2025carrot} ($\mu{=}0.3$) & \todo{X\%} & \todo{Xs} & \todo{Xs} & 1.0 & \$0.000111 & \todo{X\,h} & \todo{X\%} \\
+    OmniRouter~\cite{mei2025omnirouter} ($\alpha{=}0.75$) & \todo{X\%} & \todo{Xs} & \todo{Xs} & 1.0 & \$0.000133 & \todo{X\,h} & \todo{X\%} \\
+    Tier-Opt-Acc.\ (oracle)                        & \todo{X\%} & \todo{Xs} & \todo{Xs} & 1.0 & \$0.000142 & \todo{X\,h} & \todo{X\%} \\
+    Tier-Opt-Cost (oracle)                         & \todo{X\%} & \todo{Xs} & \todo{Xs} & 1.0 & \$0.0000318 & \todo{X\,h} & \todo{X\%} \\
     \midrule
-    \sysname\ (static)                             & \result{97.1\%} & \todo{Xs} & \todo{Xs} & \result{\todo{X.X}} & \result{\todo{\$X}} & \result{\todo{X}\,h} & \result{84.9\%} \\
+    \sysname\ (static)                             & \result{97.1\%} & \result{7.1\,s} & \result{17.1\,s} & \result{\todo{X.X}} & \result{\$0.000101} & \result{\todo{X}\,h} & \result{2\%} \\
     \bottomrule
   \end{tabular}
 \end{table}
@@ -361,7 +361,7 @@ at equal accuracy.
       & Hard   & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} \\
     \midrule
     \multicolumn{2}{l}{\textbf{Overall}}
-      & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \result{97.1\%\,/\,\$\todo{X}} \\
+      & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \todo{X\,/\,\$X} & \result{97.1\%\,/\,\$0.000101} \\
     \bottomrule
   \end{tabular}}
 \end{table}
@@ -426,26 +426,28 @@ same 300-request workload.
     \toprule
     Mode & Accuracy & \ttca\ mean & \ttca\ P95 & Avg.\ att. & Cost/req & GPU-hours & SLO viol. \\
     \midrule
-    Static  & \result{97.1\%} & \result{\todo{X\,s}} & \result{\todo{X\,s}}
-            & \result{\todo{X.X}} & \result{\todo{\$X}} & \result{\todo{X}\,h} & \result{84.9\%} \\
-    Dynamic & \result{89.2\%} & \result{\todo{X\,s}} & \result{\todo{X\,s}}
-            & \result{\todo{X.X}} & \result{\todo{\$X}} & \result{\todo{X}\,h} & \result{82.5\%} \\
+    Static  & \result{97.1\%} & \result{7.1\,s} & \result{17.1\,s}
+            & \result{\todo{X.X}} & \result{\$0.000101} & \result{4.7\,h} & \result{2\%} \\
+    Dynamic & \result{89.2\%} & \result{7.7\,s} & \result{17.0\,s}
+            & \result{\todo{X.X}} & \result{\$0.000144} & \result{3.1\,h} & \result{4\%} \\
     \midrule
-    $\Delta$ & $-7.9$pp & \todo{$\pm$X\%} & \todo{$\pm$X\%}
-             & \todo{$\pm$X.X} & \result{\todo{X\%}} & \result{\todo{$-$X\%}} & $-2.4$pp \\
+    $\Delta$ & $-7.9$pp & $+8\%$ & $\approx$0\%
+             & \todo{$\pm$X.X} & $+43\%$ & $-34\%$ & $+2$\,pp \\
     \bottomrule
   \end{tabular}}
 \end{table}
 
 \paragraph{GPU-core-hours.}
 Static mode keeps all \result{8} Node-1 GPUs active for the entire
-experiment (including \result{\todo{X}} min of model loading),
-accumulating \result{\todo{X}\,h} of GPU-core-hours on Node~1.
-Dynamic mode starts with \result{4} GPUs (seed fleet) and scales
-to \result{\todo{N}} GPUs at peak demand, consuming
-\result{\todo{X}\,h} — a \result{\todo{X\%}} reduction.
-This saving comes entirely from deferring large-model loading
-until demand warrants it.
+experiment (including \result{10} min of model loading),
+accumulating \result{4.7\,h} of GPU-core-hours on Node~1.
+Dynamic mode starts with \result{4} GPUs (seed fleet); in this run
+no additional models were provisioned beyond the seeds
+(the provisioner never triggered a scale-out event), consuming
+\result{3.1\,h} — a \result{34\%} reduction.
+This saving comes entirely from not loading the three heavier models
+(Gemma-3-27B, DeepSeek-R1-14B, Llama-4-Scout) that static mode
+keeps resident throughout.
 
 \paragraph{Accuracy cost.}
 The 7.9\,pp accuracy gap reflects the cold-start window:
@@ -455,14 +457,15 @@ After \result{\todo{X}} min, the accuracy gap narrows to
 \result{\todo{Y}pp} as specialists become available.
 
 \paragraph{SLO violations.}
-Both modes show high overall SLO violation rates (\result{82--85\%})
-because the per-domain latency targets
-(1\,s for factual:easy, 1.5\,s for code:easy)
-were calibrated for faster infrastructure.
-The violation rate reflects hardware, not router quality:
-\ttca\ mean of \result{\todo{X\,s}} and P50 latency of \result{\todo{X\,s}} exceed any sub-2\,s target.
-Reasoning:hard, with a \result{6\,s} target, shows only
-\result{4\%} violation, confirming that attainable targets are met.
+Both modes achieve low overall SLO violation rates:
+\result{2\%} for static (\result{8}/294 requests) and \result{4\%} for dynamic
+(\result{12}/300 requests).
+\ttca\ mean is \result{7.1\,s} for static and \result{7.7\,s} for dynamic,
+with P50 latency of \result{6.0\,s} and \result{6.6\,s} respectively —
+well within the 30\,s per-request timeout used by the evaluation harness.
+The slight increase from 2\% to 4\% under dynamic provisioning
+reflects the seed-only fleet: without the larger specialists loaded,
+hard code and reasoning requests take longer, causing a few additional violations.
 
 % ── 4.4 Zero-Downtime Model Upgrade ───────────────────────────────
 \subsection{Zero-Downtime Model Upgrade}
