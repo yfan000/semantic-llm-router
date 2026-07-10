@@ -462,47 +462,91 @@ COMPARE_SYSTEMS="\$COMPARE_SYSTEMS --system \"Dynamic (TTCA):\$RESULTS_DIR/dynam
   COMPARE_SYSTEMS="\$COMPARE_SYSTEMS --system \"Tier-Opt-Cost:\$RESULTS_DIR/baseline_cost_optimal.csv\""
 
 echo ""
+echo "  [compare_all.py] Ranking all systems..."
 eval python tests/compare_all.py \
     \$COMPARE_SYSTEMS \
     --ref    "Static (TTCA)" \
     --eval-matrix "\$RESULTS_DIR/eval_matrix.csv" \
     --output "\$RESULTS_DIR/compare_all_systems.csv" \
-    | tee "\$RESULTS_DIR/compare_all_systems.txt"
+    2>&1 | tee "\$RESULTS_DIR/compare_all_systems.txt"
+echo "  [compare_all.py] Done."
 
-# ── Per-source breakdown ───────────────────────────────────────────────────────
+# ── Static vs Dynamic: full metric comparison ─────────────────────────────────
 echo ""
-echo "  Per-source energy/cost breakdown:"
-python3 -c "
-import csv, json
-from collections import defaultdict
+echo "=================================================================="
+echo "  STATIC vs DYNAMIC — Full Metric Comparison"
+echo "=================================================================="
+export RESULTS_DIR_PY=\$RESULTS_DIR
+python3 << PYEOF
+import csv, sys, os
+from statistics import mean
 
-def summarize(path, label):
-    rows = [r for r in csv.DictReader(open(path)) if r.get('status') == '200']
-    energy = [float(r['energy_j']) for r in rows if r.get('energy_j')]
-    cost   = [float(r['charged_usd']) for r in rows if r.get('charged_usd')]
-    lats   = [float(r.get('actual_latency_ms') or r.get('wall_ms',0)) for r in rows
-              if r.get('actual_latency_ms') or r.get('wall_ms')]
-    winners = {}
-    for r in rows:
-        m = r.get('model_winner','?')
-        winners[m] = winners.get(m, 0) + 1
-    print(f'  {label}:')
-    print(f'    Requests      : {len(rows)}')
-    if energy:
-        print(f'    Energy total  : {sum(energy):.1f}J   mean={sum(energy)/len(energy):.2f}J/req')
-    if cost:
-        print(f'    Cost total    : \${sum(cost):.6f}   mean=\${sum(cost)/len(cost):.8f}/req')
-    if lats:
-        slats = sorted(lats)
-        p50 = slats[len(slats)//2]
-        p95 = slats[int(len(slats)*0.95)]
-        print(f'    Latency       : P50={p50/1000:.2f}s  P95={p95/1000:.2f}s')
-    print(f'    Model routing : {dict(sorted(winners.items(), key=lambda x:-x[1]))}')
-    print()
+rd = os.environ['RESULTS_DIR_PY']
 
-summarize('\$RESULTS_DIR/static_results.csv',  'Static ')
-summarize('\$RESULTS_DIR/dynamic_results.csv', 'Dynamic')
-"
+def load(path, label):
+    try:
+        rows = list(csv.DictReader(open(path)))
+    except FileNotFoundError:
+        print('  WARNING: ' + path + ' not found')
+        return None
+    ok = [r for r in rows if r.get('status') == '200']
+    scored = [r for r in ok if r.get('correct') in ('true','false','True','False','0','1')]
+    correct = [r for r in scored if r.get('correct') in ('true','True','1')]
+    lats = [float(r.get('actual_latency_ms') or r.get('wall_ms', 0))
+            for r in ok if r.get('actual_latency_ms') or r.get('wall_ms')]
+    costs = [float(r['charged_usd']) for r in ok if r.get('charged_usd')]
+    energy = [float(r['energy_j']) for r in ok if r.get('energy_j')]
+    slo_rows = [r for r in rows if r.get('slo_violated') in ('true','false','True','False')]
+    slo_viol = [r for r in slo_rows if r.get('slo_violated') in ('true','True')]
+    retries = [int(r['retries']) for r in ok if r.get('retries','') not in ('','0',None)]
+    slats = sorted(lats)
+    return {
+        'label':         label,
+        'n_total':       len(rows),
+        'n_ok':          len(ok),
+        'accuracy':      len(correct)/len(scored)*100 if scored else None,
+        'lat_mean':      mean(lats)/1000              if lats   else None,
+        'lat_p50':       slats[len(slats)//2]/1000    if lats   else None,
+        'lat_p95':       slats[int(len(slats)*0.95)]/1000 if lats else None,
+        'cost_mean':     mean(costs)                  if costs  else None,
+        'energy_mean':   mean(energy)                 if energy else None,
+        'slo_viol_n':    len(slo_viol),
+        'slo_total':     len(slo_rows),
+        'slo_pct':       len(slo_viol)/len(slo_rows)*100 if slo_rows else None,
+        'retries_total': sum(int(r.get('retries',0)) for r in ok),
+        'retries_mean':  mean(retries) if retries else 0.0,
+    }
+
+s = load(rd + '/static_results.csv',  'Static')
+d = load(rd + '/dynamic_results.csv', 'Dynamic')
+if not s or not d:
+    sys.exit(0)
+
+def fmt(v, spec, suffix=''):
+    return ((spec % v) + suffix) if v is not None else '-'
+def usd(v):
+    return ('$' + '%.8f' % v) if v is not None else '-'
+def delta(sv, dv, spec, suffix=''):
+    if sv is None or dv is None: return '-'
+    diff = dv - sv
+    sign = '+' if diff >= 0 else ''
+    return sign + (spec % diff) + suffix
+
+W1, W2, W3, W4 = 28, 14, 14, 14
+sep = '-' * (W1 + W2 + W3 + W4 + 3)
+print('\n  ' + ('Metric').ljust(W1) + ('Static').rjust(W2) + ' ' + ('Dynamic').rjust(W3) + ' ' + ('Delta (D-S)').rjust(W4))
+print('  ' + sep)
+print('  ' + ('Requests (200 OK)').ljust(W1) + str(s['n_ok']).rjust(W2) + ' ' + str(d['n_ok']).rjust(W3))
+print('  ' + ('Accuracy').ljust(W1) + fmt(s['accuracy'],'%.1f','%').rjust(W2) + ' ' + fmt(d['accuracy'],'%.1f','%').rjust(W3) + ' ' + delta(s['accuracy'],d['accuracy'],'%.1f','pp').rjust(W4))
+print('  ' + ('TTCA mean (lat mean)').ljust(W1) + fmt(s['lat_mean'],'%.2f','s').rjust(W2) + ' ' + fmt(d['lat_mean'],'%.2f','s').rjust(W3) + ' ' + delta(s['lat_mean'],d['lat_mean'],'%.2f','s').rjust(W4))
+print('  ' + ('Lat P50').ljust(W1) + fmt(s['lat_p50'],'%.2f','s').rjust(W2) + ' ' + fmt(d['lat_p50'],'%.2f','s').rjust(W3) + ' ' + delta(s['lat_p50'],d['lat_p50'],'%.2f','s').rjust(W4))
+print('  ' + ('Lat P95').ljust(W1) + fmt(s['lat_p95'],'%.2f','s').rjust(W2) + ' ' + fmt(d['lat_p95'],'%.2f','s').rjust(W3) + ' ' + delta(s['lat_p95'],d['lat_p95'],'%.2f','s').rjust(W4))
+print('  ' + ('Cost/req').ljust(W1) + usd(s['cost_mean']).rjust(W2) + ' ' + usd(d['cost_mean']).rjust(W3))
+print('  ' + ('SLO violations').ljust(W1) + (str(s['slo_viol_n'])+'/'+str(s['slo_total'])).rjust(W2) + ' ' + (str(d['slo_viol_n'])+'/'+str(d['slo_total'])).rjust(W3))
+print('  ' + ('SLO violation rate').ljust(W1) + fmt(s['slo_pct'],'%.1f','%').rjust(W2) + ' ' + fmt(d['slo_pct'],'%.1f','%').rjust(W3) + ' ' + delta(s['slo_pct'],d['slo_pct'],'%.1f','pp').rjust(W4))
+print('  ' + ('Total retries').ljust(W1) + str(s['retries_total']).rjust(W2) + ' ' + str(d['retries_total']).rjust(W3) + ' ' + delta(s['retries_total'],d['retries_total'],'%d').rjust(W4))
+print('  ' + ('Avg retries/req').ljust(W1) + fmt(s['retries_mean'],'%.3f').rjust(W2) + ' ' + fmt(d['retries_mean'],'%.3f').rjust(W3))
+PYEOF
 
 # ── GPU energy comparison (idle + serving, from provisioner logs) ──────────────
 echo ""
