@@ -154,16 +154,11 @@ for m in json.load(sys.stdin).get('data', []):
     echo "  All models stopped."
 }
 wait_node2_gpus_free() {
-    echo "  Waiting for node2 GPU memory to free up after static teardown..."
-    for i in \$(seq 1 24); do
-        USED=\$(ssh "\$NODE2" \
-            "nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null \
-             | awk '{s+=\$1}END{print s}'" </dev/null 2>/dev/null || echo 999999)
-        echo "  [\${i}x5s] Node2 GPU memory used: \${USED}MB"
-        [ "\$USED" -lt 5000 ] && echo "  Node2 GPUs free." && return 0
-        sleep 5
-    done
-    echo "  WARNING: Node2 GPU memory may not be fully freed — continuing anyway"
+    echo "  Sending kill signal to node2 vLLM processes..."
+    ssh "\$NODE2" "pkill -f 'vllm serve' 2>/dev/null; true" </dev/null 2>/dev/null || true
+    echo "  Waiting 60s for node2 GPU memory to free..."
+    sleep 60
+    echo "  Node2 teardown wait complete."
 }
 wait_llama4_scout() {
     echo "  Waiting for llama4-scout on \$NODE2:8005 (timeout 90 min)..."
@@ -220,6 +215,23 @@ ssh "\$NODE2" "
 echo ""
 echo "[S3] Waiting for all 6 models..."
 wait_models 6
+
+# If llama4-scout didn't register via provisioner, check node2 directly and register manually
+SCOUT_CNT=\$(curl --noproxy '*' -sf "\$ROUTER_URL/v1/models" \
+    | python3 -c "import sys,json; d=json.load(sys.stdin)['data']; print(sum(1 for m in d if 'llama4' in m['id']))" 2>/dev/null || echo 0)
+if [ "\$SCOUT_CNT" -eq 0 ]; then
+    echo "  llama4-scout not yet registered — waiting for it on \$NODE2:8005..."
+    wait_llama4_scout
+    if curl --noproxy '*' -sf "http://\$NODE2:8005/health" > /dev/null 2>&1; then
+        curl --noproxy '*' -sf -X POST "\$ROUTER_URL/router/register" \
+            -H "Content-Type: application/json" \
+            -d "{\"model_id\":\"llama4-scout\",\"model_name\":\"meta-llama/Llama-4-Scout-17B-16E-Instruct\",\"backend\":\"vllm\",\"base_url\":\"http://\${NODE2}:8005\",\"domains\":[\"code\",\"factual\",\"math\",\"reasoning\"],\"efficiency_tokens_per_joule\":3.0,\"input_rate_usd_per_token\":0.0000001,\"output_rate_usd_per_token\":0.0000003,\"skip_calibration\":true}" \
+            2>/dev/null && echo "  Manually registered llama4-scout with router." \
+            || echo "  WARNING: manual registration attempt failed"
+    else
+        echo "  WARNING: llama4-scout not responding on \$NODE2:8005 — proceeding with 5 models"
+    fi
+fi
 
 # Pre-evaluate all models on the workload (runs while static models are loaded)
 echo ""
@@ -316,14 +328,14 @@ python tests/baseline_cascade.py \
 echo ""
 echo "  [Baseline 2/2] RouteLLM MF router..."
 echo "  (Calibrating threshold to match cascade strong-model usage rate)"
-python tests/baseline_routellm.py \
+OPENAI_API_KEY=dummy python tests/baseline_routellm.py \
     --dataset     /tmp/svd_workload.json \
     --calibrate \
     2>&1 | tee "\$RESULTS_DIR/routellm_calibration.txt" || true
 
 ROUTELLM_THRESHOLD=\${ROUTELLM_THRESHOLD:-0.5}
 echo "  Using threshold=\${ROUTELLM_THRESHOLD} (set ROUTELLM_THRESHOLD env var to override)"
-python tests/baseline_routellm.py \
+OPENAI_API_KEY=dummy python tests/baseline_routellm.py \
     --dataset     /tmp/svd_workload.json \
     --threshold   \${ROUTELLM_THRESHOLD} \
     --concurrency ${CONCURRENCY} \
@@ -445,30 +457,28 @@ echo "    Static : \${LOAD_TEST_WALL_STATIC}s"
 echo "    Dynamic: \${LOAD_TEST_WALL_DYNAMIC}s"
 
 # Build --system list dynamically (include RouteLLM and oracle baselines only if files exist)
-COMPARE_SYSTEMS=""
-COMPARE_SYSTEMS="\$COMPARE_SYSTEMS --system \"Round-Robin:results/rr_baseline.csv\""
-COMPARE_SYSTEMS="\$COMPARE_SYSTEMS --system \"Cascade:\$RESULTS_DIR/baseline_cascade.csv\""
+COMPARE_ARGS=(tests/compare_all.py)
+COMPARE_ARGS+=(--system "Round-Robin:results/rr_baseline.csv")
+COMPARE_ARGS+=(--system "Cascade:\$RESULTS_DIR/baseline_cascade.csv")
 [ -f "\$RESULTS_DIR/baseline_routellm.csv" ] && \
-  COMPARE_SYSTEMS="\$COMPARE_SYSTEMS --system \"RouteLLM:\$RESULTS_DIR/baseline_routellm.csv\""
+  COMPARE_ARGS+=(--system "RouteLLM:\$RESULTS_DIR/baseline_routellm.csv")
 [ -f "\$RESULTS_DIR/baseline_carrot.csv" ] && \
-  COMPARE_SYSTEMS="\$COMPARE_SYSTEMS --system \"CARROT:\$RESULTS_DIR/baseline_carrot.csv\""
+  COMPARE_ARGS+=(--system "CARROT:\$RESULTS_DIR/baseline_carrot.csv")
 [ -f "\$RESULTS_DIR/baseline_omni_router.csv" ] && \
-  COMPARE_SYSTEMS="\$COMPARE_SYSTEMS --system \"OmniRouter:\$RESULTS_DIR/baseline_omni_router.csv\""
-COMPARE_SYSTEMS="\$COMPARE_SYSTEMS --system \"Static (TTCA):\$RESULTS_DIR/static_results.csv\""
-COMPARE_SYSTEMS="\$COMPARE_SYSTEMS --system \"Dynamic (TTCA):\$RESULTS_DIR/dynamic_results.csv\""
+  COMPARE_ARGS+=(--system "OmniRouter:\$RESULTS_DIR/baseline_omni_router.csv")
+COMPARE_ARGS+=(--system "Static (TTCA):\$RESULTS_DIR/static_results.csv")
+COMPARE_ARGS+=(--system "Dynamic (TTCA):\$RESULTS_DIR/dynamic_results.csv")
 [ -f "\$RESULTS_DIR/baseline_tier_acc_optimal.csv" ] && \
-  COMPARE_SYSTEMS="\$COMPARE_SYSTEMS --system \"Tier-Opt-Acc:\$RESULTS_DIR/baseline_tier_acc_optimal.csv\""
+  COMPARE_ARGS+=(--system "Tier-Opt-Acc:\$RESULTS_DIR/baseline_tier_acc_optimal.csv")
 [ -f "\$RESULTS_DIR/baseline_cost_optimal.csv" ] && \
-  COMPARE_SYSTEMS="\$COMPARE_SYSTEMS --system \"Tier-Opt-Cost:\$RESULTS_DIR/baseline_cost_optimal.csv\""
+  COMPARE_ARGS+=(--system "Tier-Opt-Cost:\$RESULTS_DIR/baseline_cost_optimal.csv")
+COMPARE_ARGS+=(--ref "Static (TTCA)")
+COMPARE_ARGS+=(--eval-matrix "\$RESULTS_DIR/eval_matrix.csv")
+COMPARE_ARGS+=(--output "\$RESULTS_DIR/compare_all_systems.csv")
 
 echo ""
 echo "  [compare_all.py] Ranking all systems..."
-eval python tests/compare_all.py \
-    \$COMPARE_SYSTEMS \
-    --ref    "Static (TTCA)" \
-    --eval-matrix "\$RESULTS_DIR/eval_matrix.csv" \
-    --output "\$RESULTS_DIR/compare_all_systems.csv" \
-    2>&1 | tee "\$RESULTS_DIR/compare_all_systems.txt"
+python "\${COMPARE_ARGS[@]}" 2>&1 | tee "\$RESULTS_DIR/compare_all_systems.txt"
 echo "  [compare_all.py] Done."
 
 # ── Static vs Dynamic: full metric comparison ─────────────────────────────────
@@ -525,7 +535,7 @@ if not s or not d:
 def fmt(v, spec, suffix=''):
     return ((spec % v) + suffix) if v is not None else '-'
 def usd(v):
-    return ('$' + '%.8f' % v) if v is not None else '-'
+    return ('\$' + '%.8f' % v) if v is not None else '-'
 def delta(sv, dv, spec, suffix=''):
     if sv is None or dv is None: return '-'
     diff = dv - sv
