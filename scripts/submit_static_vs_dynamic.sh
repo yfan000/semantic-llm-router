@@ -510,6 +510,13 @@ def load(path, label):
     slo_viol = [r for r in slo_rows if r.get('slo_violated') in ('true','True')]
     retries = [int(r['retries']) for r in ok if r.get('retries','') not in ('','0',None)]
     slats = sorted(lats)
+    ttca_lats = sorted([
+        float(r.get('actual_latency_ms') or r.get('wall_ms', 0))
+        for r in ok
+        if (r.get('gt_correct') in ('true','True') or r.get('correct') in ('true','True','1'))
+        and (r.get('actual_latency_ms') or r.get('wall_ms'))
+    ])
+    def _pct(arr, p): return arr[int(len(arr)*p)] if arr else None
     return {
         'label':         label,
         'n_total':       len(rows),
@@ -518,6 +525,10 @@ def load(path, label):
         'lat_mean':      mean(lats)/1000              if lats   else None,
         'lat_p50':       slats[len(slats)//2]/1000    if lats   else None,
         'lat_p95':       slats[int(len(slats)*0.95)]/1000 if lats else None,
+        'ttca_mean':     mean(ttca_lats)/1000         if ttca_lats else None,
+        'ttca_p50':      _pct(ttca_lats, 0.50)/1000  if ttca_lats else None,
+        'ttca_p90':      _pct(ttca_lats, 0.90)/1000  if ttca_lats else None,
+        'ttca_p95':      _pct(ttca_lats, 0.95)/1000  if ttca_lats else None,
         'cost_mean':     mean(costs)                  if costs  else None,
         'energy_mean':   mean(energy)                 if energy else None,
         'slo_viol_n':    len(slo_viol),
@@ -535,7 +546,7 @@ if not s or not d:
 def fmt(v, spec, suffix=''):
     return ((spec % v) + suffix) if v is not None else '-'
 def usd(v):
-    return ('\$' + '%.8f' % v) if v is not None else '-'
+    return ('$' + '%.8f' % v) if v is not None else '-'
 def delta(sv, dv, spec, suffix=''):
     if sv is None or dv is None: return '-'
     diff = dv - sv
@@ -548,9 +559,13 @@ print('\n  ' + ('Metric').ljust(W1) + ('Static').rjust(W2) + ' ' + ('Dynamic').r
 print('  ' + sep)
 print('  ' + ('Requests (200 OK)').ljust(W1) + str(s['n_ok']).rjust(W2) + ' ' + str(d['n_ok']).rjust(W3))
 print('  ' + ('Accuracy').ljust(W1) + fmt(s['accuracy'],'%.1f','%').rjust(W2) + ' ' + fmt(d['accuracy'],'%.1f','%').rjust(W3) + ' ' + delta(s['accuracy'],d['accuracy'],'%.1f','pp').rjust(W4))
-print('  ' + ('TTCA mean (lat mean)').ljust(W1) + fmt(s['lat_mean'],'%.2f','s').rjust(W2) + ' ' + fmt(d['lat_mean'],'%.2f','s').rjust(W3) + ' ' + delta(s['lat_mean'],d['lat_mean'],'%.2f','s').rjust(W4))
+print('  ' + ('Lat mean').ljust(W1) + fmt(s['lat_mean'],'%.2f','s').rjust(W2) + ' ' + fmt(d['lat_mean'],'%.2f','s').rjust(W3) + ' ' + delta(s['lat_mean'],d['lat_mean'],'%.2f','s').rjust(W4))
 print('  ' + ('Lat P50').ljust(W1) + fmt(s['lat_p50'],'%.2f','s').rjust(W2) + ' ' + fmt(d['lat_p50'],'%.2f','s').rjust(W3) + ' ' + delta(s['lat_p50'],d['lat_p50'],'%.2f','s').rjust(W4))
 print('  ' + ('Lat P95').ljust(W1) + fmt(s['lat_p95'],'%.2f','s').rjust(W2) + ' ' + fmt(d['lat_p95'],'%.2f','s').rjust(W3) + ' ' + delta(s['lat_p95'],d['lat_p95'],'%.2f','s').rjust(W4))
+print('  ' + ('TTCA mean (correct only)').ljust(W1) + fmt(s['ttca_mean'],'%.2f','s').rjust(W2) + ' ' + fmt(d['ttca_mean'],'%.2f','s').rjust(W3) + ' ' + delta(s['ttca_mean'],d['ttca_mean'],'%.2f','s').rjust(W4))
+print('  ' + ('TTCA P50').ljust(W1) + fmt(s['ttca_p50'],'%.2f','s').rjust(W2) + ' ' + fmt(d['ttca_p50'],'%.2f','s').rjust(W3) + ' ' + delta(s['ttca_p50'],d['ttca_p50'],'%.2f','s').rjust(W4))
+print('  ' + ('TTCA P90').ljust(W1) + fmt(s['ttca_p90'],'%.2f','s').rjust(W2) + ' ' + fmt(d['ttca_p90'],'%.2f','s').rjust(W3) + ' ' + delta(s['ttca_p90'],d['ttca_p90'],'%.2f','s').rjust(W4))
+print('  ' + ('TTCA P95').ljust(W1) + fmt(s['ttca_p95'],'%.2f','s').rjust(W2) + ' ' + fmt(d['ttca_p95'],'%.2f','s').rjust(W3) + ' ' + delta(s['ttca_p95'],d['ttca_p95'],'%.2f','s').rjust(W4))
 print('  ' + ('Cost/req').ljust(W1) + usd(s['cost_mean']).rjust(W2) + ' ' + usd(d['cost_mean']).rjust(W3))
 print('  ' + ('SLO violations').ljust(W1) + (str(s['slo_viol_n'])+'/'+str(s['slo_total'])).rjust(W2) + ' ' + (str(d['slo_viol_n'])+'/'+str(d['slo_total'])).rjust(W3))
 print('  ' + ('SLO violation rate').ljust(W1) + fmt(s['slo_pct'],'%.1f','%').rjust(W2) + ' ' + fmt(d['slo_pct'],'%.1f','%').rjust(W3) + ' ' + delta(s['slo_pct'],d['slo_pct'],'%.1f','pp').rjust(W4))
