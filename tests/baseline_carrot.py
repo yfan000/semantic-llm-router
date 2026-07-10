@@ -1,4 +1,5 @@
-"""baseline_carrot.py — CARROT: Cost Aware Rate Optimal Router (Somerstep et al., 2025).
+"""
+baseline_carrot.py — CARROT: Cost Aware Rate Optimal Router (Somerstep et al., 2025).
 arXiv: 2502.03261  |  github.com/somerstep/CARROT
 
 Adapted for our vLLM fleet (6 models, localhost endpoints).
@@ -230,8 +231,19 @@ def compute_assignments(test_queries: list[str],
     cost_max = cost_raw.max(axis=1, keepdims=True).clip(min=1e-12)
     cost_norm = cost_raw / cost_max                              # [N_test, n_models]
 
+    # Exclude degenerate models (constant acc prediction — DummyClassifier)
+    # They have acc≈0 and predicted cost=0, so score=0 beats all real models → spurious wins.
+    valid_mask = np.ones(n_models, dtype=bool)
+    for j in range(n_models):
+        if n_test > 1 and np.std(acc_preds[:, j]) < 1e-6:
+            valid_mask[j] = False
+            print(f"    Excluding {MODEL_IDS[j]} from routing (degenerate predictions)")
+    if not valid_mask.any():
+        valid_mask[:] = True  # fallback: keep all if everything is degenerate
+
     # CARROT score (higher = better)
     scores = (1.0 - mu) * acc_preds - mu * cost_norm            # [N_test, n_models]
+    scores[:, ~valid_mask] = -np.inf                            # mask degenerate models
     chosen_j = scores.argmax(axis=1)                            # [N_test]
 
     assignments = [MODEL_IDS[j] for j in chosen_j]
@@ -390,27 +402,29 @@ def main() -> None:
     n = len(dataset)
     print(f"  [CARROT] {n} queries, mu={args.mu}, concurrency={args.concurrency}")
 
-    # Phase 1: Train
+    # ── Phase 1: Train ────────────────────────────────────────────────────────
     if args.eval_matrix and os.path.exists(args.eval_matrix):
         print(f"\n  [CARROT] Training on {args.eval_matrix}...")
         train_queries, correct_mat, tokens_mat = load_eval_matrix(
             args.eval_matrix, dataset)
-        print(f"  [CARROT] Training rows: {len(train_queries)} queries x {len(MODEL_IDS)} models")
+        print(f"  [CARROT] Training rows: {len(train_queries)} queries × {len(MODEL_IDS)} models")
         encoder, classifiers, regressors = train_predictors(
             train_queries, correct_mat, tokens_mat)
     else:
         print(f"  [CARROT] WARNING: eval_matrix not found at {args.eval_matrix!r}")
         print("  [CARROT] Falling back to cheapest-model routing (qwen-7b).")
         assignments = ["qwen-7b"] * n
+        if not args.output:
+            args.output = f"results/baseline_carrot_fallback_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
         asyncio.run(run_requests(dataset, assignments, args.output, args.concurrency))
         return
 
-    # Phase 2: Compute routing assignments
+    # ── Phase 2: Compute routing assignments ──────────────────────────────────
     test_queries = [item["query"] for item in dataset]
     assignments  = compute_assignments(test_queries, encoder, classifiers,
                                        regressors, mu=args.mu)
 
-    # Phase 3: Execute requests
+    # ── Phase 3: Execute requests ─────────────────────────────────────────────
     print(f"\n  [CARROT] Executing {n} requests...")
     asyncio.run(run_requests(dataset, assignments, args.output, args.concurrency))
 
