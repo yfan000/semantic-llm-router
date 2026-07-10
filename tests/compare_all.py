@@ -83,11 +83,15 @@ def load_system(path: str, eval_index: dict) -> dict:
                   if (v := _safe_float(r.get("energy_j"))) is not None]
 
         correct = scored = 0
+        ttca_lats_cat: list[float] = []
         for r in g:
+            lat = _safe_float(r.get("actual_latency_ms") or r.get("wall_ms"))
+            is_correct = False
             if r.get("gt_scored") == "true":
                 scored += 1
                 if r.get("gt_correct") == "true":
                     correct += 1
+                    is_correct = True
             elif eval_index:
                 ic = eval_index.get((r.get("req_id", ""),
                                      r.get("model_winner", "")))
@@ -95,6 +99,9 @@ def load_system(path: str, eval_index: dict) -> dict:
                     scored += 1
                     if ic:
                         correct += 1
+                        is_correct = True
+            if is_correct and lat is not None:
+                ttca_lats_cat.append(lat)
 
         slo_rows_g = [r for r in g if r.get("slo_violated") in ("true", "false")]
         slo_viol_g = sum(1 for r in slo_rows_g if r.get("slo_violated") == "true")
@@ -110,6 +117,10 @@ def load_system(path: str, eval_index: dict) -> dict:
             "lat_p50":        _percentile(lats, 50) if lats else None,
             "lat_p95":        _percentile(lats, 95) if lats else None,
             "lat_mean":       mean(lats)             if lats else None,
+            "ttca_mean":      mean(ttca_lats_cat)              if ttca_lats_cat else None,
+            "ttca_p50":       _percentile(ttca_lats_cat, 50)   if ttca_lats_cat else None,
+            "ttca_p90":       _percentile(ttca_lats_cat, 90)   if ttca_lats_cat else None,
+            "ttca_p95":       _percentile(ttca_lats_cat, 95)   if ttca_lats_cat else None,
             "cost_mean":      mean(costs)            if costs else None,
             "cost_total":     sum(costs)             if costs else None,
             "energy_mean":    mean(energy)           if energy else None,
@@ -131,6 +142,21 @@ def load_system(path: str, eval_index: dict) -> dict:
     all_attempts = [int(r["retries"]) + 1
                     for r in rows_ok if r.get("retries", "") not in ("", None)]
 
+    # TTCA lats: latency of requests that received a correct answer
+    all_ttca_lats: list[float] = []
+    for r in rows_ok:
+        lat = _safe_float(r.get("actual_latency_ms") or r.get("wall_ms"))
+        if lat is None:
+            continue
+        is_correct = False
+        if r.get("gt_scored") == "true":
+            is_correct = (r.get("gt_correct") == "true")
+        elif eval_index:
+            ic = eval_index.get((r.get("req_id", ""), r.get("model_winner", "")))
+            is_correct = bool(ic)
+        if is_correct:
+            all_ttca_lats.append(lat)
+
     tot_correct  = sum(s["correct"]   for s in by_cat.values())
     tot_scored   = sum(s["scored"]    for s in by_cat.values())
     tot_slo_viol = sum(s["slo_viol_n"] for s in by_cat.values())
@@ -142,6 +168,10 @@ def load_system(path: str, eval_index: dict) -> dict:
         "lat_p50":        _percentile(all_lats, 50) if all_lats else None,
         "lat_p95":        _percentile(all_lats, 95) if all_lats else None,
         "lat_mean":       mean(all_lats)             if all_lats else None,
+        "ttca_mean":      mean(all_ttca_lats)              if all_ttca_lats else None,
+        "ttca_p50":       _percentile(all_ttca_lats, 50)   if all_ttca_lats else None,
+        "ttca_p90":       _percentile(all_ttca_lats, 90)   if all_ttca_lats else None,
+        "ttca_p95":       _percentile(all_ttca_lats, 95)   if all_ttca_lats else None,
         "cost_mean":      mean(all_costs)            if all_costs else None,
         "cost_total":     sum(all_costs)             if all_costs else None,
         "energy_mean":    mean(all_energy)           if all_energy else None,
@@ -186,7 +216,7 @@ def print_summary(systems: list[tuple[str, dict]], ref_name: str | None = None) 
     any_slo      = any(s.get("slo_total", 0) > 0 for _, s in systems)
     any_attempts = any(s.get("attempts_mean") is not None for _, s in systems)
 
-    W = 140 if any_slo else 128
+    W = 185 if any_slo else 173
     if any_attempts:
         W += 12
     print(f"\n{'='*W}")
@@ -196,7 +226,9 @@ def print_summary(systems: list[tuple[str, dict]], ref_name: str | None = None) 
     slo_hdr  = f"  {'SLO Viol%':>10}" if any_slo else ""
     att_hdr  = f"  {'Avg Att.':>8}"   if any_attempts else ""
     print(f"\n  {'System':<22} {'Requests':>8} {'Accuracy':>9} {hdr_vs:>9}"
-          f"  {'Lat Mean':>8}  {'Lat P50':>8}  {'Lat P95':>8}  {'Energy/req':>11}  {'Cost/req':>11}"
+          f"  {'Lat Mean':>8}  {'Lat P50':>8}  {'Lat P95':>8}"
+          f"  {'TTCA Mean':>10}  {'TTCA P50':>9}  {'TTCA P90':>9}  {'TTCA P95':>9}"
+          f"  {'Energy/req':>11}  {'Cost/req':>11}"
           + slo_hdr + att_hdr)
     print(f"  {'-'*(W-2)}")
 
@@ -214,6 +246,7 @@ def print_summary(systems: list[tuple[str, dict]], ref_name: str | None = None) 
         att_col  = (f"  {att_mean:>8.2f}" if att_mean is not None else f"  {'1.00':>8}") if any_attempts else ""
         print(f"  {name:<22} {stats['n']:>8} {_pct(stats['accuracy']):>9} {vs:>9}"
               f"  {_ms(stats['lat_mean']):>8}  {_ms(stats['lat_p50']):>8}  {_ms(stats['lat_p95']):>8}"
+              f"  {_ms(stats['ttca_mean']):>10}  {_ms(stats['ttca_p50']):>9}  {_ms(stats['ttca_p90']):>9}  {_ms(stats['ttca_p95']):>9}"
               f"  {_j(energy_mean):>11}  {_usd(stats['cost_mean']):>11}"
               + slo_col + att_col)
 
@@ -281,6 +314,10 @@ def save_csv(systems: list[tuple[str, dict]], output: str) -> None:
             f"{safe}_accuracy_pct",
             f"{safe}_lat_p50_ms",
             f"{safe}_lat_p95_ms",
+            f"{safe}_ttca_mean_ms",
+            f"{safe}_ttca_p50_ms",
+            f"{safe}_ttca_p90_ms",
+            f"{safe}_ttca_p95_ms",
             f"{safe}_cost_mean_usd",
             f"{safe}_slo_viol_pct",
             f"{safe}_attempts_mean",
@@ -298,6 +335,10 @@ def save_csv(systems: list[tuple[str, dict]], output: str) -> None:
             row[f"{safe}_accuracy_pct"]   = round(stats["accuracy"] * 100, 2) if stats["accuracy"] is not None else ""
             row[f"{safe}_lat_p50_ms"]     = round(stats["lat_p50"],  0) if stats["lat_p50"]  else ""
             row[f"{safe}_lat_p95_ms"]     = round(stats["lat_p95"],  0) if stats["lat_p95"]  else ""
+            row[f"{safe}_ttca_mean_ms"]   = round(stats["ttca_mean"], 0) if stats.get("ttca_mean") else ""
+            row[f"{safe}_ttca_p50_ms"]    = round(stats["ttca_p50"],  0) if stats.get("ttca_p50")  else ""
+            row[f"{safe}_ttca_p90_ms"]    = round(stats["ttca_p90"],  0) if stats.get("ttca_p90")  else ""
+            row[f"{safe}_ttca_p95_ms"]    = round(stats["ttca_p95"],  0) if stats.get("ttca_p95")  else ""
             row[f"{safe}_cost_mean_usd"]  = f"{stats['cost_mean']:.8f}" if stats["cost_mean"] else ""
             slo_r = stats.get("slo_viol_rate")
             row[f"{safe}_slo_viol_pct"]   = round(slo_r * 100, 1) if slo_r is not None else ""
@@ -316,6 +357,10 @@ def save_csv(systems: list[tuple[str, dict]], output: str) -> None:
                 row[f"{safe}_accuracy_pct"]  = round(s["accuracy"] * 100, 2) if s["accuracy"] is not None else ""
                 row[f"{safe}_lat_p50_ms"]    = round(s["lat_p50"],  0) if s["lat_p50"]  else ""
                 row[f"{safe}_lat_p95_ms"]    = round(s["lat_p95"],  0) if s["lat_p95"]  else ""
+                row[f"{safe}_ttca_mean_ms"]  = round(s["ttca_mean"], 0) if s.get("ttca_mean") else ""
+                row[f"{safe}_ttca_p50_ms"]   = round(s["ttca_p50"],  0) if s.get("ttca_p50")  else ""
+                row[f"{safe}_ttca_p90_ms"]   = round(s["ttca_p90"],  0) if s.get("ttca_p90")  else ""
+                row[f"{safe}_ttca_p95_ms"]   = round(s["ttca_p95"],  0) if s.get("ttca_p95")  else ""
                 row[f"{safe}_cost_mean_usd"] = f"{s['cost_mean']:.8f}" if s["cost_mean"] else ""
                 slo_cat = s.get("slo_viol_rate")
                 row[f"{safe}_slo_viol_pct"]  = round(slo_cat * 100, 1) if slo_cat is not None else ""
