@@ -186,7 +186,7 @@ def print_summary(systems: list[tuple[str, dict]], ref_name: str | None = None) 
     any_slo      = any(s.get("slo_total", 0) > 0 for _, s in systems)
     any_attempts = any(s.get("attempts_mean") is not None for _, s in systems)
 
-    W = 130 if any_slo else 118
+    W = 140 if any_slo else 128
     if any_attempts:
         W += 12
     print(f"\n{'='*W}")
@@ -196,7 +196,7 @@ def print_summary(systems: list[tuple[str, dict]], ref_name: str | None = None) 
     slo_hdr  = f"  {'SLO Viol%':>10}" if any_slo else ""
     att_hdr  = f"  {'Avg Att.':>8}"   if any_attempts else ""
     print(f"\n  {'System':<22} {'Requests':>8} {'Accuracy':>9} {hdr_vs:>9}"
-          f"  {'Lat P50':>8}  {'Lat P95':>8}  {'Energy/req':>11}  {'Cost/req':>11}"
+          f"  {'Lat Mean':>8}  {'Lat P50':>8}  {'Lat P95':>8}  {'Energy/req':>11}  {'Cost/req':>11}"
           + slo_hdr + att_hdr)
     print(f"  {'-'*(W-2)}")
 
@@ -213,7 +213,7 @@ def print_summary(systems: list[tuple[str, dict]], ref_name: str | None = None) 
         att_mean = stats.get("attempts_mean")
         att_col  = (f"  {att_mean:>8.2f}" if att_mean is not None else f"  {'1.00':>8}") if any_attempts else ""
         print(f"  {name:<22} {stats['n']:>8} {_pct(stats['accuracy']):>9} {vs:>9}"
-              f"  {_ms(stats['lat_p50']):>8}  {_ms(stats['lat_p95']):>8}"
+              f"  {_ms(stats['lat_mean']):>8}  {_ms(stats['lat_p50']):>8}  {_ms(stats['lat_p95']):>8}"
               f"  {_j(energy_mean):>11}  {_usd(stats['cost_mean']):>11}"
               + slo_col + att_col)
 
