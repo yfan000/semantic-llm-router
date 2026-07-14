@@ -302,6 +302,76 @@ def print_domain_breakdown(systems: list[tuple[str, dict]]) -> None:
     print()
 
 
+def print_ttca_breakdown(systems: list[tuple[str, dict]]) -> None:
+    """Print per-(domain,complexity) TTCA Mean breakdown."""
+    names = [n for n, _ in systems]
+    col_w = max(12, max(len(n) for n in names) + 2)
+    W = 18 + col_w * len(names) + 4
+    print(f"\n{'='*W}")
+    print(f"  TTCA MEAN BY DOMAIN x COMPLEXITY  (correct answers only, lower = better)")
+    print(f"{'='*W}")
+    print(f"  {'Category':<18}", end="")
+    for name in names:
+        print(f"  {name[:col_w-2]:>{col_w-2}}", end="")
+    print()
+    print(f"  {'-'*(W-2)}")
+    prev_domain = None
+    for cat in CATEGORIES:
+        domain, complexity = cat
+        if prev_domain and domain != prev_domain:
+            print()
+        prev_domain = domain
+        label = f"{domain}:{complexity}"
+        vals = [(name, stats["by_cat"][cat]["ttca_mean"]) for name, stats in systems]
+        best = min((v for _, v in vals if v is not None), default=None)
+        print(f"  {label:<18}", end="")
+        for name, v in vals:
+            cell = _ms(v)
+            marker = "*" if v is not None and best is not None and abs(v - best) < 1 else " "
+            print(f"  {marker}{cell:>{col_w-2}}", end="")
+        print()
+    print()
+
+
+def print_cost_breakdown(systems: list[tuple[str, dict]]) -> None:
+    """Print per-(domain,complexity) cost breakdown: cost/req and cost per correct answer."""
+    names = [n for n, _ in systems]
+    col_w = max(13, max(len(n) for n in names) + 2)
+    W = 18 + col_w * len(names) + 4
+
+    for title, get_val in [
+        ("COST/REQ BY DOMAIN x COMPLEXITY  (mean charged_usd per request, lower = better)",
+         lambda s, cat: s["by_cat"][cat]["cost_mean"]),
+        ("COST PER CORRECT ANSWER BY DOMAIN x COMPLEXITY  (total_cost / n_correct, lower = better)",
+         lambda s, cat: (s["by_cat"][cat]["cost_total"] / s["by_cat"][cat]["correct"])
+                        if s["by_cat"][cat]["correct"] else None),
+    ]:
+        print(f"\n{'='*W}")
+        print(f"  {title}")
+        print(f"{'='*W}")
+        print(f"  {'Category':<18}", end="")
+        for name in names:
+            print(f"  {name[:col_w-2]:>{col_w-2}}", end="")
+        print()
+        print(f"  {'-'*(W-2)}")
+        prev_domain = None
+        for cat in CATEGORIES:
+            domain, complexity = cat
+            if prev_domain and domain != prev_domain:
+                print()
+            prev_domain = domain
+            label = f"{domain}:{complexity}"
+            vals = [(name, get_val(stats, cat)) for name, stats in systems]
+            best = min((v for _, v in vals if v is not None), default=None)
+            print(f"  {label:<18}", end="")
+            for name, v in vals:
+                cell = _usd(v)
+                marker = "*" if v is not None and best is not None and abs(v - best) < 1e-8 else " "
+                print(f"  {marker}{cell:>{col_w-2}}", end="")
+            print()
+        print()
+
+
 def save_csv(systems: list[tuple[str, dict]], output: str) -> None:
     """Save unified comparison to CSV for downstream analysis."""
     os.makedirs(os.path.dirname(output) if os.path.dirname(output) else ".", exist_ok=True)
@@ -418,6 +488,8 @@ def main() -> None:
 
     print_summary(systems, ref_name=ref_name)
     print_domain_breakdown(systems)
+    print_ttca_breakdown(systems)
+    print_cost_breakdown(systems)
 
     if args.output:
         save_csv(systems, args.output)
