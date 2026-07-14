@@ -102,9 +102,20 @@ json.dump(sample, open('/tmp/svd_workload.json', 'w'))
 from collections import Counter
 by_domain = Counter(x.get('domain') for x in sample)
 by_complex = Counter(x.get('complexity') for x in sample)
+DOMAINS = ['factual', 'math', 'code', 'reasoning']
+COMPLEXITIES = ['easy', 'medium', 'hard']
+by_cell = Counter((x.get('domain'), x.get('complexity')) for x in sample)
 print(f'  Workload: {len(sample)} requests')
 print(f'  By domain    : {dict(sorted(by_domain.items()))}')
 print(f'  By complexity: {dict(sorted(by_complex.items()))}')
+print(f'  By domain x complexity:')
+print(f"    {\"\":12} {\"easy\":>6} {\"medium\":>8} {\"hard\":>6} {\"total\":>7}")
+for d in DOMAINS:
+    row = [by_cell.get((d, c), 0) for c in COMPLEXITIES]
+    pcts = [f\"{v/len(sample)*100:.0f}%\" for v in row]
+    print(f"    {d:12} {row[0]:>3}({pcts[0]:>3}) {row[1]:>3}({pcts[1]:>3}) {row[2]:>3}({pcts[2]:>3}) {sum(row):>6}")
+col_tots = [sum(by_cell.get((d,c),0) for d in DOMAINS) for c in COMPLEXITIES]
+print(f"    {\"total\":12} {col_tots[0]:>6} {col_tots[1]:>8} {col_tots[2]:>6} {len(sample):>7}")
 "
 
 
@@ -553,6 +564,51 @@ print('  ' + ('SLO violations').ljust(W1) + (str(s['slo_viol_n'])+'/'+str(s['slo
 print('  ' + ('SLO violation rate').ljust(W1) + fmt(s['slo_pct'],'%.1f','%').rjust(W2) + ' ' + fmt(d['slo_pct'],'%.1f','%').rjust(W3) + ' ' + delta(s['slo_pct'],d['slo_pct'],'%.1f','pp').rjust(W4))
 print('  ' + ('Total retries').ljust(W1) + str(s['retries_total']).rjust(W2) + ' ' + str(d['retries_total']).rjust(W3) + ' ' + delta(s['retries_total'],d['retries_total'],'%d').rjust(W4))
 print('  ' + ('Avg retries/req').ljust(W1) + fmt(s['retries_mean'],'%.3f').rjust(W2) + ' ' + fmt(d['retries_mean'],'%.3f').rjust(W3))
+
+# ── TTCA by domain x complexity ──────────────────────────────────
+DOMAINS_LIST = ['factual', 'math', 'code', 'reasoning']
+COMPLEXITIES_LIST = ['easy', 'medium', 'hard']
+
+def _load_rows(path):
+    try:
+        return list(csv.DictReader(open(path)))
+    except FileNotFoundError:
+        return []
+
+def _ttca_cells(rows):
+    cells = {}
+    for r in rows:
+        if r.get('status') != '200':
+            continue
+        if not (r.get('gt_correct') in ('true','True') or r.get('correct') in ('true','True','1')):
+            continue
+        lat = r.get('actual_latency_ms') or r.get('wall_ms')
+        if not lat:
+            continue
+        key = (r.get('domain',''), r.get('complexity',''))
+        cells.setdefault(key, []).append(float(lat)/1000)
+    return cells
+
+s_cells = _ttca_cells(_load_rows(rd + '/static_results.csv'))
+d_cells = _ttca_cells(_load_rows(rd + '/dynamic_results.csv'))
+
+print('\n  TTCA MEAN BY DOMAIN x COMPLEXITY  (correct answers only, seconds)')
+W_cat, W_col = 20, 12
+print('  ' + 'Category'.ljust(W_cat) + 'Static'.rjust(W_col) + ' ' + 'Dynamic'.rjust(W_col) + ' ' + 'Delta(D-S)'.rjust(W_col))
+print('  ' + '-' * (W_cat + W_col * 3 + 2))
+prev_d = None
+for domain in DOMAINS_LIST:
+    for complexity in COMPLEXITIES_LIST:
+        if prev_d and domain != prev_d:
+            print()
+        prev_d = domain
+        sv = mean(s_cells[(domain, complexity)]) if s_cells.get((domain, complexity)) else None
+        dv = mean(d_cells[(domain, complexity)]) if d_cells.get((domain, complexity)) else None
+        s_str = ('%.2fs' % sv) if sv is not None else '-'
+        d_str = ('%.2fs' % dv) if dv is not None else '-'
+        dl_str = (('+' if dv - sv >= 0 else '') + '%.2fs' % (dv - sv)) if sv is not None and dv is not None else '-'
+        print('  ' + (domain + ':' + complexity).ljust(W_cat) + s_str.rjust(W_col) + ' ' + d_str.rjust(W_col) + ' ' + dl_str.rjust(W_col))
+print()
 PYEOF
 
 echo ""
