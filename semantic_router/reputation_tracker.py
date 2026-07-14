@@ -157,6 +157,52 @@ class ReputationTracker:
         )
         self._save()
 
+    def seed_if_absent(
+        self, model_id: str, domain: str, complexity: str, score: float
+    ) -> bool:
+        """Set accuracy prior only if this cell has no existing value.
+
+        Used at model-registration time to seed calibration data without
+        overwriting values already populated by warmup_from_eval_matrix().
+        Returns True if the value was written, False if it already existed.
+        """
+        self._ensure(model_id)
+        key = f"{domain}:{complexity}"
+        if key in self._data[model_id]["accuracy_priors"]:
+            return False
+        self._data[model_id]["accuracy_priors"][key] = score
+        self._save()
+        return True
+
+    def warmup_from_eval_matrix(self, csv_path: str) -> int:
+        """Pre-seed accuracy priors from eval_matrix.csv before live traffic begins.
+
+        Computes mean is_correct per (model_id, domain, complexity) cell and
+        writes the result directly into accuracy_priors, overwriting any stale
+        values from a previous cold run. Returns the number of cells seeded.
+        """
+        import csv
+        from collections import defaultdict
+        scores: defaultdict = defaultdict(list)
+        with open(csv_path, newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                if row.get("status", "200") != "200":
+                    continue
+                is_correct = row.get("is_correct", "").lower() in ("true", "1", "yes")
+                scores[(row["model_id"], row["domain"], row["complexity"])].append(
+                    1.0 if is_correct else 0.0
+                )
+        count = 0
+        for (model_id, domain, complexity), vals in scores.items():
+            self._ensure(model_id)
+            self._data[model_id]["accuracy_priors"][f"{domain}:{complexity}"] = (
+                sum(vals) / len(vals)
+            )
+            count += 1
+        if count:
+            self._save()
+        return count
+
     def record_accuracy_bid(
         self,
         model_id: str,
