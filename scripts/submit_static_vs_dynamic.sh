@@ -300,6 +300,13 @@ python tests/baseline_omni_router.py \
     --output      "\$RESULTS_DIR/baseline_omni_router.csv"
 
 echo ""
+echo "[S3h] Warm-starting router accuracy priors from eval_matrix.csv..."
+curl --noproxy '*' -sf -X POST "\$ROUTER_URL/router/warmup" \
+    -H "Content-Type: application/json" \
+    -d "{\"eval_matrix_path\": \"\$RESULTS_DIR/eval_matrix.csv\"}" \
+    | python3 -c "import sys,json; r=json.load(sys.stdin); print(f'  Seeded {r[\"cells_seeded\"]} (model,domain,complexity) cells into reputation tracker')"
+
+echo ""
 echo "[S4] Running workload in STATIC mode (${N_REQUESTS} requests, rate=${RATE:-closed-loop})..."
 STATIC_START=\$(date +%s)
 python tests/load_test.py \
