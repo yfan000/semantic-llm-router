@@ -15,7 +15,7 @@ class ModelAdapter(ABC):
         output_rate_usd_per_token: float,
         accuracy_priors: dict[str, float] | None = None,
         model_name: str = "",
-        reputation=None,              # ReputationTracker | None
+        reputation=None,             # ReputationTracker | None
         decode_tokens_per_sec: float = 1000.0,
         prefill_tokens_per_sec: float = 5000.0,
     ) -> None:
@@ -34,13 +34,13 @@ class ModelAdapter(ABC):
         # per-model per-category output token counts instead of the static table.
         self._reputation = reputation
         # Per-model throughput used in decomposed latency formula.
-        # decode_tokens_per_sec: how fast the model generates tokens (varies by size).
+        # decode_tokens_per_sec: how fast the model generates tokens (varies by model size).
         # prefill_tokens_per_sec: how fast it processes the input prompt (typically 5-10x decode).
         self.decode_tokens_per_sec = max(decode_tokens_per_sec, 1.0)
         self.prefill_tokens_per_sec = max(prefill_tokens_per_sec, 1.0)
 
         # Router-side in-flight counter.
-        # Tracks requests dispatched but not yet completed -- updated
+        # Tracks requests dispatched but not yet completed — updated
         # immediately at dispatch time, before vLLM's Prometheus metrics
         # catch up. Prevents thundering-herd overbidding when many
         # concurrent requests all see the same stale low-load snapshot.
@@ -61,6 +61,11 @@ class ModelAdapter(ABC):
             self._in_flight = max(0, self._in_flight - 1)
 
     def get_accuracy_prior(self, domain: str, complexity: str) -> float:
+        # Tracker is the primary source: warm-started from eval_matrix.csv
+        # and updated live by the accuracy sampler after each judged request.
+        if self._reputation is not None:
+            return self._reputation.get_accuracy_prior(self.model_id, domain, complexity)
+        # Fallback when no tracker: registration-time calibration priors, then default.
         from semantic_router.config import DEFAULT_ACCURACY_PRIOR
         return self.accuracy_priors.get(f"{domain}:{complexity}", DEFAULT_ACCURACY_PRIOR)
 
@@ -68,7 +73,7 @@ class ModelAdapter(ABC):
         # Use observed per-model per-category token counts when available.
         # These are updated in real time by dispatcher.py after every response,
         # so reasoning models (deepseek-r1-*) will quickly learn their true
-        # output lengths (3-5x longer than instruction models for the same prompt).
+        # output lengths (3-5× longer than instruction models for the same prompt).
         if self._reputation is not None:
             observed = self._reputation.get_avg_output_tokens(
                 self.model_id, domain, complexity
