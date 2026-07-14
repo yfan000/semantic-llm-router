@@ -41,10 +41,10 @@ TTCA_COST_BETA: float = 0.0
 # Patched per-experiment via sed in run_experiment.sh:
 #   TTCA_ALPHA_FACTUAL=0.0 bash scripts/submit.sh   (fully accuracy-focused factual)
 #   TTCA_ALPHA_FACTUAL=1.0 bash scripts/submit.sh   (revert to classic TTCA)
-TTCA_ALPHA_FACTUAL:   float = 0.3   # factual:  accuracy-focused (MMLU-Pro rewards large models)
+TTCA_ALPHA_FACTUAL:   float = 0.1   # factual:  below crossover — lets Gemma-3-27B beat Qwen-7B on easy
 TTCA_ALPHA_MATH:      float = 0.7   # math:     moderate — reasoning speed matters
 TTCA_ALPHA_CODE:      float = 1.0   # code:     classic TTCA — compile+test latency matters
-TTCA_ALPHA_REASONING: float = 0.7   # reasoning: moderate balance
+TTCA_ALPHA_REASONING: float = 0.4   # reasoning: reduced from 0.7 to close reasoning:easy accuracy gap
 
 # Accuracy prior (judge-scored, updates eligibility floor)
 ACCURACY_EMA_ALPHA: float = 0.10  # increased from 0.05 for faster adaptation to observed accuracy
