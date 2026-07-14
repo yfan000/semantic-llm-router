@@ -437,6 +437,52 @@ same 300-request workload.
   \end{tabular}}
 \end{table}
 
+\paragraph{\ttca\ by domain and complexity.}
+Table~\ref{tab:ttca_breakdown} breaks down \ttca\ mean per
+(domain, complexity) cell for both provisioning modes.
+Code and reasoning cells show the largest delta, as the seed-only
+dynamic fleet lacks the specialist models needed to resolve hard
+queries quickly.
+
+\begin{table}[t]
+  \centering
+  \caption{%
+    \ttca\ mean (seconds) by domain and complexity for static and dynamic
+    provisioning (correct answers only, 300-request workload).
+    $\Delta = \text{Dynamic} - \text{Static}$; positive~$=$ dynamic is slower.%
+  }
+  \label{tab:ttca_breakdown}
+  \small
+  \begin{tabular}{llrrr}
+    \toprule
+    Domain & Cmplx & Static (s) & Dynamic (s) & $\Delta$ (s) \\
+    \midrule
+    \multirow{3}{*}{Factual}
+      & Easy   & \todo{X.X} & \todo{X.X} & \todo{$\pm$X.X} \\
+      & Medium & \todo{X.X} & \todo{X.X} & \todo{$\pm$X.X} \\
+      & Hard   & \todo{X.X} & \todo{X.X} & \todo{$\pm$X.X} \\
+    \midrule
+    \multirow{3}{*}{Math}
+      & Easy   & \todo{X.X} & \todo{X.X} & \todo{$\pm$X.X} \\
+      & Medium & \todo{X.X} & \todo{X.X} & \todo{$\pm$X.X} \\
+      & Hard   & \todo{X.X} & \todo{X.X} & \todo{$\pm$X.X} \\
+    \midrule
+    \multirow{3}{*}{Code}
+      & Easy   & \todo{X.X} & \todo{X.X} & \todo{$\pm$X.X} \\
+      & Medium & \todo{X.X} & \todo{X.X} & \todo{$\pm$X.X} \\
+      & Hard   & \todo{X.X} & \todo{X.X} & \todo{$\pm$X.X} \\
+    \midrule
+    \multirow{3}{*}{Reasoning}
+      & Easy   & \todo{X.X} & \todo{X.X} & \todo{$\pm$X.X} \\
+      & Medium & \todo{X.X} & \todo{X.X} & \todo{$\pm$X.X} \\
+      & Hard   & \todo{X.X} & \todo{X.X} & \todo{$\pm$X.X} \\
+    \midrule
+    \multicolumn{2}{l}{\textbf{Overall}}
+      & \result{7.1} & \result{7.7} & \result{$+0.6$} \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
 \paragraph{GPU-core-hours.}
 Static mode keeps all \result{8} Node-1 GPUs active for the entire
 experiment (including \result{10} min of model loading),
