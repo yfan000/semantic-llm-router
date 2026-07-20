@@ -102,7 +102,7 @@ if domain_filter:
     data = [x for x in data if x.get('domain') == domain_filter]
     print(f'  Domain filter: {domain_filter} ({len(data)} items available)')
 sample = random.sample(data, min(${N_REQUESTS}, len(data)))
-json.dump(sample, open('/tmp/svd_workload.json', 'w'))
+json.dump(sample, open('\$RESULTS_DIR/workload.json', 'w'))
 from collections import Counter
 by_domain = Counter(x.get('domain') for x in sample)
 by_complex = Counter(x.get('complexity') for x in sample)
@@ -113,13 +113,13 @@ print(f'  Workload: {len(sample)} requests')
 print(f'  By domain    : {dict(sorted(by_domain.items()))}')
 print(f'  By complexity: {dict(sorted(by_complex.items()))}')
 print(f'  By domain x complexity:')
-print(f\"    {\"\":12} {\"easy\":>6} {\"medium\":>8} {\"hard\":>6} {\"total\":>7}\")
+print(f\"    {'':12} {'easy':>6} {'medium':>8} {'hard':>6} {'total':>7}\")
 for d in DOMAINS:
     row = [by_cell.get((d, c), 0) for c in COMPLEXITIES]
     pcts = [f\"{v/len(sample)*100:.0f}%\" for v in row]
     print(f\"    {d:12} {row[0]:>3}({pcts[0]:>3}) {row[1]:>3}({pcts[1]:>3}) {row[2]:>3}({pcts[2]:>3}) {sum(row):>6}\")
 col_tots = [sum(by_cell.get((d,c),0) for d in DOMAINS) for c in COMPLEXITIES]
-print(f\"    {\"total\":12} {col_tots[0]:>6} {col_tots[1]:>8} {col_tots[2]:>6} {len(sample):>7}\")
+print(f\"    {'total':12} {col_tots[0]:>6} {col_tots[1]:>8} {col_tots[2]:>6} {len(sample):>7}\")
 "
 
 
@@ -250,7 +250,7 @@ echo "[S3b] Pre-evaluating all 6 models on workload → eval_matrix.csv"
 echo "      (Enables Tier-Optimal-Acc and Tier-Optimal-Cost oracle baselines)"
 echo "      This takes ~20-40 min while models are warm. Running concurrently."
 python tests/eval_all_models.py \
-    --dataset     /tmp/svd_workload.json \
+    --dataset     "\$RESULTS_DIR/workload.json" \
     --output      "\$RESULTS_DIR/eval_matrix.csv" \
     --concurrency 20 \
     --node2-host  "\$NODE2"
@@ -273,7 +273,7 @@ python tests/baseline_cost_optimal.py \
 echo ""
 echo "[S3e] Running Tier-Optimal-Acc oracle (complexity-tier with accuracy_optimal map)..."
 python tests/baseline_complexity_tier.py \
-    --dataset     /tmp/svd_workload.json \
+    --dataset     "\$RESULTS_DIR/workload.json" \
     --tier-map    "\$RESULTS_DIR/optimal_tier_maps.json" \
     --tier-variant accuracy_optimal \
     --concurrency ${CONCURRENCY} \
@@ -282,7 +282,7 @@ python tests/baseline_complexity_tier.py \
 echo ""
 echo "[S3f] CARROT baseline (Somerstep et al. 2025, arXiv:2502.03261, mu=0.3)..."
 python tests/baseline_carrot.py \
-    --dataset     /tmp/svd_workload.json \
+    --dataset     "\$RESULTS_DIR/workload.json" \
     --eval-matrix "\$RESULTS_DIR/eval_matrix.csv" \
     --mu          0.3 \
     --concurrency ${CONCURRENCY} \
@@ -292,7 +292,7 @@ python tests/baseline_carrot.py \
 echo ""
 echo "[S3g] OmniRouter baseline (Mei et al. 2025, arXiv:2502.20576, alpha=0.75)..."
 python tests/baseline_omni_router.py \
-    --dataset     /tmp/svd_workload.json \
+    --dataset     "\$RESULTS_DIR/workload.json" \
     --eval-matrix "\$RESULTS_DIR/eval_matrix.csv" \
     --alpha       0.75 \
     --concurrency ${CONCURRENCY} \
@@ -310,13 +310,16 @@ echo ""
 echo "[S4] Running workload in STATIC mode (${N_REQUESTS} requests, rate=${RATE:-closed-loop})..."
 STATIC_START=\$(date +%s)
 python tests/load_test.py \
-    --dataset     /tmp/svd_workload.json \
+    --dataset     "\$RESULTS_DIR/workload.json" \
     --router      "\$ROUTER_URL" \
     --mode        ttca \
     --requests    ${N_REQUESTS} \
     --concurrency ${CONCURRENCY} \
     ${RATE_FLAG} \
-    --output      "\$RESULTS_DIR/static_results.csv"
+    --output      "\$RESULTS_DIR/static_results.csv" \
+    2>&1 | tee "\$RESULTS_DIR/static_load.log"
+[ -f "\$RESULTS_DIR/static_results.csv" ] || \
+    echo "  WARNING: static load test produced no output — check \$RESULTS_DIR/static_load.log"
 STATIC_END=\$(date +%s)
 STATIC_WALL=\$((STATIC_END - STATIC_PROV_START))
 echo "  Static total experiment time: \${STATIC_WALL}s (provisioner start → load test end)"
@@ -335,26 +338,29 @@ echo "  BASELINES: Cascade and RouteLLM (all 6 models alive)"
 echo "=================================================================="
 
 echo ""
-echo "  [Baseline 1/3] Cascade (threshold=0.80)..."
+echo "  [Baseline 1/2] Cascade (threshold=0.80)..."
 python tests/baseline_cascade.py \
-    --dataset     /tmp/svd_workload.json \
+    --dataset     "\$RESULTS_DIR/workload.json" \
     --priors      "${PRIORS}" \
     --threshold   0.80 \
     --concurrency ${CONCURRENCY} \
-    --output      "\$RESULTS_DIR/baseline_cascade.csv"
+    --output      "\$RESULTS_DIR/baseline_cascade.csv" \
+    2>&1 | tee "\$RESULTS_DIR/cascade.log"
+[ -f "\$RESULTS_DIR/baseline_cascade.csv" ] || \
+    echo "  WARNING: cascade baseline produced no output — check \$RESULTS_DIR/cascade.log"
 
 echo ""
-echo "  [Baseline 2/3] RouteLLM MF router..."
+echo "  [Baseline 2/2] RouteLLM MF router..."
 echo "  (Calibrating threshold to match cascade strong-model usage rate)"
 OPENAI_API_KEY=dummy python tests/baseline_routellm.py \
-    --dataset     /tmp/svd_workload.json \
+    --dataset     "\$RESULTS_DIR/workload.json" \
     --calibrate \
     2>&1 | tee "\$RESULTS_DIR/routellm_calibration.txt" || true
 
 ROUTELLM_THRESHOLD=\${ROUTELLM_THRESHOLD:-0.5}
 echo "  Using threshold=\${ROUTELLM_THRESHOLD} (set ROUTELLM_THRESHOLD env var to override)"
 OPENAI_API_KEY=dummy python tests/baseline_routellm.py \
-    --dataset     /tmp/svd_workload.json \
+    --dataset     "\$RESULTS_DIR/workload.json" \
     --threshold   \${ROUTELLM_THRESHOLD} \
     --concurrency ${CONCURRENCY} \
     --output      "\$RESULTS_DIR/baseline_routellm.csv" \
@@ -363,7 +369,7 @@ OPENAI_API_KEY=dummy python tests/baseline_routellm.py \
 echo ""
 echo "  [Baseline 3/3] Round-Robin (uniform distribution over all backends)..."
 python tests/round_robin_test.py \
-    --dataset     /tmp/svd_workload.json \
+    --dataset     "\$RESULTS_DIR/workload.json" \
     --requests    ${N_REQUESTS} \
     --concurrency ${CONCURRENCY} \
     --node2-host  "\$NODE2" \
@@ -426,7 +432,7 @@ echo "  (Without warm-up, TTCA uses catalog estimates which can be wildly off)"
 python3 -c "
 import json, random
 random.seed(99)
-data = json.load(open('/tmp/svd_workload.json'))
+data = json.load(open('\$RESULTS_DIR/workload.json'))
 easy = [x for x in data if x.get('complexity') == 'easy']
 sample = random.sample(easy, min(50, len(easy)))
 json.dump(sample, open('/tmp/svd_warmup.json', 'w'))
@@ -445,13 +451,16 @@ echo ""
 echo "[D4] Running workload in DYNAMIC mode (${N_REQUESTS} requests, rate=${RATE:-closed-loop})..."
 DYNAMIC_START=\$(date +%s)
 python tests/load_test.py \
-    --dataset     /tmp/svd_workload.json \
+    --dataset     "\$RESULTS_DIR/workload.json" \
     --router      "\$ROUTER_URL" \
     --mode        ttca \
     --requests    ${N_REQUESTS} \
     --concurrency ${CONCURRENCY} \
     ${RATE_FLAG} \
-    --output      "\$RESULTS_DIR/dynamic_results.csv"
+    --output      "\$RESULTS_DIR/dynamic_results.csv" \
+    2>&1 | tee "\$RESULTS_DIR/dynamic_load.log"
+[ -f "\$RESULTS_DIR/dynamic_results.csv" ] || \
+    echo "  WARNING: dynamic load test produced no output — check \$RESULTS_DIR/dynamic_load.log"
 DYNAMIC_END=\$(date +%s)
 DYNAMIC_WALL=\$((DYNAMIC_END - DYNAMIC_PROV_START))
 echo "  Dynamic total experiment time: \${DYNAMIC_WALL}s (provisioner start → load test end)"
@@ -487,15 +496,18 @@ echo "    Dynamic: \${LOAD_TEST_WALL_DYNAMIC}s"
 COMPARE_ARGS=(tests/compare_all.py)
 [ -f "\$RESULTS_DIR/rr_baseline.csv" ] && \
   COMPARE_ARGS+=(--system "Round-Robin:\$RESULTS_DIR/rr_baseline.csv")
-COMPARE_ARGS+=(--system "Cascade:\$RESULTS_DIR/baseline_cascade.csv")
+[ -f "\$RESULTS_DIR/baseline_cascade.csv" ] && \
+  COMPARE_ARGS+=(--system "Cascade:\$RESULTS_DIR/baseline_cascade.csv")
 [ -f "\$RESULTS_DIR/baseline_routellm.csv" ] && \
   COMPARE_ARGS+=(--system "RouteLLM:\$RESULTS_DIR/baseline_routellm.csv")
 [ -f "\$RESULTS_DIR/baseline_carrot.csv" ] && \
   COMPARE_ARGS+=(--system "CARROT:\$RESULTS_DIR/baseline_carrot.csv")
 [ -f "\$RESULTS_DIR/baseline_omni_router.csv" ] && \
   COMPARE_ARGS+=(--system "OmniRouter:\$RESULTS_DIR/baseline_omni_router.csv")
-COMPARE_ARGS+=(--system "Static (TTCA):\$RESULTS_DIR/static_results.csv")
-COMPARE_ARGS+=(--system "Dynamic (TTCA):\$RESULTS_DIR/dynamic_results.csv")
+[ -f "\$RESULTS_DIR/static_results.csv" ] && \
+  COMPARE_ARGS+=(--system "Static (TTCA):\$RESULTS_DIR/static_results.csv")
+[ -f "\$RESULTS_DIR/dynamic_results.csv" ] && \
+  COMPARE_ARGS+=(--system "Dynamic (TTCA):\$RESULTS_DIR/dynamic_results.csv")
 [ -f "\$RESULTS_DIR/baseline_tier_acc_optimal.csv" ] && \
   COMPARE_ARGS+=(--system "Tier-Opt-Acc:\$RESULTS_DIR/baseline_tier_acc_optimal.csv")
 [ -f "\$RESULTS_DIR/baseline_cost_optimal.csv" ] && \
