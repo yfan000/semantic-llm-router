@@ -131,6 +131,7 @@ def load_system(path: str, eval_index: dict) -> dict:
             "ttca_p90":       _percentile(ttca_lats_cat, 90)   if ttca_lats_cat else None,
             "ttca_p95":       _percentile(ttca_lats_cat, 95)   if ttca_lats_cat else None,
             "cost_mean":          mean(costs)                            if costs else None,
+            "cost_p95":           _percentile(costs, 95)                 if costs else None,
             "cost_total":         sum(costs)                             if costs else None,
             "cost_correct_total": sum(costs_correct),
             "cost_max":           max(effective_costs_cat)               if effective_costs_cat else None,
@@ -184,6 +185,7 @@ def load_system(path: str, eval_index: dict) -> dict:
         "ttca_p90":       _percentile(all_ttca_lats, 90)   if all_ttca_lats else None,
         "ttca_p95":       _percentile(all_ttca_lats, 95)   if all_ttca_lats else None,
         "cost_mean":          mean(all_costs)                                                                         if all_costs else None,
+        "cost_p95":           _percentile(all_costs, 95)                                                              if all_costs else None,
         "cost_total":         sum(all_costs)                                                                          if all_costs else None,
         "cost_correct_total": sum(s.get("cost_correct_total") or 0 for s in by_cat.values()),
         "cost_max":           max((s["cost_max"] for s in by_cat.values() if s.get("cost_max") is not None), default=None),
@@ -229,7 +231,7 @@ def print_summary(systems: list[tuple[str, dict]], ref_name: str | None = None, 
     any_slo      = any(s.get("slo_total", 0) > 0 for _, s in systems)
     any_attempts = any(s.get("attempts_mean") is not None for _, s in systems)
 
-    W = 211 if any_slo else 199
+    W = 224 if any_slo else 212
     if any_attempts:
         W += 12
     print(f"\n{'='*W}")
@@ -241,7 +243,7 @@ def print_summary(systems: list[tuple[str, dict]], ref_name: str | None = None, 
     print(f"\n  {'System':<22} {'Requests':>8} {'Accuracy':>9} {hdr_vs:>9}"
           f"  {'Lat Mean':>8}  {'Lat P50':>8}  {'Lat P95':>8}"
           f"  {'TTCA Mean':>10}  {'TTCA P50':>9}  {'TTCA P90':>9}  {'TTCA P95':>9}"
-          f"  {'Energy/req':>11}  {'Cost/req':>11}  {'$/correct':>11}  {'Pen.$/ans':>11}"
+          f"  {'Energy/req':>11}  {'Cost/req':>11}  {'Cost P95':>11}  {'$/correct':>11}  {'Pen.$/ans':>11}"
           + slo_hdr + att_hdr)
     print(f"  {'-'*(W-2)}")
 
@@ -265,7 +267,7 @@ def print_summary(systems: list[tuple[str, dict]], ref_name: str | None = None, 
         print(f"  {name:<22} {stats['n']:>8} {_pct(stats['accuracy']):>9} {vs:>9}"
               f"  {_ms(stats['lat_mean']):>8}  {_ms(stats['lat_p50']):>8}  {_ms(stats['lat_p95']):>8}"
               f"  {_ms(stats['ttca_mean']):>10}  {_ms(stats['ttca_p50']):>9}  {_ms(stats['ttca_p90']):>9}  {_ms(stats['ttca_p95']):>9}"
-              f"  {_j(energy_mean):>11}  {_usd(stats['cost_mean']):>11}  {_usd(old_cost_per_correct):>11}  {_usd(pen_cost):>11}"
+              f"  {_j(energy_mean):>11}  {_usd(stats['cost_mean']):>11}  {_usd(stats.get('cost_p95')):>11}  {_usd(old_cost_per_correct):>11}  {_usd(pen_cost):>11}"
               + slo_col + att_col)
 
     if ref_name:
@@ -321,18 +323,25 @@ def print_domain_breakdown(systems: list[tuple[str, dict]]) -> None:
 
 
 def print_ttca_breakdown(systems: list[tuple[str, dict]]) -> None:
-    """Print per-(domain,complexity) TTCA Mean breakdown."""
+    """Print per-(domain,complexity) TTCA Mean and P95 breakdown."""
     names = [n for n, _ in systems]
     col_w = max(12, max(len(n) for n in names) + 2)
-    W = 18 + col_w * len(names) + 4
+    METRIC_W = 11
+    W = 18 + METRIC_W + 2 + col_w * len(names) + 4
     print(f"\n{'='*W}")
-    print(f"  TTCA MEAN BY DOMAIN x COMPLEXITY  (correct answers only, lower = better)")
+    print(f"  TTCA METRICS BY DOMAIN x COMPLEXITY  (correct answers only, lower = better)")
     print(f"{'='*W}")
-    print(f"  {'Category':<18}", end="")
+    print(f"  {'Category':<18}  {'Metric':>{METRIC_W}}", end="")
     for name in names:
         print(f"  {name[:col_w-2]:>{col_w-2}}", end="")
     print()
     print(f"  {'-'*(W-2)}")
+
+    METRICS = [
+        ("TTCA mean", lambda s, cat: s["by_cat"][cat]["ttca_mean"]),
+        ("TTCA P95",  lambda s, cat: s["by_cat"][cat].get("ttca_p95")),
+    ]
+
     prev_domain = None
     for cat in CATEGORIES:
         domain, complexity = cat
@@ -340,60 +349,69 @@ def print_ttca_breakdown(systems: list[tuple[str, dict]]) -> None:
             print()
         prev_domain = domain
         label = f"{domain}:{complexity}"
-        vals = [(name, stats["by_cat"][cat]["ttca_mean"]) for name, stats in systems]
-        best = min((v for _, v in vals if v is not None), default=None)
-        print(f"  {label:<18}", end="")
-        for name, v in vals:
-            cell = _ms(v)
-            marker = "*" if v is not None and best is not None and abs(v - best) < 1 else " "
-            print(f"  {marker}{cell:>{col_w-2}}", end="")
-        print()
+        for i, (metric_label, get_val) in enumerate(METRICS):
+            cat_label = f"{label:<18}" if i == 0 else f"{'':18}"
+            vals = [(name, get_val(stats, cat)) for name, stats in systems]
+            best = min((v for _, v in vals if v is not None), default=None)
+            print(f"  {cat_label}  {metric_label:>{METRIC_W}}", end="")
+            for name, v in vals:
+                cell = _ms(v)
+                marker = "*" if v is not None and best is not None and abs(v - best) < 1 else " "
+                print(f"  {marker}{cell:>{col_w-2}}", end="")
+            print()
     print()
 
 
 def print_cost_breakdown(systems: list[tuple[str, dict]], max_global_charge: float = 0.0) -> None:
-    """Print per-(domain,complexity) cost breakdown: cost/req and cost per correct answer."""
+    """Print combined cost metrics per (domain,complexity): cost/req, P95, $/correct, pen.$/ans."""
     names = [n for n, _ in systems]
     col_w = max(13, max(len(n) for n in names) + 2)
-    W = 18 + col_w * len(names) + 4
+    METRIC_W = 11
+    W = 18 + METRIC_W + 2 + col_w * len(names) + 4
 
-    for title, get_val in [
-        ("COST/REQ BY DOMAIN x COMPLEXITY  (mean charged_usd per request, lower = better)",
+    print(f"\n{'='*W}")
+    print(f"  COST METRICS BY DOMAIN x COMPLEXITY  [pen.$/ans max_charge=${max_global_charge:.6f}]")
+    print(f"{'='*W}")
+    print(f"  {'Category':<18}  {'Metric':>{METRIC_W}}", end="")
+    for name in names:
+        print(f"  {name[:col_w-2]:>{col_w-2}}", end="")
+    print()
+    print(f"  {'-'*(W-2)}")
+
+    METRICS = [
+        ("cost/req",
          lambda s, cat: s["by_cat"][cat]["cost_mean"]),
-        ("COST PER CORRECT ANSWER BY DOMAIN x COMPLEXITY  (total_cost / n_correct, lower = better)",
+        ("cost P95",
+         lambda s, cat: s["by_cat"][cat].get("cost_p95")),
+        ("$/correct",
          lambda s, cat: (s["by_cat"][cat]["cost_total"] / s["by_cat"][cat]["correct"])
                         if s["by_cat"][cat]["correct"] else None),
-        (f"PENALIZED COST PER ANSWER  ((cost_correct + max_charge*n_wrong) / n_total)  [max_charge=${max_global_charge:.6f}]",
+        ("pen.$/ans",
          lambda s, cat: (
              (s["by_cat"][cat].get("cost_correct_total", 0)
               + max_global_charge * (s["by_cat"][cat]["n"] - s["by_cat"][cat]["correct"]))
              / s["by_cat"][cat]["n"]
          ) if s["by_cat"][cat]["n"] else None),
-    ]:
-        print(f"\n{'='*W}")
-        print(f"  {title}")
-        print(f"{'='*W}")
-        print(f"  {'Category':<18}", end="")
-        for name in names:
-            print(f"  {name[:col_w-2]:>{col_w-2}}", end="")
-        print()
-        print(f"  {'-'*(W-2)}")
-        prev_domain = None
-        for cat in CATEGORIES:
-            domain, complexity = cat
-            if prev_domain and domain != prev_domain:
-                print()
-            prev_domain = domain
-            label = f"{domain}:{complexity}"
+    ]
+
+    prev_domain = None
+    for cat in CATEGORIES:
+        domain, complexity = cat
+        if prev_domain and domain != prev_domain:
+            print()
+        prev_domain = domain
+        label = f"{domain}:{complexity}"
+        for i, (metric_label, get_val) in enumerate(METRICS):
+            cat_label = f"{label:<18}" if i == 0 else f"{'':18}"
             vals = [(name, get_val(stats, cat)) for name, stats in systems]
             best = min((v for _, v in vals if v is not None), default=None)
-            print(f"  {label:<18}", end="")
+            print(f"  {cat_label}  {metric_label:>{METRIC_W}}", end="")
             for name, v in vals:
                 cell = _usd(v)
                 marker = "*" if v is not None and best is not None and abs(v - best) < 1e-8 else " "
                 print(f"  {marker}{cell:>{col_w-2}}", end="")
             print()
-        print()
+    print()
 
 
 def save_csv(systems: list[tuple[str, dict]], output: str) -> None:
