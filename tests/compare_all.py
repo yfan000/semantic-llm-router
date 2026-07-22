@@ -229,7 +229,7 @@ def print_summary(systems: list[tuple[str, dict]], ref_name: str | None = None, 
     any_slo      = any(s.get("slo_total", 0) > 0 for _, s in systems)
     any_attempts = any(s.get("attempts_mean") is not None for _, s in systems)
 
-    W = 198 if any_slo else 186
+    W = 211 if any_slo else 199
     if any_attempts:
         W += 12
     print(f"\n{'='*W}")
@@ -241,7 +241,7 @@ def print_summary(systems: list[tuple[str, dict]], ref_name: str | None = None, 
     print(f"\n  {'System':<22} {'Requests':>8} {'Accuracy':>9} {hdr_vs:>9}"
           f"  {'Lat Mean':>8}  {'Lat P50':>8}  {'Lat P95':>8}"
           f"  {'TTCA Mean':>10}  {'TTCA P50':>9}  {'TTCA P90':>9}  {'TTCA P95':>9}"
-          f"  {'Energy/req':>11}  {'Cost/req':>11}  {'Pen.$/ans':>11}"
+          f"  {'Energy/req':>11}  {'Cost/req':>11}  {'$/correct':>11}  {'Pen.$/ans':>11}"
           + slo_hdr + att_hdr)
     print(f"  {'-'*(W-2)}")
 
@@ -260,11 +260,12 @@ def print_summary(systems: list[tuple[str, dict]], ref_name: str | None = None, 
         n_correct_all = sum(s["correct"] for s in stats["by_cat"].values())
         cost_correct_all = stats.get("cost_correct_total") or 0.0
         n_wrong = stats["n"] - n_correct_all
+        old_cost_per_correct = stats.get("cost_total") / n_correct_all if n_correct_all and stats.get("cost_total") else None
         pen_cost = (cost_correct_all + max_global_charge * n_wrong) / stats["n"] if stats["n"] else None
         print(f"  {name:<22} {stats['n']:>8} {_pct(stats['accuracy']):>9} {vs:>9}"
               f"  {_ms(stats['lat_mean']):>8}  {_ms(stats['lat_p50']):>8}  {_ms(stats['lat_p95']):>8}"
               f"  {_ms(stats['ttca_mean']):>10}  {_ms(stats['ttca_p50']):>9}  {_ms(stats['ttca_p90']):>9}  {_ms(stats['ttca_p95']):>9}"
-              f"  {_j(energy_mean):>11}  {_usd(stats['cost_mean']):>11}  {_usd(pen_cost):>11}"
+              f"  {_j(energy_mean):>11}  {_usd(stats['cost_mean']):>11}  {_usd(old_cost_per_correct):>11}  {_usd(pen_cost):>11}"
               + slo_col + att_col)
 
     if ref_name:
