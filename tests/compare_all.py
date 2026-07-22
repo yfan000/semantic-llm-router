@@ -84,8 +84,15 @@ def load_system(path: str, eval_index: dict) -> dict:
 
         correct = scored = 0
         ttca_lats_cat: list[float] = []
+        costs_correct: list[float] = []
+        effective_costs_cat: list[float] = []
         for r in g:
             lat = _safe_float(r.get("actual_latency_ms") or r.get("wall_ms"))
+            cost_r = _safe_float(r.get("charged_usd"))
+            retries_r = int(_safe_float(r.get("retries")) or 0)
+            eff_cost_r = cost_r * (1 + retries_r) if cost_r is not None else None
+            if eff_cost_r is not None:
+                effective_costs_cat.append(eff_cost_r)
             is_correct = False
             if r.get("gt_scored") == "true":
                 scored += 1
@@ -102,6 +109,8 @@ def load_system(path: str, eval_index: dict) -> dict:
                         is_correct = True
             if is_correct and lat is not None:
                 ttca_lats_cat.append(lat)
+            if is_correct and eff_cost_r is not None:
+                costs_correct.append(eff_cost_r)
 
         slo_rows_g = [r for r in g if r.get("slo_violated") in ("true", "false")]
         slo_viol_g = sum(1 for r in slo_rows_g if r.get("slo_violated") == "true")
@@ -121,9 +130,11 @@ def load_system(path: str, eval_index: dict) -> dict:
             "ttca_p50":       _percentile(ttca_lats_cat, 50)   if ttca_lats_cat else None,
             "ttca_p90":       _percentile(ttca_lats_cat, 90)   if ttca_lats_cat else None,
             "ttca_p95":       _percentile(ttca_lats_cat, 95)   if ttca_lats_cat else None,
-            "cost_mean":      mean(costs)            if costs else None,
-            "cost_total":     sum(costs)             if costs else None,
-            "energy_mean":    mean(energy)           if energy else None,
+            "cost_mean":          mean(costs)                            if costs else None,
+            "cost_total":         sum(costs)                             if costs else None,
+            "cost_correct_total": sum(costs_correct),
+            "cost_max":           max(effective_costs_cat)               if effective_costs_cat else None,
+            "energy_mean":        mean(energy)                           if energy else None,
             "energy_total":   sum(energy)            if energy else None,
             "slo_viol_n":     slo_viol_g,
             "slo_total":      len(slo_rows_g),
@@ -172,9 +183,11 @@ def load_system(path: str, eval_index: dict) -> dict:
         "ttca_p50":       _percentile(all_ttca_lats, 50)   if all_ttca_lats else None,
         "ttca_p90":       _percentile(all_ttca_lats, 90)   if all_ttca_lats else None,
         "ttca_p95":       _percentile(all_ttca_lats, 95)   if all_ttca_lats else None,
-        "cost_mean":      mean(all_costs)            if all_costs else None,
-        "cost_total":     sum(all_costs)             if all_costs else None,
-        "energy_mean":    mean(all_energy)           if all_energy else None,
+        "cost_mean":          mean(all_costs)                                                                         if all_costs else None,
+        "cost_total":         sum(all_costs)                                                                          if all_costs else None,
+        "cost_correct_total": sum(s.get("cost_correct_total") or 0 for s in by_cat.values()),
+        "cost_max":           max((s["cost_max"] for s in by_cat.values() if s.get("cost_max") is not None), default=None),
+        "energy_mean":        mean(all_energy)                                                                        if all_energy else None,
         "energy_total":   sum(all_energy)            if all_energy else None,
         "slo_viol_rate":  tot_slo_viol / tot_slo_rows if tot_slo_rows > 0 else None,
         "slo_viol_n":     tot_slo_viol,
@@ -207,7 +220,7 @@ def _pp(a, b) -> str:
     return f"{d:+.1f}pp"
 
 
-def print_summary(systems: list[tuple[str, dict]], ref_name: str | None = None) -> None:
+def print_summary(systems: list[tuple[str, dict]], ref_name: str | None = None, max_global_charge: float = 0.0) -> None:
     """Print ranked summary table including accuracy, latency, energy and cost."""
     ranked = sorted(systems, key=lambda x: x[1]["accuracy"] or 0, reverse=True)
     ref = next((s for n, s in systems if n == ref_name), None) if ref_name else None
@@ -216,7 +229,7 @@ def print_summary(systems: list[tuple[str, dict]], ref_name: str | None = None) 
     any_slo      = any(s.get("slo_total", 0) > 0 for _, s in systems)
     any_attempts = any(s.get("attempts_mean") is not None for _, s in systems)
 
-    W = 185 if any_slo else 173
+    W = 198 if any_slo else 186
     if any_attempts:
         W += 12
     print(f"\n{'='*W}")
@@ -228,7 +241,7 @@ def print_summary(systems: list[tuple[str, dict]], ref_name: str | None = None) 
     print(f"\n  {'System':<22} {'Requests':>8} {'Accuracy':>9} {hdr_vs:>9}"
           f"  {'Lat Mean':>8}  {'Lat P50':>8}  {'Lat P95':>8}"
           f"  {'TTCA Mean':>10}  {'TTCA P50':>9}  {'TTCA P90':>9}  {'TTCA P95':>9}"
-          f"  {'Energy/req':>11}  {'Cost/req':>11}"
+          f"  {'Energy/req':>11}  {'Cost/req':>11}  {'Pen.$/ans':>11}"
           + slo_hdr + att_hdr)
     print(f"  {'-'*(W-2)}")
 
@@ -244,10 +257,14 @@ def print_summary(systems: list[tuple[str, dict]], ref_name: str | None = None) 
                    f"  {'  -':>10}"            if any_slo else "")
         att_mean = stats.get("attempts_mean")
         att_col  = (f"  {att_mean:>8.2f}" if att_mean is not None else f"  {'1.00':>8}") if any_attempts else ""
+        n_correct_all = sum(s["correct"] for s in stats["by_cat"].values())
+        cost_correct_all = stats.get("cost_correct_total") or 0.0
+        n_wrong = stats["n"] - n_correct_all
+        pen_cost = (cost_correct_all + max_global_charge * n_wrong) / stats["n"] if stats["n"] else None
         print(f"  {name:<22} {stats['n']:>8} {_pct(stats['accuracy']):>9} {vs:>9}"
               f"  {_ms(stats['lat_mean']):>8}  {_ms(stats['lat_p50']):>8}  {_ms(stats['lat_p95']):>8}"
               f"  {_ms(stats['ttca_mean']):>10}  {_ms(stats['ttca_p50']):>9}  {_ms(stats['ttca_p90']):>9}  {_ms(stats['ttca_p95']):>9}"
-              f"  {_j(energy_mean):>11}  {_usd(stats['cost_mean']):>11}"
+              f"  {_j(energy_mean):>11}  {_usd(stats['cost_mean']):>11}  {_usd(pen_cost):>11}"
               + slo_col + att_col)
 
     if ref_name:
@@ -333,7 +350,7 @@ def print_ttca_breakdown(systems: list[tuple[str, dict]]) -> None:
     print()
 
 
-def print_cost_breakdown(systems: list[tuple[str, dict]]) -> None:
+def print_cost_breakdown(systems: list[tuple[str, dict]], max_global_charge: float = 0.0) -> None:
     """Print per-(domain,complexity) cost breakdown: cost/req and cost per correct answer."""
     names = [n for n, _ in systems]
     col_w = max(13, max(len(n) for n in names) + 2)
@@ -345,6 +362,12 @@ def print_cost_breakdown(systems: list[tuple[str, dict]]) -> None:
         ("COST PER CORRECT ANSWER BY DOMAIN x COMPLEXITY  (total_cost / n_correct, lower = better)",
          lambda s, cat: (s["by_cat"][cat]["cost_total"] / s["by_cat"][cat]["correct"])
                         if s["by_cat"][cat]["correct"] else None),
+        (f"PENALIZED COST PER ANSWER  ((cost_correct + max_charge*n_wrong) / n_total)  [max_charge=${max_global_charge:.6f}]",
+         lambda s, cat: (
+             (s["by_cat"][cat].get("cost_correct_total", 0)
+              + max_global_charge * (s["by_cat"][cat]["n"] - s["by_cat"][cat]["correct"]))
+             / s["by_cat"][cat]["n"]
+         ) if s["by_cat"][cat]["n"] else None),
     ]:
         print(f"\n{'='*W}")
         print(f"  {title}")
@@ -486,10 +509,15 @@ def main() -> None:
 
     ref_name = args.ref or parsed[0][0]
 
-    print_summary(systems, ref_name=ref_name)
+    max_global_charge = max(
+        (s.get("cost_max") or 0.0 for _, s in systems),
+        default=0.0,
+    )
+
+    print_summary(systems, ref_name=ref_name, max_global_charge=max_global_charge)
     print_domain_breakdown(systems)
     print_ttca_breakdown(systems)
-    print_cost_breakdown(systems)
+    print_cost_breakdown(systems, max_global_charge=max_global_charge)
 
     if args.output:
         save_csv(systems, args.output)
