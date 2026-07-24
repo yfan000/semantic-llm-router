@@ -180,25 +180,27 @@ warmup_priors() {
         -H "Content-Type: application/json" \
         -d "{\"eval_matrix_path\": \"\$RESULTS_DIR/eval_matrix.csv\"}" \
         | python3 -c "import sys,json; r=json.load(sys.stdin); print(f'  Seeded {r[\"cells_seeded\"]} (model,domain,complexity) cells')" \
-        2>/dev/null || echo "  WARNING: warmup failed"
+        2>/dev/null || echo "  WARNING: warmup failed (router may not support /router/warmup)"
 }
 print_quick_stats() {
     local CSV=\$1
     local LABEL=\$2
     [ -f "\$CSV" ] || { echo "  (no CSV to summarize)"; return; }
     python3 -c "
-import csv, sys
-from statistics import mean
+import csv
+from statistics import mean, quantiles
 rows = [r for r in csv.DictReader(open('\$CSV')) if r.get('status') == '200']
 scored  = [r for r in rows if r.get('gt_scored') == 'true']
 correct = [r for r in scored if r.get('gt_correct') == 'true']
 costs   = [float(r['charged_usd']) for r in rows if r.get('charged_usd')]
-n    = len(rows)
-acc  = len(correct)/len(scored)*100 if scored else 0
-cost = mean(costs) if costs else 0
-retries = [int(r.get('retries', 0)) for r in rows if r.get('retries', '') not in ('', '0', None)]
-avg_att = 1 + (sum(retries)/len(rows) if retries else 0)
-print(f'  Quick stats [\$LABEL]:  n={n}  acc={acc:.1f}%  cost/req=\${cost:.6f}  avg_att={avg_att:.2f}')
+ttca_lats = [float(r.get('actual_latency_ms') or r.get('wall_ms') or 0)
+             for r in correct if r.get('actual_latency_ms') or r.get('wall_ms')]
+n         = len(rows)
+acc       = len(correct)/len(scored)*100 if scored else 0
+cost      = mean(costs) if costs else 0
+ttca_mean = mean(ttca_lats)/1000 if ttca_lats else 0
+ttca_p95  = quantiles(ttca_lats, n=20)[18]/1000 if len(ttca_lats) >= 20 else (max(ttca_lats)/1000 if ttca_lats else 0)
+print(f'  Quick stats for \$LABEL:  n={n}  acc={acc:.1f}%  ttca_mean={ttca_mean:.2f}s  ttca_p95={ttca_p95:.2f}s  cost/req=\${cost:.6f}')
 " 2>/dev/null || echo "  (stats unavailable)"
 }
 
@@ -324,7 +326,8 @@ for BETA in \$BETAS; do
     echo "  Beta run \$BETA_NUM: TTCA_COST_BETA = \$BETA"
     echo "══════════════════════════════════════════════════════════════════"
 
-    echo "  Patching semantic_router/config.py → TTCA_COST_BETA = \$BETA..."
+    # Patch config.py with the new beta value
+    echo "  Patching semantic_router/config.py..."
     sed -i "s/^TTCA_COST_BETA: float = .*/TTCA_COST_BETA: float = \${BETA}/" \
         semantic_router/config.py
     grep "TTCA_COST_BETA" semantic_router/config.py | head -1 | sed 's/^/    /'
@@ -358,7 +361,7 @@ for BETA in \$BETAS; do
     sleep 30
 done
 
-# Restore config.py to repo version
+# Restore config.py
 git checkout semantic_router/config.py
 echo "  config.py restored to repo version."
 
@@ -404,12 +407,11 @@ python "\${COMPARE_ARGS[@]}" 2>&1 | tee "\$RESULTS_DIR/compare_beta_sweep.txt"
 # Quick Pareto summary
 echo ""
 echo "=================================================================="
-echo "  Pareto summary: accuracy vs cost/req"
+echo "  Pareto summary: accuracy vs TTCA latency vs cost/req"
 echo "=================================================================="
-python3 << PYEOF
+python3 -c "
 import csv, os
-from statistics import mean
-
+from statistics import mean, quantiles
 rd = '\$RESULTS_DIR'
 betas = '\$BETAS'.split()
 rows_data = []
@@ -422,35 +424,42 @@ for beta in betas:
     scored  = [r for r in rows if r.get('gt_scored') == 'true']
     correct = [r for r in scored if r.get('gt_correct') == 'true']
     costs   = [float(r['charged_usd']) for r in rows if r.get('charged_usd')]
-    acc  = len(correct)/len(scored)*100 if scored else 0
-    cost = mean(costs) if costs else 0
-    rows_data.append((beta, len(rows), acc, cost))
+    ttca_lats = [float(r.get('actual_latency_ms') or r.get('wall_ms') or 0)
+                 for r in correct if r.get('actual_latency_ms') or r.get('wall_ms')]
+    acc       = len(correct)/len(scored)*100 if scored else 0
+    cost      = mean(costs) if costs else 0
+    ttca_mean = mean(ttca_lats)/1000 if ttca_lats else 0
+    ttca_p95  = quantiles(ttca_lats, n=20)[18]/1000 if len(ttca_lats) >= 20 else (max(ttca_lats)/1000 if ttca_lats else 0)
+    rows_data.append((beta, len(rows), acc, ttca_mean, ttca_p95, cost))
 
-print(f"  {'Beta':>6}  {'N':>5}  {'Accuracy':>9}  {'Cost/req':>12}")
-print(f"  {'-'*42}")
-for beta, n, acc, cost in rows_data:
-    print(f"  {beta:>6}  {n:>5}  {acc:>8.1f}%  \${cost:.8f}")
-
+print(f\"  {'Beta':>6}  {'N':>5}  {'Accuracy':>9}  {'TTCA Mean':>10}  {'TTCA P95':>9}  {'Cost/req':>12}\")
+print(f\"  {'-'*66}\")
+for beta, n, acc, ttca_mean, ttca_p95, cost in rows_data:
+    print(f\"  {beta:>6}  {n:>5}  {acc:>8.1f}%  {ttca_mean:>9.2f}s  {ttca_p95:>8.2f}s  \${cost:.8f}\")
 if len(rows_data) >= 2:
     beta0 = rows_data[0]
     print()
-    print(f"  vs β={beta0[0]} (current default):  acc delta   cost delta")
-    for beta, n, acc, cost in rows_data[1:]:
-        da = acc - beta0[2]
-        dc = cost - beta0[3]
-        sign_a = '+' if da >= 0 else ''
-        sign_c = '+' if dc >= 0 else ''
-        print(f"  β={beta:>5}                    {sign_a}{da:.1f}pp       {sign_c}\${dc:.8f}")
-PYEOF
+    print(f\"  vs β={beta0[0]} (baseline):  acc delta   ttca_mean delta   ttca_p95 delta   cost delta\")
+    for beta, n, acc, ttca_mean, ttca_p95, cost in rows_data[1:]:
+        da  = acc      - beta0[2]
+        dtm = ttca_mean - beta0[3]
+        dtp = ttca_p95  - beta0[4]
+        dc  = cost      - beta0[5]
+        sign_a  = '+' if da  >= 0 else ''
+        sign_tm = '+' if dtm >= 0 else ''
+        sign_tp = '+' if dtp >= 0 else ''
+        sign_c  = '+' if dc  >= 0 else ''
+        print(f\"  β={beta:>5}          {sign_a}{da:.1f}pp        {sign_tm}{dtm:.2f}s           {sign_tp}{dtp:.2f}s         {sign_c}\${dc:.8f}\")
+" 2>/dev/null || echo "  (Pareto summary unavailable)"
 
 echo ""
 echo "=================================================================="
 echo "  Beta sweep complete!  \$(date)"
 echo "  Results: \$RESULTS_DIR/"
 echo ""
-echo "  To re-run compare_all.py after pulling updated code:"
+echo "  To re-run compare_all.py (e.g. after pulling updated code):"
 echo "    RDIR=\$RESULTS_DIR"
-RERUN_ARGS=""
+echo "    python tests/compare_all.py \\"
 for BETA in \$BETAS; do
     BETA_LABEL=\$(echo "\$BETA" | tr '.' '_')
     echo "      --system \"TTCA b=\${BETA}:\\\$RDIR/beta_\${BETA_LABEL}_results.csv\" \\"
@@ -467,7 +476,7 @@ echo "  N_REQUESTS  : $N_REQUESTS  (per beta run)"
 echo "  CONCURRENCY : $CONCURRENCY"
 echo "  RATE        : ${RATE:-closed-loop} req/s"
 echo "  Dataset     : $DATASET  (seed=$SEED)"
-echo "  Walltime    : 12:00:00  (baselines ~2h + $N_BETAS betas × ~45min each)"
+echo "  Walltime    : 12:00:00  (baselines ~2h + ${N_BETAS} betas × ~45min each)"
 echo "  Log dir     : $LOG_DIR/"
 echo ""
 
