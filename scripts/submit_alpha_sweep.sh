@@ -204,7 +204,9 @@ cost      = mean(costs) if costs else 0
 lat       = mean(lats)/1000 if lats else 0
 ttca_mean = mean(ttca_lats)/1000 if ttca_lats else 0
 ttca_p95  = quantiles(ttca_lats, n=20)[18]/1000 if len(ttca_lats) >= 20 else (max(ttca_lats)/1000 if ttca_lats else 0)
-print(f'  Quick stats for \$LABEL:  n={n}  acc={acc:.1f}%  lat={lat:.2f}s  ttca_mean={ttca_mean:.2f}s  ttca_p95={ttca_p95:.2f}s  cost/req=\${cost:.6f}')
+ctca_costs = [float(r['charged_usd']) for r in correct if r.get('charged_usd')]
+ctca = mean(ctca_costs) if ctca_costs else 0
+print(f'  Quick stats for \$LABEL:  n={n}  acc={acc:.1f}%  lat={lat:.2f}s  ttca_mean={ttca_mean:.2f}s  ttca_p95={ttca_p95:.2f}s  cost/req=\${cost:.6f}  ctca=\${ctca:.6f}')
 " 2>/dev/null || echo "  (stats unavailable)"
 }
 
@@ -417,7 +419,7 @@ python "\${COMPARE_ARGS[@]}" 2>&1 | tee "\$RESULTS_DIR/compare_alpha_sweep.txt"
 # ── [4] Summary table ─────────────────────────────────────────────────────────
 echo ""
 echo "=================================================================="
-echo "  Alpha sweep summary: accuracy vs TTCA latency"
+echo "  Alpha sweep summary: accuracy vs TTCA latency vs CTCA"
 echo "=================================================================="
 python3 -c "
 import csv, os
@@ -444,25 +446,29 @@ for alpha in alphas:
     ttca_mean = mean(ttca_lats)/1000 if ttca_lats else 0
     ttca_p95  = quantiles(ttca_lats, n=20)[18]/1000 if len(ttca_lats) >= 20 else (max(ttca_lats)/1000 if ttca_lats else 0)
     cost      = mean(costs) if costs else 0
-    rows_data.append((alpha, len(rows), acc, lat_mean, lat_p95, ttca_mean, ttca_p95, cost))
+    ctca_costs = [float(r['charged_usd']) for r in correct if r.get('charged_usd')]
+    ctca      = mean(ctca_costs) if ctca_costs else 0
+    rows_data.append((alpha, len(rows), acc, lat_mean, lat_p95, ttca_mean, ttca_p95, cost, ctca))
 
-print(f\"  {'Alpha':>6}  {'N':>5}  {'Accuracy':>9}  {'Lat Mean':>9}  {'Lat P95':>8}  {'TTCA Mean':>10}  {'TTCA P95':>9}  {'Cost/req':>12}\")
-print(f\"  {'-'*84}\")
-for alpha, n, acc, lat_mean, lat_p95, ttca_mean, ttca_p95, cost in rows_data:
-    print(f\"  {alpha:>6}  {n:>5}  {acc:>8.1f}%  {lat_mean:>8.2f}s  {lat_p95:>7.2f}s  {ttca_mean:>9.2f}s  {ttca_p95:>8.2f}s  \${cost:.8f}\")
+print(f\"  {'Alpha':>6}  {'N':>5}  {'Accuracy':>9}  {'Lat Mean':>9}  {'Lat P95':>8}  {'TTCA Mean':>10}  {'TTCA P95':>9}  {'Cost/req':>12}  {'CTCA':>12}\")
+print(f\"  {'-'*98}\")
+for alpha, n, acc, lat_mean, lat_p95, ttca_mean, ttca_p95, cost, ctca in rows_data:
+    print(f\"  {alpha:>6}  {n:>5}  {acc:>8.1f}%  {lat_mean:>8.2f}s  {lat_p95:>7.2f}s  {ttca_mean:>9.2f}s  {ttca_p95:>8.2f}s  \${cost:.8f}  \${ctca:.8f}\")
 if len(rows_data) >= 2:
     ref = next((r for r in rows_data if r[0] == '1.0'), rows_data[0])
     print()
-    print(f\"  vs α={ref[0]} (paper default):  acc delta   ttca_mean delta   ttca_p95 delta\")
-    for alpha, n, acc, lat_mean, lat_p95, ttca_mean, ttca_p95, cost in rows_data:
+    print(f\"  vs α={ref[0]} (paper default):  acc delta   ttca_mean delta   ttca_p95 delta   ctca delta\")
+    for alpha, n, acc, lat_mean, lat_p95, ttca_mean, ttca_p95, cost, ctca in rows_data:
         if alpha == ref[0]: continue
-        da  = acc - ref[2]
-        dtm = ttca_mean - ref[5]
-        dtp = ttca_p95  - ref[6]
-        sign_a  = '+' if da  >= 0 else ''
-        sign_tm = '+' if dtm >= 0 else ''
-        sign_tp = '+' if dtp >= 0 else ''
-        print(f\"  α={alpha:>5}          {sign_a}{da:.1f}pp        {sign_tm}{dtm:.2f}s           {sign_tp}{dtp:.2f}s\")
+        da   = acc - ref[2]
+        dtm  = ttca_mean - ref[5]
+        dtp  = ttca_p95  - ref[6]
+        dctca = ctca - ref[8]
+        sign_a  = '+' if da   >= 0 else ''
+        sign_tm = '+' if dtm  >= 0 else ''
+        sign_tp = '+' if dtp  >= 0 else ''
+        sign_c  = '+' if dctca >= 0 else ''
+        print(f\"  α={alpha:>5}          {sign_a}{da:.1f}pp        {sign_tm}{dtm:.2f}s           {sign_tp}{dtp:.2f}s         {sign_c}\${dctca:.8f}\")
 " 2>/dev/null || echo "  (summary unavailable)"
 
 echo ""
