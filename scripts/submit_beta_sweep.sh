@@ -200,7 +200,9 @@ acc       = len(correct)/len(scored)*100 if scored else 0
 cost      = mean(costs) if costs else 0
 ttca_mean = mean(ttca_lats)/1000 if ttca_lats else 0
 ttca_p95  = quantiles(ttca_lats, n=20)[18]/1000 if len(ttca_lats) >= 20 else (max(ttca_lats)/1000 if ttca_lats else 0)
-print(f'  Quick stats for \$LABEL:  n={n}  acc={acc:.1f}%  ttca_mean={ttca_mean:.2f}s  ttca_p95={ttca_p95:.2f}s  cost/req=\${cost:.6f}')
+ctca_costs = [float(r['charged_usd']) for r in correct if r.get('charged_usd')]
+ctca = mean(ctca_costs) if ctca_costs else 0
+print(f'  Quick stats for \$LABEL:  n={n}  acc={acc:.1f}%  ttca_mean={ttca_mean:.2f}s  ttca_p95={ttca_p95:.2f}s  cost/req=\${cost:.6f}  ctca=\${ctca:.6f}')
 " 2>/dev/null || echo "  (stats unavailable)"
 }
 
@@ -381,6 +383,7 @@ COMPARE_ARGS=(tests/compare_all.py)
 [ -f "\$RESULTS_DIR/baseline_omni_router.csv" ] && \
     COMPARE_ARGS+=(--system "OmniRouter:\$RESULTS_DIR/baseline_omni_router.csv")
 
+# Insert beta runs in order
 for BETA in \$BETAS; do
     BETA_LABEL=\$(echo "\$BETA" | tr '.' '_')
     [ -f "\$RESULTS_DIR/beta_\${BETA_LABEL}_results.csv" ] && \
@@ -392,6 +395,7 @@ done
 [ -f "\$RESULTS_DIR/baseline_cost_optimal.csv" ] && \
     COMPARE_ARGS+=(--system "Tier-Opt-Cost:\$RESULTS_DIR/baseline_cost_optimal.csv")
 
+# Reference = beta=0 (current default TTCA behavior)
 FIRST_BETA=\$(echo "\$BETAS" | awk '{print \$1}')
 FIRST_LABEL=\$(echo "\$FIRST_BETA" | tr '.' '_')
 if [ -f "\$RESULTS_DIR/beta_\${FIRST_LABEL}_results.csv" ]; then
@@ -407,11 +411,10 @@ python "\${COMPARE_ARGS[@]}" 2>&1 | tee "\$RESULTS_DIR/compare_beta_sweep.txt"
 # Quick Pareto summary
 echo ""
 echo "=================================================================="
-echo "  Pareto summary: accuracy vs TTCA latency vs cost/req"
+echo "  Pareto summary: accuracy vs TTCA latency vs CTCA"
 echo "=================================================================="
 python3 -c "
-import csv, os
-from statistics import mean, quantiles
+import csv, os, sys
 rd = '\$RESULTS_DIR'
 betas = '\$BETAS'.split()
 rows_data = []
@@ -426,30 +429,35 @@ for beta in betas:
     costs   = [float(r['charged_usd']) for r in rows if r.get('charged_usd')]
     ttca_lats = [float(r.get('actual_latency_ms') or r.get('wall_ms') or 0)
                  for r in correct if r.get('actual_latency_ms') or r.get('wall_ms')]
+    from statistics import mean, quantiles
     acc       = len(correct)/len(scored)*100 if scored else 0
     cost      = mean(costs) if costs else 0
     ttca_mean = mean(ttca_lats)/1000 if ttca_lats else 0
     ttca_p95  = quantiles(ttca_lats, n=20)[18]/1000 if len(ttca_lats) >= 20 else (max(ttca_lats)/1000 if ttca_lats else 0)
-    rows_data.append((beta, len(rows), acc, ttca_mean, ttca_p95, cost))
+    ctca_costs = [float(r['charged_usd']) for r in correct if r.get('charged_usd')]
+    ctca      = mean(ctca_costs) if ctca_costs else 0
+    rows_data.append((beta, len(rows), acc, ttca_mean, ttca_p95, cost, ctca))
 
-print(f\"  {'Beta':>6}  {'N':>5}  {'Accuracy':>9}  {'TTCA Mean':>10}  {'TTCA P95':>9}  {'Cost/req':>12}\")
-print(f\"  {'-'*66}\")
-for beta, n, acc, ttca_mean, ttca_p95, cost in rows_data:
-    print(f\"  {beta:>6}  {n:>5}  {acc:>8.1f}%  {ttca_mean:>9.2f}s  {ttca_p95:>8.2f}s  \${cost:.8f}\")
+print(f\"  {'Beta':>6}  {'N':>5}  {'Accuracy':>9}  {'TTCA Mean':>10}  {'TTCA P95':>9}  {'Cost/req':>12}  {'CTCA':>12}\")
+print(f\"  {'-'*80}\")
+for beta, n, acc, ttca_mean, ttca_p95, cost, ctca in rows_data:
+    print(f\"  {beta:>6}  {n:>5}  {acc:>8.1f}%  {ttca_mean:>9.2f}s  {ttca_p95:>8.2f}s  \${cost:.8f}  \${ctca:.8f}\")
 if len(rows_data) >= 2:
     beta0 = rows_data[0]
     print()
-    print(f\"  vs β={beta0[0]} (baseline):  acc delta   ttca_mean delta   ttca_p95 delta   cost delta\")
-    for beta, n, acc, ttca_mean, ttca_p95, cost in rows_data[1:]:
-        da  = acc      - beta0[2]
-        dtm = ttca_mean - beta0[3]
-        dtp = ttca_p95  - beta0[4]
-        dc  = cost      - beta0[5]
-        sign_a  = '+' if da  >= 0 else ''
-        sign_tm = '+' if dtm >= 0 else ''
-        sign_tp = '+' if dtp >= 0 else ''
-        sign_c  = '+' if dc  >= 0 else ''
-        print(f\"  β={beta:>5}          {sign_a}{da:.1f}pp        {sign_tm}{dtm:.2f}s           {sign_tp}{dtp:.2f}s         {sign_c}\${dc:.8f}\")
+    print(f\"  vs β={beta0[0]} (baseline):  acc delta   ttca_mean delta   ttca_p95 delta   cost delta   ctca delta\")
+    for beta, n, acc, ttca_mean, ttca_p95, cost, ctca in rows_data[1:]:
+        da   = acc       - beta0[2]
+        dtm  = ttca_mean - beta0[3]
+        dtp  = ttca_p95  - beta0[4]
+        dc   = cost      - beta0[5]
+        dctca = ctca     - beta0[6]
+        sign_a  = '+' if da   >= 0 else ''
+        sign_tm = '+' if dtm  >= 0 else ''
+        sign_tp = '+' if dtp  >= 0 else ''
+        sign_c  = '+' if dc   >= 0 else ''
+        sign_ct = '+' if dctca >= 0 else ''
+        print(f\"  β={beta:>5}          {sign_a}{da:.1f}pp        {sign_tm}{dtm:.2f}s           {sign_tp}{dtp:.2f}s         {sign_c}\${dc:.8f}   {sign_ct}\${dctca:.8f}\")
 " 2>/dev/null || echo "  (Pareto summary unavailable)"
 
 echo ""
