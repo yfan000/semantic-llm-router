@@ -2,12 +2,13 @@
 build_optimal_tier.py — Build data-driven optimal tier maps from eval matrix.
 
 After running eval_all_models.py you have accuracy and latency for every
-(model × domain × complexity) cell.  This script finds the best model per
+(model x domain x complexity) cell.  This script finds the best model per
 cell under two objectives:
 
   accuracy_optimal  — highest mean accuracy per cell (ignores cost/latency)
   ttca_optimal      — highest mean TTCA score per cell:
-                        score = accuracy / (latency^alpha × cost^beta)
+                        score = accuracy / (latency^alpha x cost_norm^beta)
+                        where cost_norm = cost / min_cost_in_cell  (>= 1.0)
 
 The output JSON is consumed by baseline_complexity_tier.py via --tier-map.
 
@@ -44,11 +45,13 @@ def _estimate_cost(model_id: str, query: str, response_text: str) -> float:
 
 
 def build_maps(eval_matrix: str, alpha: float, beta: float) -> dict:
-    # Accumulators: key=(domain, complexity, model_id)
-    acc_sum:   dict[tuple, float] = defaultdict(float)
-    ttca_sum:  dict[tuple, float] = defaultdict(float)
-    cost_sum:  dict[tuple, float] = defaultdict(float)
-    counts:    dict[tuple, int]   = defaultdict(int)
+    # Pass 1 — accumulate raw sums; TTCA score is computed in pass 2 after
+    # per-cell cost normalisation so that cost^beta is never applied to sub-1
+    # USD values (which would invert the penalty).
+    acc_sum:  dict[tuple, float] = defaultdict(float)
+    lat_sum:  dict[tuple, float] = defaultdict(float)
+    cost_sum: dict[tuple, float] = defaultdict(float)
+    counts:   dict[tuple, int]   = defaultdict(int)
 
     with open(eval_matrix, newline="", encoding="utf-8") as f:
         for row in csv.DictReader(f):
@@ -62,31 +65,35 @@ def build_maps(eval_matrix: str, alpha: float, beta: float) -> dict:
             model_id   = row["model_id"]
             key        = (domain, complexity, model_id)
 
-            correct  = 1.0 if row["is_correct"] == "true" else 0.0
-            wall_ms  = float(row["wall_ms"]) if row["wall_ms"] else 1000.0
-            cost     = _estimate_cost(model_id, row.get("query", ""), row.get("response_text", ""))
-
-            acc  = max(correct, 0.01)
-            lat  = max(wall_ms, 1.0)
-            cost = max(cost, 1e-9)
-
-            ttca_score = acc / ((lat ** alpha) * (cost ** beta))
+            correct = 1.0 if row["is_correct"] == "true" else 0.0
+            wall_ms = float(row["wall_ms"]) if row["wall_ms"] else 1000.0
+            cost    = _estimate_cost(model_id, row.get("query", ""), row.get("response_text", ""))
 
             acc_sum[key]  += correct
-            ttca_sum[key] += ttca_score
-            cost_sum[key] += cost
+            lat_sum[key]  += max(wall_ms, 1.0)
+            cost_sum[key] += max(cost, 1e-9)
             counts[key]   += 1
 
-    # Compute per-cell means
+    # Pass 2 — compute per-cell means, then normalise cost within each cell
+    # so the cheapest model gets cost_norm=1.0 and all others > 1.0.
+    # This matches the live router's normalisation in selector.py.
     cells: dict[tuple[str, str], dict[str, dict]] = defaultdict(dict)
     for (domain, complexity, model_id), n in counts.items():
-        cell_key = (domain, complexity)
-        cells[cell_key][model_id] = {
-            "accuracy":   acc_sum[(domain, complexity, model_id)] / n,
-            "ttca_score": ttca_sum[(domain, complexity, model_id)] / n,
-            "cost_mean":  cost_sum[(domain, complexity, model_id)] / n,
-            "n":          n,
+        cells[(domain, complexity)][model_id] = {
+            "accuracy":  acc_sum[(domain, complexity, model_id)] / n,
+            "lat_mean":  lat_sum[(domain, complexity, model_id)] / n,
+            "cost_mean": cost_sum[(domain, complexity, model_id)] / n,
+            "n":         n,
         }
+
+    for (domain, complexity), models in cells.items():
+        min_cost = min(v["cost_mean"] for v in models.values())
+        for model_id, stats in models.items():
+            cost_norm = stats["cost_mean"] / min_cost        # >= 1.0 always
+            acc = max(stats["accuracy"], 0.01)
+            lat = max(stats["lat_mean"], 1.0)
+            stats["cost_norm"]  = cost_norm
+            stats["ttca_score"] = acc / ((lat ** alpha) * (cost_norm ** beta))
 
     # Pick best model per cell for each objective
     accuracy_optimal: dict[str, str] = {}
@@ -119,6 +126,7 @@ def build_maps(eval_matrix: str, alpha: float, beta: float) -> dict:
                 "accuracy":    round(stats["accuracy"], 4),
                 "ttca_score":  round(stats["ttca_score"], 6),
                 "cost_mean":   round(stats["cost_mean"], 8),
+                "cost_norm":   round(stats["cost_norm"], 4),
                 "n":           stats["n"],
                 "best_acc":    model_id == best_acc,
                 "best_ttca":   model_id == best_ttca,
