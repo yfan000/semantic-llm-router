@@ -32,6 +32,8 @@ CATEGORIES = [
     ("reasoning", "easy"),   ("reasoning", "medium"),   ("reasoning", "hard"),
 ]
 
+DOMAINS = ["factual", "math", "code", "reasoning"]
+
 
 def _safe_float(v) -> float | None:
     try:
@@ -377,6 +379,73 @@ def print_ttca_breakdown(systems: list[tuple[str, dict]], max_global_lat: float 
     print()
 
 
+def _domain_agg(stats: dict, domain: str) -> dict:
+    """Aggregate by_cat entries for all complexities within a domain."""
+    cats = [cat for cat in CATEGORIES if cat[0] == domain]
+    n       = sum(stats["by_cat"][cat]["n"]       for cat in cats)
+    correct = sum(stats["by_cat"][cat]["correct"] for cat in cats)
+    scored  = sum(stats["by_cat"][cat]["scored"]  for cat in cats)
+    lat_ct  = sum(stats["by_cat"][cat].get("lat_correct_total", 0) for cat in cats)
+    cost_ct = sum(stats["by_cat"][cat].get("cost_correct_total", 0) for cat in cats)
+    return {
+        "n":                  n,
+        "correct":            correct,
+        "scored":             scored,
+        "accuracy":           correct / scored if scored else None,
+        "lat_correct_total":  lat_ct,
+        "cost_correct_total": cost_ct,
+    }
+
+
+def print_grouped_breakdown(
+    systems: list[tuple[str, dict]],
+    max_global_charge: float = 0.0,
+    max_global_lat: float = 0.0,
+) -> None:
+    """Print accuracy, pen.lat/ans and pen.$/ans grouped by domain (easy+medium+hard combined)."""
+    names = [n for n, _ in systems]
+    col_w = max(13, max(len(n) for n in names) + 2)
+    METRIC_W = 11
+    W = 18 + METRIC_W + 2 + col_w * len(names) + 4
+
+    print(f"\n{'='*W}")
+    print(f"  GROUPED BY DOMAIN  (easy+medium+hard combined)")
+    print(f"{'='*W}")
+    print(f"  {'Domain':<18}  {'Metric':>{METRIC_W}}", end="")
+    for name in names:
+        print(f"  {name[:col_w-2]:>{col_w-2}}", end="")
+    print()
+    print(f"  {'-'*(W-2)}")
+
+    def _pen_lat(agg):
+        return (agg["lat_correct_total"] + max_global_lat * (agg["n"] - agg["correct"])) / agg["n"] if agg["n"] else None
+
+    def _pen_cost(agg):
+        return (agg["cost_correct_total"] + max_global_charge * (agg["n"] - agg["correct"])) / agg["n"] if agg["n"] else None
+
+    # (label, get_raw_fn, format_fn, higher_is_better, tolerance_for_best_marker)
+    METRICS = [
+        ("accuracy",    lambda agg: agg["accuracy"], _pct,  True,  0.001),
+        ("pen.lat/ans", _pen_lat,                    _ms,   False, 1.0),
+        ("pen.$/ans",   _pen_cost,                   _usd,  False, 1e-8),
+    ]
+
+    for domain in DOMAINS:
+        aggs = [(name, _domain_agg(stats, domain)) for name, stats in systems]
+        for i, (metric_label, get_raw, fmt_fn, higher_better, tol) in enumerate(METRICS):
+            dom_label = f"{domain:<18}" if i == 0 else f"{'':18}"
+            raw_vals = [get_raw(agg) for _, agg in aggs]
+            best = (max if higher_better else min)((v for v in raw_vals if v is not None), default=None)
+            print(f"  {dom_label}  {metric_label:>{METRIC_W}}", end="")
+            for j, (name, agg) in enumerate(aggs):
+                raw = raw_vals[j]
+                cell = fmt_fn(raw)
+                marker = "*" if (raw is not None and best is not None and abs(raw - best) < tol) else " "
+                print(f"  {marker}{cell:>{col_w-2}}", end="")
+            print()
+        print()
+
+
 def print_cost_breakdown(systems: list[tuple[str, dict]], max_global_charge: float = 0.0) -> None:
     """Print combined cost metrics per (domain,complexity): cost/req, P95, $/correct, pen.$/ans."""
     names = [n for n, _ in systems]
@@ -553,6 +622,7 @@ def main() -> None:
     )
 
     print_summary(systems, ref_name=ref_name, max_global_charge=max_global_charge, max_global_lat=max_global_lat)
+    print_grouped_breakdown(systems, max_global_charge=max_global_charge, max_global_lat=max_global_lat)
     print_domain_breakdown(systems)
     print_ttca_breakdown(systems, max_global_lat=max_global_lat)
     print_cost_breakdown(systems, max_global_charge=max_global_charge)
