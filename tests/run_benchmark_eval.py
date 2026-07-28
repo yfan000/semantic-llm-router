@@ -346,7 +346,7 @@ async def _send_one(
                 sc = score_item(text, item)
                 if sc is not None:
                     row["score"]      = f"{sc:.4f}"
-                    row["is_correct"] = "true" if sc >= 0.5 else "false"
+                    row["is_correct"] = "true" if sc >= 0.9 else "false"
         except Exception as exc:
             row["status"] = "error"
             row["error"]  = str(exc)[:300]
