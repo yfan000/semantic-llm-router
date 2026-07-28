@@ -84,6 +84,7 @@ def load_system(path: str, eval_index: dict) -> dict:
 
         correct = scored = 0
         ttca_lats_cat: list[float] = []
+        lat_correct_total_cat: float = 0.0
         costs_correct: list[float] = []
         effective_costs_cat: list[float] = []
         for r in g:
@@ -109,6 +110,7 @@ def load_system(path: str, eval_index: dict) -> dict:
                         is_correct = True
             if is_correct and lat is not None:
                 ttca_lats_cat.append(lat)
+                lat_correct_total_cat += lat
             if is_correct and eff_cost_r is not None:
                 costs_correct.append(eff_cost_r)
 
@@ -133,6 +135,8 @@ def load_system(path: str, eval_index: dict) -> dict:
             "cost_mean":          mean(costs)                            if costs else None,
             "cost_p95":           _percentile(costs, 95)                 if costs else None,
             "cost_total":         sum(costs)                             if costs else None,
+            "lat_correct_total": lat_correct_total_cat,
+            "lat_max":           max(lats) if lats else None,
             "cost_correct_total": sum(costs_correct),
             "cost_max":           max(effective_costs_cat)               if effective_costs_cat else None,
             "energy_mean":        mean(energy)                           if energy else None,
@@ -187,6 +191,8 @@ def load_system(path: str, eval_index: dict) -> dict:
         "cost_mean":          mean(all_costs)                                                                         if all_costs else None,
         "cost_p95":           _percentile(all_costs, 95)                                                              if all_costs else None,
         "cost_total":         sum(all_costs)                                                                          if all_costs else None,
+        "lat_correct_total": sum(s.get("lat_correct_total", 0) for s in by_cat.values()),
+        "lat_max":           max((s["lat_max"] for s in by_cat.values() if s.get("lat_max") is not None), default=None),
         "cost_correct_total": sum(s.get("cost_correct_total") or 0 for s in by_cat.values()),
         "cost_max":           max((s["cost_max"] for s in by_cat.values() if s.get("cost_max") is not None), default=None),
         "energy_mean":        mean(all_energy)                                                                        if all_energy else None,
@@ -222,7 +228,8 @@ def _pp(a, b) -> str:
     return f"{d:+.1f}pp"
 
 
-def print_summary(systems: list[tuple[str, dict]], ref_name: str | None = None, max_global_charge: float = 0.0) -> None:
+def print_summary(systems: list[tuple[str, dict]], ref_name: str | None = None,
+                  max_global_charge: float = 0.0, max_global_lat: float = 0.0) -> None:
     """Print ranked summary table including accuracy, latency, energy and cost."""
     ranked = sorted(systems, key=lambda x: x[1]["accuracy"] or 0, reverse=True)
     ref = next((s for n, s in systems if n == ref_name), None) if ref_name else None
@@ -231,7 +238,7 @@ def print_summary(systems: list[tuple[str, dict]], ref_name: str | None = None, 
     any_slo      = any(s.get("slo_total", 0) > 0 for _, s in systems)
     any_attempts = any(s.get("attempts_mean") is not None for _, s in systems)
 
-    W = 224 if any_slo else 212
+    W = 238 if any_slo else 226
     if any_attempts:
         W += 12
     print(f"\n{'='*W}")
@@ -242,7 +249,7 @@ def print_summary(systems: list[tuple[str, dict]], ref_name: str | None = None, 
     att_hdr  = f"  {'Avg Att.':>8}"   if any_attempts else ""
     print(f"\n  {'System':<22} {'Requests':>8} {'Accuracy':>9} {hdr_vs:>9}"
           f"  {'Lat Mean':>8}  {'Lat P50':>8}  {'Lat P95':>8}"
-          f"  {'TTCA Mean':>10}  {'TTCA P50':>9}  {'TTCA P90':>9}  {'TTCA P95':>9}"
+          f"  {'TTCA Mean':>10}  {'TTCA P50':>9}  {'TTCA P90':>9}  {'TTCA P95':>9}  {'Pen.lat/ans':>12}"
           f"  {'Energy/req':>11}  {'Cost/req':>11}  {'Cost P95':>11}  {'$/correct':>11}  {'Pen.$/ans':>11}"
           + slo_hdr + att_hdr)
     print(f"  {'-'*(W-2)}")
@@ -260,13 +267,15 @@ def print_summary(systems: list[tuple[str, dict]], ref_name: str | None = None, 
         att_mean = stats.get("attempts_mean")
         att_col  = (f"  {att_mean:>8.2f}" if att_mean is not None else f"  {'1.00':>8}") if any_attempts else ""
         n_correct_all = sum(s["correct"] for s in stats["by_cat"].values())
-        cost_correct_all = stats.get("cost_correct_total") or 0.0
         n_wrong = stats["n"] - n_correct_all
+        lat_correct_all = stats.get("lat_correct_total") or 0.0
+        pen_lat = (lat_correct_all + max_global_lat * n_wrong) / stats["n"] if stats["n"] else None
+        cost_correct_all = stats.get("cost_correct_total") or 0.0
         old_cost_per_correct = stats.get("cost_total") / n_correct_all if n_correct_all and stats.get("cost_total") else None
         pen_cost = (cost_correct_all + max_global_charge * n_wrong) / stats["n"] if stats["n"] else None
         print(f"  {name:<22} {stats['n']:>8} {_pct(stats['accuracy']):>9} {vs:>9}"
               f"  {_ms(stats['lat_mean']):>8}  {_ms(stats['lat_p50']):>8}  {_ms(stats['lat_p95']):>8}"
-              f"  {_ms(stats['ttca_mean']):>10}  {_ms(stats['ttca_p50']):>9}  {_ms(stats['ttca_p90']):>9}  {_ms(stats['ttca_p95']):>9}"
+              f"  {_ms(stats['ttca_mean']):>10}  {_ms(stats['ttca_p50']):>9}  {_ms(stats['ttca_p90']):>9}  {_ms(stats['ttca_p95']):>9}  {_ms(pen_lat):>12}"
               f"  {_j(energy_mean):>11}  {_usd(stats['cost_mean']):>11}  {_usd(stats.get('cost_p95')):>11}  {_usd(old_cost_per_correct):>11}  {_usd(pen_cost):>11}"
               + slo_col + att_col)
 
@@ -322,14 +331,15 @@ def print_domain_breakdown(systems: list[tuple[str, dict]]) -> None:
     print()
 
 
-def print_ttca_breakdown(systems: list[tuple[str, dict]]) -> None:
-    """Print per-(domain,complexity) TTCA Mean and P95 breakdown."""
+def print_ttca_breakdown(systems: list[tuple[str, dict]], max_global_lat: float = 0.0) -> None:
+    """Print per-(domain,complexity) TTCA Mean, P95 and pen.lat/ans breakdown."""
     names = [n for n, _ in systems]
     col_w = max(12, max(len(n) for n in names) + 2)
     METRIC_W = 11
     W = 18 + METRIC_W + 2 + col_w * len(names) + 4
     print(f"\n{'='*W}")
-    print(f"  TTCA METRICS BY DOMAIN x COMPLEXITY  (correct answers only, lower = better)")
+    print(f"  TTCA METRICS BY DOMAIN x COMPLEXITY  (correct answers only, lower = better)"
+          f"  [pen.lat/ans max_lat={_ms(max_global_lat)}]")
     print(f"{'='*W}")
     print(f"  {'Category':<18}  {'Metric':>{METRIC_W}}", end="")
     for name in names:
@@ -338,8 +348,13 @@ def print_ttca_breakdown(systems: list[tuple[str, dict]]) -> None:
     print(f"  {'-'*(W-2)}")
 
     METRICS = [
-        ("TTCA mean", lambda s, cat: s["by_cat"][cat]["ttca_mean"]),
-        ("TTCA P95",  lambda s, cat: s["by_cat"][cat].get("ttca_p95")),
+        ("TTCA mean",   lambda s, cat: s["by_cat"][cat]["ttca_mean"]),
+        ("TTCA P95",    lambda s, cat: s["by_cat"][cat].get("ttca_p95")),
+        ("pen.lat/ans", lambda s, cat: (
+            (s["by_cat"][cat].get("lat_correct_total", 0)
+             + max_global_lat * (s["by_cat"][cat]["n"] - s["by_cat"][cat]["correct"]))
+            / s["by_cat"][cat]["n"]
+        ) if s["by_cat"][cat]["n"] else None),
     ]
 
     prev_domain = None
@@ -532,10 +547,14 @@ def main() -> None:
         (s.get("cost_max") or 0.0 for _, s in systems),
         default=0.0,
     )
+    max_global_lat = max(
+        (s.get("lat_max") or 0.0 for _, s in systems),
+        default=0.0,
+    )
 
-    print_summary(systems, ref_name=ref_name, max_global_charge=max_global_charge)
+    print_summary(systems, ref_name=ref_name, max_global_charge=max_global_charge, max_global_lat=max_global_lat)
     print_domain_breakdown(systems)
-    print_ttca_breakdown(systems)
+    print_ttca_breakdown(systems, max_global_lat=max_global_lat)
     print_cost_breakdown(systems, max_global_charge=max_global_charge)
 
     if args.output:
