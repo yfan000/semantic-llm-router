@@ -297,13 +297,42 @@ def load_gsm1k(n: int) -> list[dict]:
 
 
 def load_olympiadbench(n: int) -> list[dict]:
-    """OlympiadBench: math and physics olympiad problems. math:hard.
+    """OlympiadBench (or NuminaMath fallback): hard math/physics competition problems.
 
-    Loads raw data files directly from HuggingFace Hub, bypassing the
-    deprecated loading script (trust_remote_code).
+    Tries OlympiadBench first via streaming Parquet (English-only files, capped).
+    Falls back to AI-MO/NuminaMath-CoT which is openly accessible and has AMC/AIME
+    competition problems of comparable difficulty.
     """
+    import itertools
     from datasets import load_dataset
 
+    def _parse_olympiad_row(row: dict) -> dict | None:
+        problem = str(
+            row.get("problem", row.get("Problem", row.get("question", "")))
+        ).strip()
+        answer = str(
+            row.get("answer", row.get("Answer", row.get("solution", "")))
+        ).strip()
+        subject = str(
+            row.get("subject", row.get("Subject", row.get("category", "math")))
+        ).lower()
+        if not problem or not answer:
+            return None
+        if "math" not in subject and "phys" not in subject and subject not in ("", "unknown"):
+            return None
+        m  = re.search(r"\\boxed\{([^}]+)\}", answer)
+        gt = m.group(1).strip() if m else answer.strip()[:120]
+        return {
+            "domain": "math", "complexity": "hard",
+            "query": (
+                "Solve the following olympiad problem. Show your reasoning step by step, "
+                f"then put your final answer in \\boxed{{}}:\n\n{problem}"
+            ),
+            "ground_truth": gt,
+            "source": "olympiadbench", "answer_type": "expression",
+        }
+
+    # ── Try OlympiadBench directly via streaming ────────────────────────────
     for repo_id in ["OpenBMB/OlympiadBench", "olympiadbench/OlympiadBench"]:
         try:
             all_files = _list_repo_data_files(repo_id)
@@ -311,51 +340,26 @@ def load_olympiadbench(n: int) -> list[dict]:
                 print(f"  [OlympiadBench/{repo_id}] no data files found")
                 continue
 
-            # Prefer English math/physics files if the repo has per-subject files
+            # Prefer English math/physics files; cap at 4 files to avoid huge downloads
             en_files = [
                 f for f in all_files
                 if any(x in f.lower() for x in ["_en", "english", "maths_en", "phys_en"])
             ]
-            use_files = en_files if en_files else all_files
-            print(f"  [OlympiadBench/{repo_id}] found {len(all_files)} files, "
-                  f"using {len(use_files)}")
+            use_files = (en_files if en_files else all_files)[:4]
+            fmt  = "parquet" if any(f.endswith(".parquet") for f in use_files) else "json"
+            urls = [f"hf://datasets/{repo_id}/{f}" for f in use_files]
+            print(f"  [OlympiadBench/{repo_id}] streaming {len(urls)} files ({fmt})")
 
-            ds = _load_raw(repo_id, use_files)
-            if ds is None:
-                continue
-            print(f"  [OlympiadBench] loaded {len(ds)} rows via direct file access")
+            raw    = load_dataset(fmt, data_files=urls, streaming=True)
+            split  = raw["train"] if "train" in raw else list(raw.values())[0]
+            sample = list(itertools.islice(split, n * 6))  # stream only what's needed
+            print(f"  [OlympiadBench/{repo_id}] streamed {len(sample)} candidate rows")
 
-            ds = ds.shuffle(seed=42).select(range(min(n * 4, len(ds))))
             results = []
-            for row in ds:
-                problem = str(
-                    row.get("problem", row.get("Problem", row.get("question", "")))
-                ).strip()
-                answer  = str(
-                    row.get("answer",  row.get("Answer",  row.get("solution",  "")))
-                ).strip()
-                subject = str(
-                    row.get("subject", row.get("Subject", row.get("category", "math")))
-                ).lower()
-
-                if not problem or not answer:
-                    continue
-                if "math" not in subject and "phys" not in subject:
-                    continue
-
-                m  = re.search(r"\\boxed\{([^}]+)\}", answer)
-                gt = m.group(1).strip() if m else answer.strip()[:120]
-
-                query = (
-                    "Solve the following olympiad problem. Show your reasoning step by step, "
-                    "then put your final answer in \\boxed{}:\n\n"
-                    f"{problem}"
-                )
-                results.append({
-                    "domain": "math", "complexity": "hard",
-                    "query": query, "ground_truth": gt,
-                    "source": "olympiadbench", "answer_type": "expression",
-                })
+            for row in sample:
+                parsed = _parse_olympiad_row(row)
+                if parsed:
+                    results.append(parsed)
                 if len(results) >= n:
                     break
 
@@ -365,6 +369,45 @@ def load_olympiadbench(n: int) -> list[dict]:
 
         except Exception as e:
             print(f"  [OlympiadBench/{repo_id}] skipped: {e}")
+
+    # ── Fallback: NuminaMath-CoT (AMC / AIME / competition math, open access) ──
+    print("  [OlympiadBench] falling back to AI-MO/NuminaMath-CoT")
+    try:
+        raw   = load_dataset("AI-MO/NuminaMath-CoT", streaming=True)
+        split = raw["train"] if "train" in raw else list(raw.values())[0]
+
+        # Only keep competition-level sources (AIME, AMC, Olympiad)
+        hard_sources = {"aime", "amc", "olympiad", "imo", "usamo", "putnam", "hmmt",
+                        "arml", "mathcounts"}
+        results = []
+        for row in split:
+            src = str(row.get("source", "")).lower()
+            if not any(h in src for h in hard_sources):
+                continue
+            problem  = str(row.get("problem", "")).strip()
+            solution = str(row.get("solution", "")).strip()
+            if not problem or not solution:
+                continue
+            m  = re.search(r"\\boxed\{([^}]+)\}", solution)
+            gt = m.group(1).strip() if m else solution.strip()[:120]
+            results.append({
+                "domain": "math", "complexity": "hard",
+                "query": (
+                    "Solve the following competition math problem. Show your reasoning "
+                    f"step by step, then put your final answer in \\boxed{{}}:\n\n{problem}"
+                ),
+                "ground_truth": gt,
+                "source": "numina_math", "answer_type": "expression",
+            })
+            if len(results) >= n:
+                break
+
+        if results:
+            print(f"  [NuminaMath-CoT] {len(results)} items selected")
+            return results[:n]
+
+    except Exception as e:
+        print(f"  [NuminaMath-CoT] skipped: {e}")
 
     print("  [OlympiadBench] could not load from any source")
     return []
