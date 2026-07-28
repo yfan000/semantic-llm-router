@@ -1,1 +1,631 @@
-"""\nrun_benchmark_eval.py — End-to-end benchmark evaluation for the semantic router.\n\nLoads a dataset built by build_benchmark_dataset.py, sends each query to the\nrouter asynchronously, scores responses using benchmark-appropriate methods,\nand reports accuracy by source, domain, complexity, and model.\n\nScoring by answer_type:\n  mcq        — extract letter (A-J) from response, exact match vs GT letter\n  numeric    — extract last number, compare ±1% tolerance (grade-school math)\n  expression — LaTeX/symbolic; numeric fallback then normalized string match\n  code       — stdin/stdout execution against LiveCodeBench test cases\n\nUsage:\n    # Build dataset then evaluate\n    python tests/run_benchmark_eval.py \\\n        --build --total 1000 \\\n        --router http://localhost:8080 \\\n        --mode ttca \\\n        --output results/benchmark_eval.csv\n\n    # Evaluate an existing dataset\n    python tests/run_benchmark_eval.py \\\n        --dataset datasets/benchmark_1000.json \\\n        --router  http://localhost:8080 \\\n        --mode    ttca \\\n        --output  results/benchmark_eval.csv\n\n    # Quick smoke test (first 50 items)\n    python tests/run_benchmark_eval.py \\\n        --dataset datasets/benchmark_1000.json \\\n        --router  http://localhost:8080 \\\n        --n 50\n\n    # Compare two router modes side-by-side (score existing CSVs)\n    python tests/run_benchmark_eval.py \\\n        --score-only results/ttca_eval.csv results/carrot_eval.csv\n\"\"\"\nfrom __future__ import annotations\n\nimport argparse\nimport ast\nimport asyncio\nimport csv\nimport json\nimport os\nimport re\nimport subprocess\nimport sys\nimport tempfile\nimport time\nfrom collections import defaultdict\nfrom pathlib import Path\nfrom typing import Optional\n\n\n# ---------------------------------------------------------------------------\n# Scorers\n# ---------------------------------------------------------------------------\n\ndef _extract_numbers(text: str) -> list[float]:\n    return [float(m) for m in re.findall(r\"-?\\d+(?:\\.\\d+)?\", text)]\n\n\ndef score_mcq(response: str, ground_truth: str) -> Optional[float]:\n    \"\"\"Extract the letter choice from response text, exact match vs GT letter.\n\n    Checks high-confidence patterns first (explicit \"answer is A\", bold **A**,\n    \"Answer: A\") and falls back to scanning the response tail for a bare letter\n    only when nothing explicit is found.\n    Returns None when no letter can be extracted (e.g. refusal or empty).\n    \"\"\"\n    gt = ground_truth.strip().upper()\n    if not gt or gt[0] not in \"ABCDEFGHIJ\":\n        return None\n    gt = gt[0]\n\n    resp_upper = response.upper()\n\n    # High-confidence patterns — explicit answer markers\n    hi_patterns = [\n        r\"(?:THE\\s+)?(?:CORRECT\\s+)?ANSWER\\s+IS\\s*[:(]?\\s*\\*?\\*?([A-J])\\*?\\*?\",\n        r\"ANSWER:\\s*\\*?\\*?([A-J])\\*?\\*?\",\n        r\"\\*\\*([A-J])\\*\\*\",\n        r\"^([A-J])[.):  \\s]\",\n        r\"OPTION\\s+([A-J])\\b\",\n        r\"CHOICE\\s+([A-J])\\b\",\n        r\"\\(([A-J])\\)\\s+IS\\s+CORRECT\",\n        r\"SELECT\\s+([A-J])\\b\",\n        r\"RESPONSE:\\s*([A-J])\\b\",\n        r\"MY\\s+ANSWER\\s+IS\\s+([A-J])\\b\",\n    ]\n\n    found = []\n    for pat in hi_patterns:\n        for m in re.finditer(pat, resp_upper, re.MULTILINE):\n            found.append(m.group(1))\n\n    if found:\n        from collections import Counter\n        winner = Counter(found).most_common(1)[0][0]\n        return 1.0 if winner == gt else 0.0\n\n    # Fallback: look for a lone letter in the last 300 chars\n    tail = resp_upper[-300:]\n    for m in re.finditer(r\"\\b([A-J])\\b\", tail):\n        return 1.0 if m.group(1) == gt else 0.0\n\n    return None  # could not extract a letter\n\n\ndef score_numeric(response: str, ground_truth: str) -> Optional[float]:\n    \"\"\"Extract the last number from response, compare ±1% or absolute ≤0.01.\n\n    Suitable for GSM1K and other grade-school numeric math benchmarks.\n    Returns None when no number is found in either response or ground truth.\n    \"\"\"\n    pred_nums = _extract_numbers(response)\n    true_nums = _extract_numbers(str(ground_truth))\n    if not pred_nums or not true_nums:\n        return None\n    pred = pred_nums[-1]\n    true = true_nums[-1]\n    if true == 0:\n        return 1.0 if abs(pred) < 0.01 else 0.0\n    return 1.0 if (abs(pred - true) / abs(true) < 0.01 or abs(pred - true) < 0.01) else 0.0\n\n\ndef score_expression(response: str, ground_truth: str) -> Optional[float]:\n    \"\"\"Score symbolic/LaTeX answers (OlympiadBench).\n\n    Strategy:\n    1. Extract \\\\boxed{} from the response (models are prompted to use it).\n    2. Try numeric comparison with 2% tolerance.\n    3. Normalize both sides (strip whitespace, LaTeX macros) and string-compare.\n    4. Return 0.0 on definitive mismatch, None if the response has no answer signal.\n    \"\"\"\n    # Extract \\boxed{...} — models are instructed to put answers there\n    boxed = re.search(r\"\\\\boxed\\{([^}]+)\\}\", response)\n    pred_str = boxed.group(1).strip() if boxed else \"\"\n\n    if not pred_str:\n        # Try last math environment or final number\n        last_env = re.search(r\"\\$([^$]+)\\$\", response)\n        pred_str = last_env.group(1).strip() if last_env else \"\"\n\n    if not pred_str:\n        # No clear answer marker — fall back to last number in response\n        nums = _extract_numbers(response)\n        if not nums:\n            return None\n        pred_str = str(nums[-1])\n\n    gt_str = str(ground_truth).strip()\n\n    # Numeric comparison (2% tolerance for Olympiad problems)\n    pred_nums = _extract_numbers(pred_str)\n    true_nums = _extract_numbers(gt_str)\n    if pred_nums and true_nums:\n        pred = pred_nums[-1]\n        true = true_nums[-1]\n        if true == 0:\n            return 1.0 if abs(pred) < 0.01 else 0.0\n        if abs(pred - true) / abs(true) < 0.02:\n            return 1.0\n\n    # Normalized string comparison\n    def _norm(s: str) -> str:\n        s = s.lower().strip()\n        s = re.sub(r\"\\s+\", \"\", s)\n        replacements = [\n            (\"\\\\cdot\",  \"*\"), (\"\\\\times\", \"*\"), (\"\\\\div\", \"/\"),\n            (\"\\\\frac\",  \"\"), (\"\\\\sqrt\",   \"sqrt\"),\n            (\"{\", \"\"),  (\"}\", \"\"),  (\"^\", \"**\"), (\"\\\\pm\", \"±\"),\n        ]\n        for old, new in replacements:\n            s = s.replace(old, new)\n        return s\n\n    if _norm(pred_str) and _norm(gt_str) and _norm(pred_str) == _norm(gt_str):\n        return 1.0\n\n    return 0.0\n\n\ndef score_code_exec(response: str, ground_truth: str) -> Optional[float]:\n    \"\"\"Score code via syntax check + stdin/stdout execution (LiveCodeBench).\n\n    Runs up to 5 public test cases from the JSON ground_truth.\n    Returns fraction of test cases passed (0.0-1.0).\n    Returns 0.5 for syntactically valid code with no executable tests.\n    \"\"\"\n    # Extract code from markdown fences\n    code_blocks = re.findall(r\"```(?:python)?\\s*(.*?)```\", response, re.DOTALL)\n    code = code_blocks[0].strip() if code_blocks else response.strip()\n\n    # Syntax check\n    try:\n        ast.parse(code)\n    except SyntaxError:\n        return 0.0\n\n    # Try to parse test cases as JSON [{input, output}, ...]\n    try:\n        test_cases = json.loads(ground_truth)\n    except Exception:\n        # Fallback: assert-style ground truth (HumanEval/MBPP)\n        gt = str(ground_truth)\n        if \"assert\" in gt:\n            test_src = code + \"\\n\" + gt\n            with tempfile.NamedTemporaryFile(suffix=\".py\", mode=\"w\", delete=False) as f:\n                f.write(test_src)\n                fname = f.name\n            try:\n                res = subprocess.run([sys.executable, fname],\n                                     timeout=5, capture_output=True)\n                return 1.0 if res.returncode == 0 else 0.0\n            except Exception:\n                return 0.0\n        return 0.5  # no tests — syntax valid, partial credit\n\n    if not test_cases:\n        return 0.5\n\n    # Stdin/stdout execution against each test case (cap at 5)\n    passed = 0\n    total  = min(len(test_cases), 5)\n    for tc in test_cases[:total]:\n        stdin_data = str(tc.get(\"input\",  \"\")).strip()\n        expected   = str(tc.get(\"output\", \"\")).strip()\n\n        with tempfile.NamedTemporaryFile(suffix=\".py\", mode=\"w\", delete=False) as f:\n            f.write(code)\n            fname = f.name\n        try:\n            res = subprocess.run(\n                [sys.executable, fname],\n                input=stdin_data, text=True, capture_output=True, timeout=5,\n            )\n            got = res.stdout.strip()\n            if got == expected:\n                passed += 1\n        except Exception:\n            pass\n\n    return passed / total\n\n\n# Map answer_type -> scorer function\nSCORERS = {\n    \"mcq\":        score_mcq,\n    \"numeric\":    score_numeric,\n    \"expression\": score_expression,\n    \"code\":       score_code_exec,\n}\n\n# Fallback by domain when answer_type is missing\n_DOMAIN_FALLBACK = {\n    \"math\":      score_numeric,\n    \"reasoning\": score_mcq,\n    \"factual\":   score_mcq,\n    \"code\":      score_code_exec,\n}\n\n\ndef score_item(response: str, item: dict) -> Optional[float]:\n    scorer = SCORERS.get(item.get(\"answer_type\", \"\"))\n    if scorer is None:\n        scorer = _DOMAIN_FALLBACK.get(item.get(\"domain\", \"\"))\n    if scorer is None:\n        return None\n    return scorer(response, item.get(\"ground_truth\", \"\"))\n\n\n# ---------------------------------------------------------------------------\n# CSV schema\n# ---------------------------------------------------------------------------\n\nFIELDNAMES = [\n    \"req_id\", \"source\", \"domain\", \"complexity\", \"answer_type\",\n    \"query\", \"ground_truth\",\n    \"status\", \"model_winner\", \"actual_latency_ms\", \"wall_ms\",\n    \"charged_usd\", \"response_text\",\n    \"score\", \"is_correct\", \"error\",\n]\n\n\n# ---------------------------------------------------------------------------\n# Async router client\n# ---------------------------------------------------------------------------\n\nasync def _send_one(\n    client,\n    router_url: str,\n    sem: asyncio.Semaphore,\n    item: dict,\n    mode: str,\n    idx: int,\n    total: int,\n    counter: list,\n) -> dict:\n    async with sem:\n        t0 = time.monotonic()\n        row: dict = {\n            \"req_id\":            item.get(\"req_id\", idx),\n            \"source\":            item.get(\"source\", \"\"),\n            \"domain\":            item.get(\"domain\", \"\"),\n            \"complexity\":        item.get(\"complexity\", \"\"),\n            \"answer_type\":       item.get(\"answer_type\", \"\"),\n            \"query\":             item.get(\"query\", \"\")[:300],\n            \"ground_truth\":      item.get(\"ground_truth\", \"\")[:100],\n            \"status\":            \"\",\n            \"model_winner\":      \"\",\n            \"actual_latency_ms\": \"\",\n            \"wall_ms\":           \"\",\n            \"charged_usd\":       \"\",\n            \"response_text\":     \"\",\n            \"score\":             \"\",\n            \"is_correct\":        \"\",\n            \"error\":             \"\",\n        }\n        try:\n            payload = {\n                \"model\":    \"auto\",\n                \"messages\": [{\"role\": \"user\", \"content\": item[\"query\"]}],\n                \"max_tokens\": 1024,\n                \"extra_body\": {\"router\": {\"mode\": mode}},\n            }\n            resp = await client.post(\n                f\"{router_url}/v1/chat/completions\",\n                json=payload,\n                timeout=90.0,\n            )\n            wall_ms = (time.monotonic() - t0) * 1000\n            row[\"status\"]            = str(resp.status_code)\n            row[\"wall_ms\"]           = f\"{wall_ms:.1f}\"\n            row[\"actual_latency_ms\"] = resp.headers.get(\"X-Router-Actual-Latency-Ms\", \"\")\n            row[\"model_winner\"]      = resp.headers.get(\"X-Router-Model-Winner\", \"\")\n            row[\"charged_usd\"]       = resp.headers.get(\"X-Router-Charged-USD\", \"\")\n\n            if resp.status_code == 200:\n                data = resp.json()\n                text = data[\"choices\"][0][\"message\"][\"content\"]\n                row[\"response_text\"] = text\n\n                sc = score_item(text, item)\n                if sc is not None:\n                    row[\"score\"]      = f\"{sc:.4f}\"\n                    row[\"is_correct\"] = \"true\" if sc >= 0.5 else \"false\"\n        except Exception as exc:\n            row[\"status\"] = \"error\"\n            row[\"error\"]  = str(exc)[:300]\n\n        counter[0] += 1\n        done = counter[0]\n        if done % 50 == 0 or done == total:\n            print(f\"  {done}/{total} requests done\", flush=True)\n\n        return row\n\n\nasync def run_eval(\n    router_url: str,\n    dataset: list[dict],\n    mode: str,\n    output: str,\n    concurrency: int,\n) -> list[dict]:\n    try:\n        import httpx\n    except ImportError:\n        print(\"httpx not installed. Run: pip install httpx\")\n        sys.exit(1)\n\n    sem     = asyncio.Semaphore(concurrency)\n    counter = [0]\n\n    os.makedirs(os.path.dirname(output) if os.path.dirname(output) else \".\", exist_ok=True)\n\n    results = []\n    with open(output, \"w\", newline=\"\", encoding=\"utf-8\") as csvf:\n        writer = csv.DictWriter(csvf, fieldnames=FIELDNAMES)\n        writer.writeheader()\n\n        async with httpx.AsyncClient() as client:\n            tasks = [\n                _send_one(client, router_url, sem, item, mode, i, len(dataset), counter)\n                for i, item in enumerate(dataset)\n            ]\n            for coro in asyncio.as_completed(tasks):\n                row = await coro\n                writer.writerow(row)\n                csvf.flush()\n                results.append(row)\n\n    return results\n\n\n# ---------------------------------------------------------------------------\n# Report\n# ---------------------------------------------------------------------------\n\ndef _acc(rows: list[dict]) -> Optional[float]:\n    scored = [r for r in rows if r.get(\"is_correct\") in (\"true\", \"false\")]\n    if not scored:\n        return None\n    correct = sum(1 for r in scored if r[\"is_correct\"] == \"true\")\n    return correct / len(scored)\n\n\ndef _mean_lat(rows: list[dict]) -> Optional[float]:\n    lats = []\n    for r in rows:\n        try:\n            lats.append(float(r.get(\"wall_ms\", \"\")))\n        except (ValueError, TypeError):\n            pass\n    return sum(lats) / len(lats) if lats else None\n\n\ndef print_report(results: list[dict], label: str = \"\") -> None:\n    W = 82\n    title = f\"BENCHMARK EVALUATION REPORT{' - ' + label if label else ''}\"\n    print(f\"\\n{'='*W}\")\n    print(f\"  {title}\")\n    print(f\"{'='*W}\")\n\n    n200   = sum(1 for r in results if r.get(\"status\") == \"200\")\n    scored = [r for r in results if r.get(\"is_correct\") in (\"true\", \"false\")]\n    acc    = _acc(scored)\n    lat    = _mean_lat(results)\n\n    print(f\"\\n  Requests total  : {len(results)}\")\n    print(f\"  HTTP 200        : {n200}\")\n    print(f\"  Scored          : {len(scored)}\")\n    if acc is not None:\n        print(f\"  Overall accuracy: {acc*100:.1f}%\")\n    if lat is not None:\n        print(f\"  Mean wall lat   : {lat:.0f} ms\")\n\n    # By source\n    print(f\"\\n  {'Source':<22} {'N':>5} {'Scored':>7} {'Acc':>8} {'Lat(ms)':>9}\")\n    print(f\"  {'-'*54}\")\n    by_src: dict[str, list[dict]] = defaultdict(list)\n    for r in results:\n        by_src[r.get(\"source\", \"?\")].append(r)\n    for src in sorted(by_src):\n        rows  = by_src[src]\n        sc    = [r for r in rows if r.get(\"is_correct\") in (\"true\", \"false\")]\n        a     = _acc(sc)\n        l     = _mean_lat(rows)\n        a_s   = f\"{a*100:.1f}%\" if a is not None else \"\u2014\"\n        l_s   = f\"{l:.0f}\"     if l is not None else \"\u2014\"\n        print(f\"  {src:<22} {len(rows):>5} {len(sc):>7} {a_s:>8} {l_s:>9}\")\n\n    # By domain / complexity\n    print(f\"\\n  {'Domain':<12} {'Complexity':<10} {'N':>5} {'Scored':>7} {'Acc':>8}\")\n    print(f\"  {'-'*45}\")\n    by_dc: dict[tuple, list[dict]] = defaultdict(list)\n    for r in results:\n        by_dc[(r.get(\"domain\", \"?\"), r.get(\"complexity\", \"?\"))].append(r)\n    for (dom, cpx) in sorted(by_dc):\n        rows = by_dc[(dom, cpx)]\n        sc   = [r for r in rows if r.get(\"is_correct\") in (\"true\", \"false\")]\n        a    = _acc(sc)\n        a_s  = f\"{a*100:.1f}%\" if a is not None else \"\u2014\"\n        print(f\"  {dom:<12} {cpx:<10} {len(rows):>5} {len(sc):>7} {a_s:>8}\")\n\n    # By model\n    by_model: dict[str, list[dict]] = defaultdict(list)\n    for r in results:\n        m = r.get(\"model_winner\", \"\").strip()\n        if m:\n            by_model[m].append(r)\n    if by_model:\n        print(f\"\\n  {'Model':<36} {'N':>5} {'Acc':>8}\")\n        print(f\"  {'-'*52}\")\n        for model in sorted(by_model, key=lambda m: -len(by_model[m])):\n            rows = by_model[model]\n            sc   = [r for r in rows if r.get(\"is_correct\") in (\"true\", \"false\")]\n            a    = _acc(sc)\n            a_s  = f\"{a*100:.1f}%\" if a is not None else \"\u2014\"\n            short = model.split(\"/\")[-1][:36]\n            print(f\"  {short:<36} {len(rows):>5} {a_s:>8}\")\n\n    # Scoring method legend\n    print(f\"\\n  Scoring methods:\")\n    print(f\"    mcq        - letter extraction (A-J), exact match\")\n    print(f\"    numeric    - last-number extraction, +/-1% tolerance\")\n    print(f\"    expression - \\\\boxed{{}} extraction, numeric + string normalization\")\n    print(f\"    code       - stdin/stdout execution against test cases (pass rate)\")\n    print(f\"\\n{'='*W}\\n\")\n\n\ndef print_comparison(csv_paths: list[str]) -> None:\n    \"\"\"Load multiple scored CSVs and print a side-by-side accuracy table.\"\"\"\n    all_data = []\n    for path in csv_paths:\n        with open(path, newline=\"\", encoding=\"utf-8\") as f:\n            rows = list(csv.DictReader(f))\n        all_data.append((Path(path).stem, rows))\n\n    W = 82\n    print(f\"\\n{'='*W}\")\n    print(\"  BENCHMARK COMPARISON\")\n    print(f\"{'='*W}\\n\")\n\n    labels = [name for name, _ in all_data]\n\n    # Header\n    print(f\"  {'Benchmark':<22}\", end=\"\")\n    for lbl in labels:\n        print(f\"  {lbl[:18]:>18}\", end=\"\")\n    print()\n    print(f\"  {'-'*(22 + 20*len(labels))}\")\n\n    # Gather all sources\n    sources = []\n    for _, rows in all_data:\n        for r in rows:\n            s = r.get(\"source\", \"?\")\n            if s not in sources:\n                sources.append(s)\n\n    for src in sources:\n        print(f\"  {src:<22}\", end=\"\")\n        for _, rows in all_data:\n            subset = [r for r in rows if r.get(\"source\") == src]\n            sc     = [r for r in subset if r.get(\"is_correct\") in (\"true\", \"false\")]\n            a      = _acc(sc)\n            a_s    = f\"{a*100:.1f}%\" if a is not None else \"\u2014\"\n            print(f\"  {a_s:>18}\", end=\"\")\n        print()\n\n    # Overall row\n    print(f\"  {'OVERALL':<22}\", end=\"\")\n    for _, rows in all_data:\n        sc = [r for r in rows if r.get(\"is_correct\") in (\"true\", \"false\")]\n        a  = _acc(sc)\n        a_s = f\"{a*100:.1f}%\" if a is not None else \"\u2014\"\n        print(f\"  {a_s:>18}\", end=\"\")\n    print()\n    print(f\"\\n{'='*W}\\n\")\n\n\n# ---------------------------------------------------------------------------\n# Entry point\n# ---------------------------------------------------------------------------\n\ndef main() -> None:\n    parser = argparse.ArgumentParser(\n        description=\"Benchmark evaluation for the semantic LLM router.\"\n    )\n    # Dataset\n    parser.add_argument(\"--dataset\",     default=\"datasets/benchmark_1000.json\",\n                        help=\"Path to benchmark JSON (build_benchmark_dataset.py output)\")\n    parser.add_argument(\"--build\",       action=\"store_true\",\n                        help=\"Build the dataset before running (calls build_benchmark_dataset.py)\")\n    parser.add_argument(\"--total\",       type=int, default=1000,\n                        help=\"Dataset size when --build is used\")\n    parser.add_argument(\"--cutoff\",      default=\"2024-06-01\",\n                        help=\"Contamination cutoff when --build is used\")\n    parser.add_argument(\"--seed\",        type=int, default=42)\n    # Router\n    parser.add_argument(\"--router\",      default=\"http://localhost:8080\")\n    parser.add_argument(\"--mode\",        default=\"ttca\",\n                        choices=[\"ttca\", \"accuracy\", \"cost\", \"eco\", \"carrot\"],\n                        help=\"Router routing mode\")\n    parser.add_argument(\"--concurrency\", type=int, default=16)\n    parser.add_argument(\"--n\",           type=int, default=None,\n                        help=\"Limit to first N items (smoke test)\")\n    # Output\n    parser.add_argument(\"--output\",      default=\"results/benchmark_eval.csv\")\n    # Comparison mode\n    parser.add_argument(\"--score-only\",  nargs=\"+\", metavar=\"CSV\",\n                        help=\"Skip eval; compare already-scored CSVs side-by-side\")\n    args = parser.parse_args()\n\n    # Comparison-only mode\n    if args.score_only:\n        print_comparison(args.score_only)\n        return\n\n    import random\n    random.seed(args.seed)\n\n    # Optionally build dataset\n    if args.build:\n        sys.path.insert(0, str(Path(__file__).parent))\n        from build_benchmark_dataset import build\n        build(args.total, args.dataset, cutoff=args.cutoff)\n\n    # Load dataset\n    if not os.path.exists(args.dataset):\n        print(f\"Dataset not found: {args.dataset}\")\n        print(\"Run with --build to create it, or specify an existing --dataset path.\")\n        sys.exit(1)\n\n    with open(args.dataset) as f:\n        dataset = json.load(f)\n\n    if args.n is not None:\n        dataset = dataset[:args.n]\n\n    # Print plan\n    by_src: dict[str, int] = defaultdict(int)\n    for item in dataset:\n        by_src[item.get(\"source\", \"?\")] += 1\n    print(f\"\\nRunning benchmark eval:\")\n    print(f\"  Dataset  : {args.dataset} ({len(dataset)} items)\")\n    for src, cnt in sorted(by_src.items()):\n        print(f\"    {src:<22} {cnt}\")\n    print(f\"  Router   : {args.router}\")\n    print(f\"  Mode     : {args.mode}\")\n    print(f\"  Output   : {args.output}\")\n    print(f\"  Workers  : {args.concurrency}\\n\")\n\n    results = asyncio.run(run_eval(\n        router_url=args.router,\n        dataset=dataset,\n        mode=args.mode,\n        output=args.output,\n        concurrency=args.concurrency,\n    ))\n\n    print_report(results, label=f\"{args.mode} @ {args.router}\")\n    print(f\"Results saved to: {args.output}\")\n\n\nif __name__ == \"__main__\":\n    main()\n
+"""
+run_benchmark_eval.py — End-to-end benchmark evaluation for the semantic router.
+
+Loads a dataset built by build_benchmark_dataset.py, sends each query to the
+router asynchronously, scores responses using benchmark-appropriate methods,
+and reports accuracy by source, domain, complexity, and model.
+
+Scoring by answer_type:
+  mcq        — extract letter (A-J) from response, exact match vs GT letter
+  numeric    — extract last number, compare ±1% tolerance (grade-school math)
+  expression — LaTeX/symbolic; numeric fallback then normalized string match
+  code       — stdin/stdout execution against LiveCodeBench test cases
+
+Usage:
+    # Build dataset then evaluate
+    python tests/run_benchmark_eval.py \\
+        --build --total 1000 \\
+        --router http://localhost:8080 \\
+        --mode ttca \\
+        --output results/benchmark_eval.csv
+
+    # Evaluate an existing dataset
+    python tests/run_benchmark_eval.py \\
+        --dataset datasets/benchmark_1000.json \\
+        --router  http://localhost:8080 \\
+        --mode    ttca \\
+        --output  results/benchmark_eval.csv
+
+    # Quick smoke test (first 50 items)
+    python tests/run_benchmark_eval.py \\
+        --dataset datasets/benchmark_1000.json \\
+        --router  http://localhost:8080 \\
+        --n 50
+
+    # Compare two router modes side-by-side (score existing CSVs)
+    python tests/run_benchmark_eval.py \\
+        --score-only results/ttca_eval.csv results/carrot_eval.csv
+"""
+from __future__ import annotations
+
+import argparse
+import ast
+import asyncio
+import csv
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import time
+from collections import defaultdict
+from pathlib import Path
+from typing import Optional
+
+
+# ---------------------------------------------------------------------------
+# Scorers
+# ---------------------------------------------------------------------------
+
+def _extract_numbers(text: str) -> list[float]:
+    return [float(m) for m in re.findall(r"-?\d+(?:\.\d+)?", text)]
+
+
+def score_mcq(response: str, ground_truth: str) -> Optional[float]:
+    """Extract the letter choice from response text, exact match vs GT letter.
+
+    Checks high-confidence patterns first (explicit "answer is A", bold **A**,
+    "Answer: A") and falls back to scanning the response tail for a bare letter
+    only when nothing explicit is found.
+    Returns None when no letter can be extracted (e.g. refusal or empty).
+    """
+    gt = ground_truth.strip().upper()
+    if not gt or gt[0] not in "ABCDEFGHIJ":
+        return None
+    gt = gt[0]
+
+    resp_upper = response.upper()
+
+    # High-confidence patterns — explicit answer markers
+    hi_patterns = [
+        r"(?:THE\s+)?(?:CORRECT\s+)?ANSWER\s+IS\s*[:(]?\s*\*?\*?([A-J])\*?\*?",
+        r"ANSWER:\s*\*?\*?([A-J])\*?\*?",
+        r"\*\*([A-J])\*\*",
+        r"^([A-J])[.):\s]",
+        r"OPTION\s+([A-J])\b",
+        r"CHOICE\s+([A-J])\b",
+        r"\(([A-J])\)\s+IS\s+CORRECT",
+        r"SELECT\s+([A-J])\b",
+        r"RESPONSE:\s*([A-J])\b",
+        r"MY\s+ANSWER\s+IS\s+([A-J])\b",
+    ]
+
+    found = []
+    for pat in hi_patterns:
+        for m in re.finditer(pat, resp_upper, re.MULTILINE):
+            found.append(m.group(1))
+
+    if found:
+        from collections import Counter
+        winner = Counter(found).most_common(1)[0][0]
+        return 1.0 if winner == gt else 0.0
+
+    # Fallback: look for a lone letter in the last 300 chars
+    tail = resp_upper[-300:]
+    for m in re.finditer(r"\b([A-J])\b", tail):
+        return 1.0 if m.group(1) == gt else 0.0
+
+    return None  # could not extract a letter
+
+
+def score_numeric(response: str, ground_truth: str) -> Optional[float]:
+    """Extract the last number from response, compare ±1% or absolute ≤0.01.
+
+    Suitable for GSM1K and other grade-school numeric math benchmarks.
+    Returns None when no number is found in either response or ground truth.
+    """
+    pred_nums = _extract_numbers(response)
+    true_nums = _extract_numbers(str(ground_truth))
+    if not pred_nums or not true_nums:
+        return None
+    pred = pred_nums[-1]
+    true = true_nums[-1]
+    if true == 0:
+        return 1.0 if abs(pred) < 0.01 else 0.0
+    return 1.0 if (abs(pred - true) / abs(true) < 0.01 or abs(pred - true) < 0.01) else 0.0
+
+
+def score_expression(response: str, ground_truth: str) -> Optional[float]:
+    """Score symbolic/LaTeX answers (OlympiadBench).
+
+    Strategy:
+    1. Extract \\boxed{} from the response (models are prompted to use it).
+    2. Try numeric comparison with 2% tolerance.
+    3. Normalize both sides (strip whitespace, LaTeX macros) and string-compare.
+    4. Return 0.0 on definitive mismatch, None if the response has no answer signal.
+    """
+    # Extract \boxed{...} — models are instructed to put answers there
+    boxed = re.search(r"\\boxed\{([^}]+)\}", response)
+    pred_str = boxed.group(1).strip() if boxed else ""
+
+    if not pred_str:
+        # Try last math environment or final number
+        last_env = re.search(r"\$([^$]+)\$", response)
+        pred_str = last_env.group(1).strip() if last_env else ""
+
+    if not pred_str:
+        # No clear answer marker — fall back to last number in response
+        nums = _extract_numbers(response)
+        if not nums:
+            return None
+        pred_str = str(nums[-1])
+
+    gt_str = str(ground_truth).strip()
+
+    # Numeric comparison (2% tolerance for Olympiad problems)
+    pred_nums = _extract_numbers(pred_str)
+    true_nums = _extract_numbers(gt_str)
+    if pred_nums and true_nums:
+        pred = pred_nums[-1]
+        true = true_nums[-1]
+        if true == 0:
+            return 1.0 if abs(pred) < 0.01 else 0.0
+        if abs(pred - true) / abs(true) < 0.02:
+            return 1.0
+
+    # Normalized string comparison
+    def _norm(s: str) -> str:
+        s = s.lower().strip()
+        s = re.sub(r"\s+", "", s)
+        replacements = [
+            ("\\cdot",  "*"), ("\\times", "*"), ("\\div", "/"),
+            ("\\frac",  ""), ("\\sqrt",   "sqrt"),
+            ("{", ""),  ("}", ""),  ("^", "**"), ("\\pm", "±"),
+        ]
+        for old, new in replacements:
+            s = s.replace(old, new)
+        return s
+
+    if _norm(pred_str) and _norm(gt_str) and _norm(pred_str) == _norm(gt_str):
+        return 1.0
+
+    return 0.0
+
+
+def score_code_exec(response: str, ground_truth: str) -> Optional[float]:
+    """Score code via syntax check + stdin/stdout execution (LiveCodeBench).
+
+    Runs up to 5 public test cases from the JSON ground_truth.
+    Returns fraction of test cases passed (0.0–1.0).
+    Returns 0.5 for syntactically valid code with no executable tests.
+    """
+    # Extract code from markdown fences
+    code_blocks = re.findall(r"```(?:python)?\s*(.*?)```", response, re.DOTALL)
+    code = code_blocks[0].strip() if code_blocks else response.strip()
+
+    # Syntax check
+    try:
+        ast.parse(code)
+    except SyntaxError:
+        return 0.0
+
+    # Try to parse test cases as JSON [{input, output}, ...]
+    try:
+        test_cases = json.loads(ground_truth)
+    except Exception:
+        # Fallback: assert-style ground truth (HumanEval/MBPP)
+        gt = str(ground_truth)
+        if "assert" in gt:
+            test_src = code + "\n" + gt
+            with tempfile.NamedTemporaryFile(suffix=".py", mode="w", delete=False) as f:
+                f.write(test_src)
+                fname = f.name
+            try:
+                res = subprocess.run([sys.executable, fname],
+                                     timeout=5, capture_output=True)
+                return 1.0 if res.returncode == 0 else 0.0
+            except Exception:
+                return 0.0
+        return 0.5  # no tests — syntax valid, partial credit
+
+    if not test_cases:
+        return 0.5
+
+    # Stdin/stdout execution against each test case (cap at 5)
+    passed = 0
+    total  = min(len(test_cases), 5)
+    for tc in test_cases[:total]:
+        stdin_data = str(tc.get("input",  "")).strip()
+        expected   = str(tc.get("output", "")).strip()
+
+        with tempfile.NamedTemporaryFile(suffix=".py", mode="w", delete=False) as f:
+            f.write(code)
+            fname = f.name
+        try:
+            res = subprocess.run(
+                [sys.executable, fname],
+                input=stdin_data, text=True, capture_output=True, timeout=5,
+            )
+            got = res.stdout.strip()
+            if got == expected:
+                passed += 1
+        except Exception:
+            pass
+
+    return passed / total
+
+
+# Map answer_type → scorer function
+SCORERS = {
+    "mcq":        score_mcq,
+    "numeric":    score_numeric,
+    "expression": score_expression,
+    "code":       score_code_exec,
+}
+
+# Fallback by domain when answer_type is missing
+_DOMAIN_FALLBACK = {
+    "math":      score_numeric,
+    "reasoning": score_mcq,
+    "factual":   score_mcq,
+    "code":      score_code_exec,
+}
+
+
+def score_item(response: str, item: dict) -> Optional[float]:
+    scorer = SCORERS.get(item.get("answer_type", ""))
+    if scorer is None:
+        scorer = _DOMAIN_FALLBACK.get(item.get("domain", ""))
+    if scorer is None:
+        return None
+    return scorer(response, item.get("ground_truth", ""))
+
+
+# ---------------------------------------------------------------------------
+# CSV schema
+# ---------------------------------------------------------------------------
+
+FIELDNAMES = [
+    "req_id", "source", "domain", "complexity", "answer_type",
+    "query", "ground_truth",
+    "status", "model_winner", "actual_latency_ms", "wall_ms",
+    "charged_usd", "response_text",
+    "score", "is_correct", "error",
+]
+
+
+# ---------------------------------------------------------------------------
+# Async router client
+# ---------------------------------------------------------------------------
+
+async def _send_one(
+    client,
+    router_url: str,
+    sem: asyncio.Semaphore,
+    item: dict,
+    mode: str,
+    idx: int,
+    total: int,
+    counter: list,
+) -> dict:
+    async with sem:
+        t0 = time.monotonic()
+        row: dict = {
+            "req_id":            item.get("req_id", idx),
+            "source":            item.get("source", ""),
+            "domain":            item.get("domain", ""),
+            "complexity":        item.get("complexity", ""),
+            "answer_type":       item.get("answer_type", ""),
+            "query":             item.get("query", "")[:300],
+            "ground_truth":      item.get("ground_truth", "")[:100],
+            "status":            "",
+            "model_winner":      "",
+            "actual_latency_ms": "",
+            "wall_ms":           "",
+            "charged_usd":       "",
+            "response_text":     "",
+            "score":             "",
+            "is_correct":        "",
+            "error":             "",
+        }
+        try:
+            payload = {
+                "model":    "auto",
+                "messages": [{"role": "user", "content": item["query"]}],
+                "max_tokens": 1024,
+                "extra_body": {"router": {"mode": mode}},
+            }
+            resp = await client.post(
+                f"{router_url}/v1/chat/completions",
+                json=payload,
+                timeout=90.0,
+            )
+            wall_ms = (time.monotonic() - t0) * 1000
+            row["status"]            = str(resp.status_code)
+            row["wall_ms"]           = f"{wall_ms:.1f}"
+            row["actual_latency_ms"] = resp.headers.get("X-Router-Actual-Latency-Ms", "")
+            row["model_winner"]      = resp.headers.get("X-Router-Model-Winner", "")
+            row["charged_usd"]       = resp.headers.get("X-Router-Charged-USD", "")
+
+            if resp.status_code == 200:
+                data = resp.json()
+                text = data["choices"][0]["message"]["content"]
+                row["response_text"] = text
+
+                sc = score_item(text, item)
+                if sc is not None:
+                    row["score"]      = f"{sc:.4f}"
+                    row["is_correct"] = "true" if sc >= 0.5 else "false"
+        except Exception as exc:
+            row["status"] = "error"
+            row["error"]  = str(exc)[:300]
+
+        counter[0] += 1
+        done = counter[0]
+        if done % 50 == 0 or done == total:
+            print(f"  {done}/{total} requests done", flush=True)
+
+        return row
+
+
+async def run_eval(
+    router_url: str,
+    dataset: list[dict],
+    mode: str,
+    output: str,
+    concurrency: int,
+) -> list[dict]:
+    try:
+        import httpx
+    except ImportError:
+        print("httpx not installed. Run: pip install httpx")
+        sys.exit(1)
+
+    sem     = asyncio.Semaphore(concurrency)
+    counter = [0]
+
+    os.makedirs(os.path.dirname(output) if os.path.dirname(output) else ".", exist_ok=True)
+
+    results = []
+    with open(output, "w", newline="", encoding="utf-8") as csvf:
+        writer = csv.DictWriter(csvf, fieldnames=FIELDNAMES)
+        writer.writeheader()
+
+        async with httpx.AsyncClient() as client:
+            tasks = [
+                _send_one(client, router_url, sem, item, mode, i, len(dataset), counter)
+                for i, item in enumerate(dataset)
+            ]
+            for coro in asyncio.as_completed(tasks):
+                row = await coro
+                writer.writerow(row)
+                csvf.flush()
+                results.append(row)
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Report
+# ---------------------------------------------------------------------------
+
+def _acc(rows: list[dict]) -> Optional[float]:
+    scored = [r for r in rows if r.get("is_correct") in ("true", "false")]
+    if not scored:
+        return None
+    correct = sum(1 for r in scored if r["is_correct"] == "true")
+    return correct / len(scored)
+
+
+def _mean_lat(rows: list[dict]) -> Optional[float]:
+    lats = []
+    for r in rows:
+        try:
+            lats.append(float(r.get("wall_ms", "")))
+        except (ValueError, TypeError):
+            pass
+    return sum(lats) / len(lats) if lats else None
+
+
+def print_report(results: list[dict], label: str = "") -> None:
+    W = 82
+    title = f"BENCHMARK EVALUATION REPORT{' — ' + label if label else ''}"
+    print(f"\n{'='*W}")
+    print(f"  {title}")
+    print(f"{'='*W}")
+
+    n200   = sum(1 for r in results if r.get("status") == "200")
+    scored = [r for r in results if r.get("is_correct") in ("true", "false")]
+    acc    = _acc(scored)
+    lat    = _mean_lat(results)
+
+    print(f"\n  Requests total  : {len(results)}")
+    print(f"  HTTP 200        : {n200}")
+    print(f"  Scored          : {len(scored)}")
+    if acc is not None:
+        print(f"  Overall accuracy: {acc*100:.1f}%")
+    if lat is not None:
+        print(f"  Mean wall lat   : {lat:.0f} ms")
+
+    # By source
+    print(f"\n  {'Source':<22} {'N':>5} {'Scored':>7} {'Acc':>8} {'Lat(ms)':>9}")
+    print(f"  {'-'*54}")
+    by_src: dict[str, list[dict]] = defaultdict(list)
+    for r in results:
+        by_src[r.get("source", "?")].append(r)
+    for src in sorted(by_src):
+        rows  = by_src[src]
+        sc    = [r for r in rows if r.get("is_correct") in ("true", "false")]
+        a     = _acc(sc)
+        l     = _mean_lat(rows)
+        a_s   = f"{a*100:.1f}%" if a is not None else "—"
+        l_s   = f"{l:.0f}"     if l is not None else "—"
+        print(f"  {src:<22} {len(rows):>5} {len(sc):>7} {a_s:>8} {l_s:>9}")
+
+    # By domain / complexity
+    print(f"\n  {'Domain':<12} {'Complexity':<10} {'N':>5} {'Scored':>7} {'Acc':>8}")
+    print(f"  {'-'*45}")
+    by_dc: dict[tuple, list[dict]] = defaultdict(list)
+    for r in results:
+        by_dc[(r.get("domain", "?"), r.get("complexity", "?"))].append(r)
+    for (dom, cpx) in sorted(by_dc):
+        rows = by_dc[(dom, cpx)]
+        sc   = [r for r in rows if r.get("is_correct") in ("true", "false")]
+        a    = _acc(sc)
+        a_s  = f"{a*100:.1f}%" if a is not None else "—"
+        print(f"  {dom:<12} {cpx:<10} {len(rows):>5} {len(sc):>7} {a_s:>8}")
+
+    # By model
+    by_model: dict[str, list[dict]] = defaultdict(list)
+    for r in results:
+        m = r.get("model_winner", "").strip()
+        if m:
+            by_model[m].append(r)
+    if by_model:
+        print(f"\n  {'Model':<36} {'N':>5} {'Acc':>8}")
+        print(f"  {'-'*52}")
+        for model in sorted(by_model, key=lambda m: -len(by_model[m])):
+            rows = by_model[model]
+            sc   = [r for r in rows if r.get("is_correct") in ("true", "false")]
+            a    = _acc(sc)
+            a_s  = f"{a*100:.1f}%" if a is not None else "—"
+            short = model.split("/")[-1][:36]
+            print(f"  {short:<36} {len(rows):>5} {a_s:>8}")
+
+    # Scoring method legend
+    print(f"\n  Scoring methods:")
+    print(f"    mcq        — letter extraction (A-J), exact match")
+    print(f"    numeric    — last-number extraction, ±1% tolerance")
+    print(f"    expression — \\boxed{{}} extraction, numeric + string normalization")
+    print(f"    code       — stdin/stdout execution against test cases (pass rate)")
+    print(f"\n{'='*W}\n")
+
+
+def print_comparison(csv_paths: list[str]) -> None:
+    """Load multiple scored CSVs and print a side-by-side accuracy table."""
+    all_data = []
+    for path in csv_paths:
+        with open(path, newline="", encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+        all_data.append((Path(path).stem, rows))
+
+    W = 82
+    print(f"\n{'='*W}")
+    print("  BENCHMARK COMPARISON")
+    print(f"{'='*W}\n")
+
+    labels = [name for name, _ in all_data]
+
+    # Header
+    print(f"  {'Benchmark':<22}", end="")
+    for lbl in labels:
+        print(f"  {lbl[:18]:>18}", end="")
+    print()
+    print(f"  {'-'*(22 + 20*len(labels))}")
+
+    # Gather all sources
+    sources = []
+    for _, rows in all_data:
+        for r in rows:
+            s = r.get("source", "?")
+            if s not in sources:
+                sources.append(s)
+
+    for src in sources:
+        print(f"  {src:<22}", end="")
+        for _, rows in all_data:
+            subset = [r for r in rows if r.get("source") == src]
+            sc     = [r for r in subset if r.get("is_correct") in ("true", "false")]
+            a      = _acc(sc)
+            a_s    = f"{a*100:.1f}%" if a is not None else "—"
+            print(f"  {a_s:>18}", end="")
+        print()
+
+    # Overall row
+    print(f"  {'OVERALL':<22}", end="")
+    for _, rows in all_data:
+        sc = [r for r in rows if r.get("is_correct") in ("true", "false")]
+        a  = _acc(sc)
+        a_s = f"{a*100:.1f}%" if a is not None else "—"
+        print(f"  {a_s:>18}", end="")
+    print()
+    print(f"\n{'='*W}\n")
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Benchmark evaluation for the semantic LLM router."
+    )
+    # Dataset
+    parser.add_argument("--dataset",     default="datasets/benchmark_1000.json",
+                        help="Path to benchmark JSON (build_benchmark_dataset.py output)")
+    parser.add_argument("--build",       action="store_true",
+                        help="Build the dataset before running (calls build_benchmark_dataset.py)")
+    parser.add_argument("--total",       type=int, default=1000,
+                        help="Dataset size when --build is used")
+    parser.add_argument("--cutoff",      default="2024-06-01",
+                        help="Contamination cutoff when --build is used")
+    parser.add_argument("--seed",        type=int, default=42)
+    # Router
+    parser.add_argument("--router",      default="http://localhost:8080")
+    parser.add_argument("--mode",        default="ttca",
+                        choices=["ttca", "accuracy", "cost", "eco", "carrot"],
+                        help="Router routing mode")
+    parser.add_argument("--concurrency", type=int, default=16)
+    parser.add_argument("--n",           type=int, default=None,
+                        help="Limit to first N items (smoke test)")
+    # Output
+    parser.add_argument("--output",      default="results/benchmark_eval.csv")
+    # Comparison mode
+    parser.add_argument("--score-only",  nargs="+", metavar="CSV",
+                        help="Skip eval; compare already-scored CSVs side-by-side")
+    args = parser.parse_args()
+
+    # Comparison-only mode
+    if args.score_only:
+        print_comparison(args.score_only)
+        return
+
+    import random
+    random.seed(args.seed)
+
+    # Optionally build dataset
+    if args.build:
+        sys.path.insert(0, str(Path(__file__).parent))
+        from build_benchmark_dataset import build
+        build(args.total, args.dataset, cutoff=args.cutoff)
+
+    # Load dataset
+    if not os.path.exists(args.dataset):
+        print(f"Dataset not found: {args.dataset}")
+        print("Run with --build to create it, or specify an existing --dataset path.")
+        sys.exit(1)
+
+    with open(args.dataset) as f:
+        dataset = json.load(f)
+
+    if args.n is not None:
+        dataset = dataset[:args.n]
+
+    # Print plan
+    by_src: dict[str, int] = defaultdict(int)
+    for item in dataset:
+        by_src[item.get("source", "?")] += 1
+    print(f"\nRunning benchmark eval:")
+    print(f"  Dataset  : {args.dataset} ({len(dataset)} items)")
+    for src, cnt in sorted(by_src.items()):
+        print(f"    {src:<22} {cnt}")
+    print(f"  Router   : {args.router}")
+    print(f"  Mode     : {args.mode}")
+    print(f"  Output   : {args.output}")
+    print(f"  Workers  : {args.concurrency}\n")
+
+    results = asyncio.run(run_eval(
+        router_url=args.router,
+        dataset=dataset,
+        mode=args.mode,
+        output=args.output,
+        concurrency=args.concurrency,
+    ))
+
+    print_report(results, label=f"{args.mode} @ {args.router}")
+    print(f"Results saved to: {args.output}")
+
+
+if __name__ == "__main__":
+    main()
