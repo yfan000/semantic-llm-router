@@ -55,7 +55,8 @@ def score_row(response_text: str, ground_truth: str,
     return sc, is_correct
 
 
-def process_csv(csv_path: str, workload_index: dict[str, dict]) -> None:
+def process_csv(csv_path: str, workload_index: dict[str, dict],
+                workload_list: list[dict]) -> None:
     """Add score / is_correct / answer_type / source to one CSV, in-place."""
     bak_path = csv_path + ".bak"
     shutil.copy2(csv_path, bak_path)
@@ -85,7 +86,17 @@ def process_csv(csv_path: str, workload_index: dict[str, dict]) -> None:
             continue
 
         req_id = str(row.get("req_id", "")).strip()
-        item   = workload_index.get(req_id)
+        # Primary: match by workload req_id value
+        item = workload_index.get(req_id)
+        # Fallback: baseline scripts use sequential 0..N req_ids, so treat
+        # req_id as a positional index into the workload list
+        if item is None:
+            try:
+                pos = int(req_id)
+                if 0 <= pos < len(workload_list):
+                    item = workload_list[pos]
+            except (ValueError, TypeError):
+                pass
         if item is None:
             skipped += 1
             for col in new_fields:
@@ -135,22 +146,23 @@ def main() -> None:
 
     CORRECT_THRESHOLD = args.threshold
 
-    # Load workload, index by req_id (both int and str keys)
+    # Load workload, index by req_id value AND by position
     with open(args.workload) as f:
-        workload = json.load(f)
+        workload_list = json.load(f)
     workload_index: dict[str, dict] = {}
-    for item in workload:
+    for item in workload_list:
         rid = item.get("req_id")
         if rid is not None:
             workload_index[str(rid)] = item
-    print(f"Workload: {len(workload_index)} items from {args.workload}")
+    print(f"Workload: {len(workload_list)} items from {args.workload}")
+    print(f"  (indexed by req_id value; positional fallback also enabled)")
     print()
 
     for csv_path in args.csvs:
         if not os.path.exists(csv_path):
             print(f"  WARNING: not found, skipping: {csv_path}")
             continue
-        process_csv(csv_path, workload_index)
+        process_csv(csv_path, workload_index, workload_list)
 
     print()
     print("Done. Re-run compare_all.py to see updated accuracy numbers.")
