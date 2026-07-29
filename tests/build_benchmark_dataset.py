@@ -510,6 +510,101 @@ def load_livecodebench(n: int, cutoff: str = CONTAMINATION_CUTOFF) -> list[dict]
     return balanced
 
 
+def load_livebench_reasoning(n: int) -> list[dict]:
+    """LiveBench reasoning tasks → reasoning:easy and reasoning:medium.
+
+    Three tasks from livebench/reasoning:
+      - web_of_lies_v2  : truth/lie chain logic         → easy
+      - zebra_puzzle    : logic grid (level-based)      → easy (≤12) / medium (13-16)
+      - spatial         : geometric piece-counting       → medium
+
+    Answer types:
+      - spatial         : "numeric"    (bold integer answer already in query)
+      - web_of_lies_v2  : "structured" (comma-separated yes/no)
+      - zebra_puzzle    : "structured" (comma-separated attribute values)
+    """
+    import json as _json
+    from datasets import load_dataset
+
+    try:
+        ds = load_dataset(
+            "parquet",
+            data_files="hf://datasets/livebench/reasoning/data/test-00000-of-00001.parquet",
+            split="train",
+        )
+        print(f"  [LiveBench/reasoning] loaded {len(ds)} items")
+    except Exception as e:
+        print(f"  [LiveBench/reasoning] skipped: {e}")
+        return []
+
+    def _query(row: dict) -> str:
+        turns = row.get("turns", "")
+        try:
+            parsed = _json.loads(turns)
+            return parsed[0] if parsed else str(turns)
+        except Exception:
+            return str(turns)
+
+    def _complexity(row: dict) -> str:
+        task = row.get("task", "")
+        if task == "web_of_lies_v2":
+            return "easy"
+        if task == "spatial":
+            return "medium"
+        # zebra_puzzle: use level field
+        try:
+            lvl = int(row.get("level") or 0)
+        except (TypeError, ValueError):
+            lvl = 0
+        return "easy" if lvl <= 12 else "medium"
+
+    def _answer_type(row: dict) -> str:
+        return "numeric" if row.get("task") == "spatial" else "structured"
+
+    results: list[dict] = []
+    ds = ds.shuffle(seed=42)
+    for row in ds:
+        task = row.get("task", "")
+        if task not in ("zebra_puzzle", "web_of_lies_v2", "spatial"):
+            continue
+        query = _query(row)
+        gt    = str(row.get("ground_truth", "")).strip()
+        if not query or not gt:
+            continue
+        complexity   = _complexity(row)
+        answer_type  = _answer_type(row)
+        # Append output-format hint for structured tasks
+        if answer_type == "structured":
+            n_fields = len([f for f in gt.split(",") if f.strip()])
+            query = (
+                query.rstrip()
+                + f"\n\nProvide your final answer as a comma-separated list of "
+                  f"{n_fields} value(s) matching the order asked."
+            )
+        results.append({
+            "domain": "reasoning",
+            "complexity": complexity,
+            "query": query,
+            "ground_truth": gt,
+            "source": f"livebench_{task}",
+            "answer_type": answer_type,
+        })
+        if len(results) >= n:
+            break
+
+    easy   = [r for r in results if r["complexity"] == "easy"]
+    medium = [r for r in results if r["complexity"] == "medium"]
+    per_c  = n // 2
+    balanced = (
+        random.sample(easy,   min(per_c, len(easy)))
+        + random.sample(medium, min(per_c, len(medium)))
+    )
+    print(f"  [LiveBench/reasoning] {len(balanced)} items selected "
+          f"(easy={sum(1 for r in balanced if r['complexity']=='easy')}, "
+          f"medium={sum(1 for r in balanced if r['complexity']=='medium')})")
+    return balanced
+
+
 # ---------------------------------------------------------------------------
 # Build
 # ---------------------------------------------------------------------------
@@ -529,15 +624,19 @@ def build(total: int, output: str, cutoff: str = CONTAMINATION_CUTOFF) -> None:
     all_items: list[dict] = []
 
     def add(name: str, items: list[dict]) -> None:
-        print(f"  {name:<28} {len(items):4} items loaded")
+        print(f"  {name:<34} {len(items):4} items loaded")
         all_items.extend(items)
 
     print("Loading benchmarks:")
-    add("GPQA / ARC-Challenge",       load_gpqa_diamond(per_benchmark))
-    add("MMLU-Pro",                   load_mmlu_pro(per_benchmark))
-    add("GSM1K / GSM8K",              load_gsm1k(per_benchmark))
-    add("OlympiadBench",              load_olympiadbench(per_benchmark))
-    add("LiveCodeBench",              load_livecodebench(per_benchmark, cutoff=cutoff))
+    # Reasoning slot: GPQA Diamond (hard) + LiveBench (easy/medium), split evenly
+    gpqa_n      = per_benchmark // 2
+    livebench_n = per_benchmark - gpqa_n
+    add("GPQA / ARC-Challenge (hard)",    load_gpqa_diamond(gpqa_n))
+    add("LiveBench Reasoning (easy/med)", load_livebench_reasoning(livebench_n))
+    add("MMLU-Pro",                       load_mmlu_pro(per_benchmark))
+    add("GSM1K / GSM8K",                  load_gsm1k(per_benchmark))
+    add("OlympiadBench",                  load_olympiadbench(per_benchmark))
+    add("LiveCodeBench",                  load_livecodebench(per_benchmark, cutoff=cutoff))
 
     random.shuffle(all_items)
     for i, item in enumerate(all_items):
