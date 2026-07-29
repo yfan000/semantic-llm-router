@@ -102,6 +102,12 @@ def load_system(path: str, eval_index: dict) -> dict:
                 if r.get("gt_correct") == "true":
                     correct += 1
                     is_correct = True
+            elif r.get("is_correct") in ("true", "false"):
+                # inline-scored by run_benchmark_eval.py
+                scored += 1
+                if r.get("is_correct") == "true":
+                    correct += 1
+                    is_correct = True
             elif eval_index:
                 ic = eval_index.get((r.get("req_id", ""),
                                      r.get("model_winner", "")))
@@ -169,6 +175,8 @@ def load_system(path: str, eval_index: dict) -> dict:
         is_correct = False
         if r.get("gt_scored") == "true":
             is_correct = (r.get("gt_correct") == "true")
+        elif r.get("is_correct") in ("true", "false"):
+            is_correct = (r.get("is_correct") == "true")
         elif eval_index:
             ic = eval_index.get((r.get("req_id", ""), r.get("model_winner", "")))
             is_correct = bool(ic)
