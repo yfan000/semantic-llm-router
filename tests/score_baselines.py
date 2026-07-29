@@ -121,6 +121,7 @@ def process_csv(csv_path: str, workload_index: dict[str, dict]) -> None:
 
 
 def main() -> None:
+    global CORRECT_THRESHOLD
     parser = argparse.ArgumentParser(
         description="Add is_correct/score to baseline CSVs using workload ground truth."
     )
@@ -132,7 +133,6 @@ def main() -> None:
                         help=f"Score threshold for is_correct=true (default {CORRECT_THRESHOLD})")
     args = parser.parse_args()
 
-    global CORRECT_THRESHOLD
     CORRECT_THRESHOLD = args.threshold
 
     # Load workload, index by req_id (both int and str keys)
