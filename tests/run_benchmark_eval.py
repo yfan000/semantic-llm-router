@@ -246,12 +246,53 @@ def score_code_exec(response: str, ground_truth: str) -> Optional[float]:
     return passed / total
 
 
+def score_structured(response: str, ground_truth: str) -> Optional[float]:
+    """Match comma-separated fields case-insensitively.
+
+    Used for LiveBench tasks (zebra_puzzle, web_of_lies_v2) where the ground
+    truth is an ordered comma-separated list.  Returns the fraction of fields
+    that match; 1.0 = all correct, 0.0 = none correct.
+    """
+    def _fields(s: str) -> list[str]:
+        return [f.strip().lower() for f in s.split(",") if f.strip()]
+
+    gt = _fields(ground_truth)
+    if not gt:
+        return None
+
+    # Extract candidate answer: prefer explicit marker, else last non-empty line
+    candidate = ""
+    for pat in [
+        r"(?:final\s+)?answer\s*:\s*(.+)",
+        r"solution\s*:\s*(.+)",
+    ]:
+        m = re.search(pat, response, re.IGNORECASE)
+        if m:
+            candidate = m.group(1).strip()
+            break
+    if not candidate:
+        lines = [l.strip() for l in response.strip().splitlines() if l.strip()]
+        candidate = lines[-1] if lines else ""
+
+    pred = _fields(candidate)
+    if not pred:
+        return None
+
+    # Align to gt length (take last N if model adds extra preamble)
+    if len(pred) > len(gt):
+        pred = pred[-len(gt):]
+
+    matches = sum(1 for p, g in zip(pred, gt) if p == g)
+    return matches / len(gt)
+
+
 # Map answer_type → scorer function
 SCORERS = {
     "mcq":        score_mcq,
     "numeric":    score_numeric,
     "expression": score_expression,
     "code":       score_code_exec,
+    "structured": score_structured,
 }
 
 # Fallback by domain when answer_type is missing
