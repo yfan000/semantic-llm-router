@@ -90,7 +90,17 @@ python3 -c "
 import json, random
 random.seed(${SEED})
 data = json.load(open('${DATASET}'))
-sample = random.sample(data, min(${N_REQUESTS}, len(data)))
+n = ${N_REQUESTS}
+if n <= len(data):
+    sample = random.sample(data, n)
+else:
+    # Oversample: full dataset once + random remainder (no item repeated more than twice)
+    extra  = random.sample(data, n - len(data))
+    sample = data + extra
+    random.shuffle(sample)
+# Re-assign req_ids to match position in workload
+for i, item in enumerate(sample):
+    item = dict(item); item['req_id'] = i; sample[i] = item
 json.dump(sample, open('\$RESULTS_DIR/workload.json', 'w'), indent=2)
 from collections import Counter
 by_src    = Counter(x.get('source','?') for x in sample)
