@@ -247,9 +247,23 @@ echo "  BASELINES (all 6 models alive)"
 echo "=================================================================="
 
 echo ""
+echo "  [B0] Building eval_matrix (all models × all queries)..."
+python tests/eval_all_models.py \
+    --dataset     "\$RESULTS_DIR/workload.json" \
+    --output      "\$RESULTS_DIR/eval_matrix.csv" \
+    --concurrency 20 \
+    --node2-host  "\$NODE2" \
+    2>&1 | tee "\$RESULTS_DIR/eval_matrix.log" || echo "  WARNING: eval_matrix generation failed"
+echo "  eval_matrix.csv done."
+
+EVAL_MATRIX_FLAG=""
+[ -f "\$RESULTS_DIR/eval_matrix.csv" ] && EVAL_MATRIX_FLAG="--eval-matrix \$RESULTS_DIR/eval_matrix.csv"
+
+echo ""
 echo "  [B1] CARROT baseline..."
 python tests/baseline_carrot.py \
     --dataset     "\$RESULTS_DIR/workload.json" \
+    \$EVAL_MATRIX_FLAG \
     --concurrency ${CONCURRENCY} \
     --output      "\$RESULTS_DIR/baseline_carrot.csv" \
     2>&1 | tee "\$RESULTS_DIR/carrot.log" || echo "  WARNING: CARROT failed"
@@ -258,6 +272,7 @@ echo ""
 echo "  [B2] OmniRouter baseline (alpha=0.75)..."
 python tests/baseline_omni_router.py \
     --dataset     "\$RESULTS_DIR/workload.json" \
+    \$EVAL_MATRIX_FLAG \
     --alpha       0.75 \
     --concurrency ${CONCURRENCY} \
     --output      "\$RESULTS_DIR/baseline_omni_router.csv" \
