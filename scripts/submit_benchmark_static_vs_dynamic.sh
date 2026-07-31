@@ -417,6 +417,23 @@ echo "    Dynamic total: \${DYNAMIC_WALL}s"
 echo "    Static  load test only: \$((STATIC_END  - STATIC_START))s"
 echo "    Dynamic load test only: \$((DYNAMIC_END - DYNAMIC_START))s"
 
+# Score baseline CSVs in-place (adds is_correct / answer_type / source columns)
+echo ""
+echo "  [score_baselines.py] Scoring baseline CSVs..."
+BASELINE_CSVS=()
+[ -f "\$RESULTS_DIR/rr_baseline.csv" ]            && BASELINE_CSVS+=("\$RESULTS_DIR/rr_baseline.csv")
+[ -f "\$RESULTS_DIR/baseline_cascade.csv" ]       && BASELINE_CSVS+=("\$RESULTS_DIR/baseline_cascade.csv")
+[ -f "\$RESULTS_DIR/baseline_carrot.csv" ]        && BASELINE_CSVS+=("\$RESULTS_DIR/baseline_carrot.csv")
+[ -f "\$RESULTS_DIR/baseline_omni_router.csv" ]   && BASELINE_CSVS+=("\$RESULTS_DIR/baseline_omni_router.csv")
+if [ \${#BASELINE_CSVS[@]} -gt 0 ]; then
+    python tests/score_baselines.py \
+        --workload "\$RESULTS_DIR/workload.json" \
+        --csvs "\${BASELINE_CSVS[@]}" \
+        2>&1 | tee "\$RESULTS_DIR/score_baselines.log"
+else
+    echo "  No baseline CSVs found, skipping."
+fi
+
 # Build --system args for compare_all.py
 COMPARE_ARGS=(tests/compare_all.py)
 [ -f "\$RESULTS_DIR/rr_baseline.csv" ]            && COMPARE_ARGS+=(--system "Round-Robin:\$RESULTS_DIR/rr_baseline.csv")
